@@ -86,7 +86,7 @@ confirm() {
     prompt="$1"
     printf '%s%s%s (yes/no) ' "${C_YELLOW}" "$prompt" "${C_RESET}"
     read -r answer || return 1
-    [ "$answer" = "yes" ] || [ "$answer" = "y" ] || [ "$answer" = "YES" ] || [ "$answer" = "Y" ]
+    [ "$answer" = "yes" ] || [ "$answer" = "y" ] || [ "$answer" = "YES" ]
 }
 
 # Press-enter-to-continue gate.
@@ -299,9 +299,28 @@ pick_raid_set() {
 # values it omits remain at the defaults below.
 # ----------------------------------------------------------------------
 cfg_set_defaults() {
-    # What to monitor
-    MONITOR_SETS="all"                     # "all" or comma-list of names/UUIDs
-    MONITOR_DISKS="auto"                   # "auto" = derive from RAID members
+    # --- RAID monitoring ---
+    MONITOR_SETS="all"                     # "all"|"auto" (synonyms) or comma-list of names/UUIDs
+    MONITOR_SETS_EXCLUDE=""                # Comma-list subtracted from MONITOR_SETS
+    REQUIRED_SETS="all"                    # "all"=snapshot | comma-list | "" (disabled)
+    ALERT_ON_MISSING_SET=yes               # master switch for set-presence alerts
+    MISSING_SET_SEVERITY=crit              # warn|crit
+    MISSING_SET_GRACE_PERIOD=5m            # debounce transient disappearance
+
+    # --- Disk monitoring ---
+    MONITOR_DISKS="auto"                   # "auto"=RAID members | "all"=every phys disk | comma-list
+    MONITOR_DISKS_EXCLUDE=""               # Comma-list subtracted from MONITOR_DISKS
+    REQUIRED_DISKS="all"                   # "all"=snapshot | comma-list | "" (disabled)
+    ALERT_ON_MISSING_DISK=yes              # master switch for disk-presence alerts
+    MISSING_DISK_SEVERITY=crit             # warn|crit
+    MISSING_DISK_GRACE_PERIOD=5m           # debounce transient disappearance
+
+    # --- Auto-baseline (keeps REQUIRED_*=all in sync with reality) ---
+    AUTO_BASELINE_FOR_SETS_ON_CREATE=yes   # `appleRAID create` adds set to baseline
+    AUTO_BASELINE_FOR_SETS_ON_DESTROY=yes  # `appleRAID destroy` removes set from baseline
+    AUTO_BASELINE_FOR_SETS_ON_HEALTH=yes   # health poll auto-adds new sets observed
+    AUTO_BASELINE_FOR_DISKS_ON_HEALTH=yes  # health poll auto-adds new disks observed
+    AUTO_BASELINE_GRACE_PERIOD=24h         # item must be present this long before ON_HEALTH adds it
     # Thresholds
     TEMP_WARN_C=50
     TEMP_CRIT_C=58
@@ -310,15 +329,15 @@ cfg_set_defaults() {
     ALARM_SOUND="/System/Library/Sounds/Basso.aiff"
     ALARM_VOLUME=0.8                       # 0.0 - 1.0
     ALARM_VOLUME_MODE=boost                # boost|cap|set
-    ALARM_INTERVAL_SEC=60
+    ALARM_INTERVAL=60
     ALARM_ENABLED=yes
     # Email
     EMAIL_TO=""                            # empty disables email
     EMAIL_FROM="appleRAID@$(hostname)"
     EMAIL_SENDER="/usr/local/bin/msmtp"
-    EMAIL_INTERVAL_SEC=14400               # 4 hours
+    EMAIL_INTERVAL=14400                   # 4 hours
     # SMART polling & self-tests
-    SMART_POLL_INTERVAL_SEC=86400          # 1 day
+    SMART_POLL_INTERVAL=86400              # 1 day
     SELFTEST_SHORT_SCHEDULE="never"        # never|daily|weekly
     SELFTEST_LONG_SCHEDULE="weekly"        # never|daily|weekly
     SELFTEST_HOUR=3                        # 0-23, when scheduled tests kick off
@@ -329,7 +348,7 @@ cfg_set_defaults() {
     # LaunchDaemon installation target (used by install-daemon)
     LAUNCHD_PLIST="/Library/LaunchDaemons/local.appleRAID.health.plist"
     LAUNCHD_LABEL="local.appleRAID.health"
-    LAUNCHD_INTERVAL_SEC=60
+    LAUNCHD_INTERVAL=60
 }
 
 # Path of the config file actually used by this run (for show-config).
@@ -354,11 +373,82 @@ cfg_load() {
             # shellcheck disable=SC1090
             . "$candidate"
             LOADED_CONFIG="$candidate"
-            return 0
+            break
         fi
     done
-    LOADED_CONFIG="(none - defaults in use)"
+    [ -n "$LOADED_CONFIG" ] || LOADED_CONFIG="(none - defaults in use)"
+
+    # Normalize duration-valued config keys: accept either a bare number
+    # (seconds) or a suffix like 30s / 5m / 2h / 1d / 1w. Done once at
+    # load time so the rest of the script can treat these as plain ints.
+    ALARM_INTERVAL=$(parse_duration "$ALARM_INTERVAL" "ALARM_INTERVAL")
+    EMAIL_INTERVAL=$(parse_duration "$EMAIL_INTERVAL" "EMAIL_INTERVAL")
+    SMART_POLL_INTERVAL=$(parse_duration "$SMART_POLL_INTERVAL" "SMART_POLL_INTERVAL")
+    LAUNCHD_INTERVAL=$(parse_duration "$LAUNCHD_INTERVAL" "LAUNCHD_INTERVAL")
+    MISSING_SET_GRACE_PERIOD=$(parse_duration "$MISSING_SET_GRACE_PERIOD" "MISSING_SET_GRACE_PERIOD")
+    MISSING_DISK_GRACE_PERIOD=$(parse_duration "$MISSING_DISK_GRACE_PERIOD" "MISSING_DISK_GRACE_PERIOD")
+    AUTO_BASELINE_GRACE_PERIOD=$(parse_duration "$AUTO_BASELINE_GRACE_PERIOD" "AUTO_BASELINE_GRACE_PERIOD")
     return 0
+}
+
+# ----------------------------------------------------------------------
+# Duration parser.
+# Converts a human-readable duration to seconds. Accepts:
+#   <n>          -> n seconds (bare number, backwards-compatible)
+#   <n>s         -> n seconds
+#   <n>m         -> n minutes
+#   <n>h         -> n hours
+#   <n>d         -> n days
+#   <n>w         -> n weeks
+# The suffix is case-insensitive. Invalid input emits a warning and
+# falls back to the default shown (so a typo doesn't make the daemon
+# silently stop monitoring).
+# Args: value, keyname (for error messages)
+# ----------------------------------------------------------------------
+parse_duration() {
+    v="$1"; k="${2:-duration}"
+    # Strip whitespace.
+    v=$(printf '%s' "$v" | sed 's/[[:space:]]//g')
+    [ -n "$v" ] || { echo 0; return; }
+
+    # Lowercase the suffix only (portable: tr everywhere).
+    suf=$(printf '%s' "$v" | sed 's/^[0-9]*//' | tr '[:upper:]' '[:lower:]')
+    num=$(printf '%s' "$v" | sed 's/[^0-9].*$//')
+
+    # Bare number = seconds.
+    if [ -z "$suf" ]; then
+        # Validate that it's digits only.
+        case "$v" in
+            ''|*[!0-9]*)
+                log_warn "Invalid duration for $k: '$v' (expected e.g. 60, 5m, 2h, 1d, 1w). Using 0."
+                echo 0
+                return
+                ;;
+        esac
+        echo "$v"
+        return
+    fi
+
+    # Require a numeric portion.
+    case "$num" in
+        ''|*[!0-9]*)
+            log_warn "Invalid duration for $k: '$v' (missing number). Using 0."
+            echo 0
+            return
+            ;;
+    esac
+
+    case "$suf" in
+        s)    echo "$num" ;;
+        m)    echo "$(( num * 60 ))" ;;
+        h)    echo "$(( num * 3600 ))" ;;
+        d)    echo "$(( num * 86400 ))" ;;
+        w)    echo "$(( num * 604800 ))" ;;
+        *)
+            log_warn "Invalid duration suffix for $k: '$suf' in '$v'. Expected s|m|h|d|w. Using $num as seconds."
+            echo "$num"
+            ;;
+    esac
 }
 
 # ----------------------------------------------------------------------
@@ -509,6 +599,132 @@ now_iso() {
 }
 
 # ----------------------------------------------------------------------
+# Grace-period tracking for missing sets/disks.
+# When a required item first disappears, we record a "pending" file
+# rather than firing an alert immediately. On subsequent runs we check
+# if it's still missing AND has been missing long enough. If it comes
+# back before the grace expires, we drop the pending file silently.
+#
+# State dir layout for pending files:
+#   $STATE_DIR/pending-set-<name>    timestamp when set first seen missing
+#   $STATE_DIR/pending-disk-<name>   timestamp when disk first seen missing
+# ----------------------------------------------------------------------
+
+# Mark item as pending-missing if not already pending. Returns 0 if grace
+# has expired (caller should alert) or 1 if still within grace period.
+# Args: kind (set|disk), name, grace_sec
+grace_check() {
+    kind="$1"; name="$2"; grace="$3"
+    f="${STATE_DIR}/pending-${kind}-${name}"
+    if [ ! -f "$f" ]; then
+        # First disappearance in this run; start the clock.
+        date +%s > "$f"
+        log_debug "Started grace timer for ${kind} ${name} (${grace}s)"
+        return 1
+    fi
+    first=$(cat "$f" 2>/dev/null)
+    [ -n "$first" ] || { date +%s > "$f"; return 1; }
+    now=$(date +%s)
+    elapsed=$(( now - first ))
+    if [ "$elapsed" -ge "$grace" ]; then
+        return 0
+    fi
+    log_debug "${kind} ${name} missing for ${elapsed}s (grace ${grace}s); not alerting yet"
+    return 1
+}
+
+# Clear any pending grace entry for this item (called when it reappears).
+# Args: kind, name
+grace_clear() {
+    rm -f "${STATE_DIR}/pending-$1-$2" 2>/dev/null || true
+}
+
+# ----------------------------------------------------------------------
+# Auto-baseline presence tracking. Mirror of grace_check, but for the
+# opposite event: "has this item been consistently PRESENT long enough
+# to auto-add to the baseline?"
+#
+# Sentinel files: $STATE_DIR/seen-<kind>-<name>  (timestamp of first sighting)
+#
+# Returns 0 if the item has been present long enough (caller should
+# add to baseline) or 1 if still in the grace window.
+# Args: kind (set|disk), name, grace_sec
+# ----------------------------------------------------------------------
+auto_baseline_check() {
+    kind="$1"; name="$2"; grace="$3"
+    f="${STATE_DIR}/seen-${kind}-${name}"
+    if [ ! -f "$f" ]; then
+        date +%s > "$f"
+        log_debug "Started auto-baseline timer for ${kind} ${name} (${grace}s)"
+        return 1
+    fi
+    first=$(cat "$f" 2>/dev/null)
+    [ -n "$first" ] || { date +%s > "$f"; return 1; }
+    now=$(date +%s)
+    elapsed=$(( now - first ))
+    if [ "$elapsed" -ge "$grace" ]; then
+        return 0
+    fi
+    log_debug "${kind} ${name} present for ${elapsed}s (grace ${grace}s); not auto-baselining yet"
+    return 1
+}
+
+# Clear the auto-baseline seen-timer for an item (called once it has
+# been added to the baseline, so the timer doesn't linger).
+auto_baseline_clear() {
+    rm -f "${STATE_DIR}/seen-$1-$2" 2>/dev/null || true
+}
+
+# ----------------------------------------------------------------------
+# Baseline files: the snapshot of "what should exist" for REQUIRED_*=all.
+#
+#   $STATE_DIR/baseline-sets    newline-separated RAID set names
+#   $STATE_DIR/baseline-disks   newline-separated disk identifiers (disk2, ...)
+#
+# Written by 'appleRAID baseline'. If a baseline file doesn't exist
+# when REQUIRED_*=all is active, the 'health' command auto-creates it
+# from current state on first run and logs that it did.
+# ----------------------------------------------------------------------
+baseline_sets_file()  { echo "${STATE_DIR}/baseline-sets";  }
+baseline_disks_file() { echo "${STATE_DIR}/baseline-disks"; }
+
+baseline_read_sets() {
+    f=$(baseline_sets_file)
+    [ -f "$f" ] || return 0
+    awk 'NF>0 && !/^#/ {print}' "$f"
+}
+
+baseline_read_disks() {
+    f=$(baseline_disks_file)
+    [ -f "$f" ] || return 0
+    awk 'NF>0 && !/^#/ {print}' "$f"
+}
+
+# Write the currently-existing RAID set *names* to the baseline file.
+baseline_write_sets() {
+    f=$(baseline_sets_file)
+    {
+        echo "# appleRAID baseline: RAID sets expected to exist."
+        echo "# Written: $(now_iso)"
+        echo "# Update with: appleRAID baseline --sets"
+        diskutil appleRAID list 2>/dev/null | awk -F': +' '
+            /^Name:/ { n=$2; sub(/ +$/,"",n); if (n!="") print n }
+        '
+    } > "$f"
+}
+
+# Write the currently-attached physical disk identifiers to the baseline.
+baseline_write_disks() {
+    f=$(baseline_disks_file)
+    {
+        echo "# appleRAID baseline: disks expected to be attached."
+        echo "# Written: $(now_iso)"
+        echo "# Update with: appleRAID baseline --disks"
+        list_all_physical_disks
+    } > "$f"
+}
+
+# ----------------------------------------------------------------------
 # Alerting: sound + email.
 # alert_sound plays ALARM_SOUND using afplay, respecting ALARM_VOLUME_MODE.
 # ----------------------------------------------------------------------
@@ -621,12 +837,12 @@ $(diskutil appleRAID list 2>/dev/null)
         new_la="$la"
         new_le="$le"
 
-        if [ "$sev" = "crit" ] && [ "${since_alarm:-0}" -ge "${ALARM_INTERVAL_SEC:-60}" ]; then
+        if [ "$sev" = "crit" ] && [ "${since_alarm:-0}" -ge "${ALARM_INTERVAL:-60}" ]; then
             alert_sound
             new_la="$now"
         fi
 
-        if [ "${since_email:-0}" -ge "${EMAIL_INTERVAL_SEC:-14400}" ]; then
+        if [ "${since_email:-0}" -ge "${EMAIL_INTERVAL:-14400}" ]; then
             alert_email "[appleRAID/$sev] (recurring) $summary" \
                 "Problem still present (first seen: $first)
 
@@ -666,30 +882,51 @@ Cleared at: $(now_iso)
 # RAID health check
 # ----------------------------------------------------------------------
 
-# Returns the list of RAID UUIDs to monitor, based on MONITOR_SETS.
+# Returns the list of RAID UUIDs to monitor, based on MONITOR_SETS
+# and MONITOR_SETS_EXCLUDE. Accepts "all" and "auto" as synonyms.
 resolve_monitored_sets() {
+    # Build base UUID list.
+    base_uuids=""
     case "${MONITOR_SETS:-all}" in
-        all|ALL|"")
-            raid_list_uuids
+        all|ALL|auto|AUTO|"")
+            base_uuids=$(raid_list_uuids)
             ;;
         *)
             for item in $(echo "$MONITOR_SETS" | tr ',' ' '); do
-                # Accept UUID directly or look up by name.
-                found=0
+                found=""
                 for u in $(raid_list_uuids); do
                     if [ "$u" = "$item" ]; then
-                        echo "$u"
-                        found=1
+                        found="$u"
                         break
                     fi
                 done
-                if [ "$found" = "0" ]; then
-                    u=$(raid_name_to_uuid "$item")
-                    [ -n "$u" ] && echo "$u"
-                fi
+                [ -z "$found" ] && found=$(raid_name_to_uuid "$item")
+                [ -n "$found" ] && base_uuids="$base_uuids
+$found"
             done
             ;;
     esac
+
+    # Build exclusion UUID list (by name or UUID).
+    exclude_uuids=""
+    if [ -n "${MONITOR_SETS_EXCLUDE:-}" ]; then
+        for item in $(echo "$MONITOR_SETS_EXCLUDE" | tr ',' ' '); do
+            found=""
+            for u in $(raid_list_uuids); do
+                [ "$u" = "$item" ] && found="$u" && break
+            done
+            [ -z "$found" ] && found=$(raid_name_to_uuid "$item")
+            [ -n "$found" ] && exclude_uuids="$exclude_uuids
+$found"
+        done
+    fi
+
+    # Subtract + dedupe.
+    echo "$base_uuids" | awk 'NF>0' | while read -r u; do
+        if ! echo "$exclude_uuids" | grep -qxF "$u"; then
+            echo "$u"
+        fi
+    done | awk '!seen[$0]++'
 }
 
 # Produces newline-separated list of problem-hashes seen THIS run.
@@ -782,7 +1019,7 @@ check_raid_sets() {
 }
 
 # ----------------------------------------------------------------------
-# SMART health check. Runs at most once per SMART_POLL_INTERVAL_SEC.
+# SMART health check. Runs at most once per SMART_POLL_INTERVAL.
 # Uses a sentinel file ($STATE_DIR/last-smart) to rate-limit across runs.
 # ----------------------------------------------------------------------
 
@@ -799,34 +1036,318 @@ smart_should_run() {
     last=$(cat "$f" 2>/dev/null)
     now=$(date +%s)
     diff=$(( now - ${last:-0} ))
-    [ "$diff" -ge "${SMART_POLL_INTERVAL_SEC:-86400}" ]
+    [ "$diff" -ge "${SMART_POLL_INTERVAL:-86400}" ]
 }
 
 smart_mark_ran() {
     date +%s > "$(smart_last_run_file)" 2>/dev/null || true
 }
 
-# Resolve list of physical disks to check.
-resolve_monitored_disks() {
-    case "${MONITOR_DISKS:-auto}" in
-        auto|AUTO|"")
-            # Collect unique parent disks from all monitored RAID members.
-            uuids=$(resolve_monitored_sets)
-            for u in $uuids; do
-                diskutil appleRAID list "$u" 2>/dev/null \
-                    | awk '/^[0-9]+[ \t]+disk/ {print $2}' \
-                    | sed 's/s[0-9]*$//'
-            done | sort -u
+# Normalize a single disk spec ("3", "disk3", "/dev/disk3", "disk3s2") to
+# the bare whole-disk identifier ("disk3"). Returns empty if it can't parse.
+normalize_disk_id() {
+    raw="$1"
+    # Strip leading/trailing whitespace and /dev/ prefix.
+    raw=$(printf '%s' "$raw" | sed 's|^[[:space:]]*||; s|[[:space:]]*$||; s|^/dev/||')
+    case "$raw" in
+        disk[0-9]*)
+            # Strip any partition suffix (sNN).
+            echo "$raw" | sed 's/s[0-9]*$//'
+            ;;
+        [0-9]*)
+            echo "disk$raw"
+            ;;
+        "")
+            : # silently skip blanks
             ;;
         *)
-            echo "$MONITOR_DISKS" | tr ',' '\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//'
+            log_warn "Ignoring unparseable disk spec: '$raw'"
             ;;
     esac
 }
 
+# List every whole physical disk currently attached (no virtual RAID/APFS).
+# Used for MONITOR_DISKS="all".
+list_all_physical_disks() {
+    # 'diskutil list' shows a header line per disk; we want ones marked
+    # "(internal, physical)" or "(external, physical)" - NOT "virtual" or
+    # "synthesized".
+    diskutil list 2>/dev/null \
+        | awk -F'[ (]' '/^\/dev\/disk[0-9]+ \((internal|external), physical\):/ {
+            # $1="/dev/diskN" -> strip /dev/
+            sub(/^\/dev\//, "", $1)
+            print $1
+        }'
+}
+
+# Build the expected disk list WITHOUT presence validation.
+# This is the union of (base list from MONITOR_DISKS) + MONITOR_EXTRA_DISKS,
+# normalized and deduplicated. Used by both the SMART pipeline (which
+# then filters down to present disks) and the presence check (which
+# diffs this list against what's actually attached).
+# Resolve REQUIRED_DISKS into a concrete list of disk names.
+# Handles "all" (read baseline file), "" (empty), or comma-list.
+resolve_required_disks() {
+    case "${REQUIRED_DISKS:-}" in
+        ""|none|NONE)
+            return 0
+            ;;
+        all|ALL)
+            f=$(baseline_disks_file)
+            if [ ! -f "$f" ]; then
+                log_info "No disk baseline yet; creating from current state"
+                baseline_write_disks
+            fi
+            baseline_read_disks
+            ;;
+        *)
+            echo "$REQUIRED_DISKS" | tr ',' '\n' | while read -r spec; do
+                normalize_disk_id "$spec"
+            done
+            ;;
+    esac
+}
+
+# Resolve REQUIRED_SETS into a concrete list of set NAMES (not UUIDs).
+# Names are more stable across recreations than UUIDs.
+resolve_required_sets() {
+    case "${REQUIRED_SETS:-}" in
+        ""|none|NONE)
+            return 0
+            ;;
+        all|ALL)
+            f=$(baseline_sets_file)
+            if [ ! -f "$f" ]; then
+                log_info "No set baseline yet; creating from current state"
+                baseline_write_sets
+            fi
+            baseline_read_sets
+            ;;
+        *)
+            echo "$REQUIRED_SETS" | tr ',' '\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | awk 'NF>0'
+            ;;
+    esac
+}
+
+# Build the full SMART-monitoring scope: MONITOR_DISKS base minus
+# MONITOR_DISKS_EXCLUDE, plus any explicit REQUIRED_DISKS entries
+# (required disks are always SMART-checked when present, even if they
+# would otherwise be excluded).
+resolve_expected_disks() {
+    # --- Base list from MONITOR_DISKS ---
+    base=""
+    case "${MONITOR_DISKS:-auto}" in
+        auto|AUTO|"")
+            uuids=$(resolve_monitored_sets)
+            for u in $uuids; do
+                base="$base
+$(diskutil appleRAID list "$u" 2>/dev/null \
+                    | awk '/^[0-9]+[ \t]+disk/ {print $2}' \
+                    | sed 's/s[0-9]*$//')"
+            done
+            ;;
+        all|ALL)
+            base=$(list_all_physical_disks)
+            ;;
+        *)
+            base=$(echo "$MONITOR_DISKS" | tr ',' '\n' | while read -r spec; do
+                normalize_disk_id "$spec"
+            done)
+            ;;
+    esac
+
+    # --- Subtract MONITOR_DISKS_EXCLUDE ---
+    exclude=""
+    if [ -n "${MONITOR_DISKS_EXCLUDE:-}" ]; then
+        exclude=$(echo "$MONITOR_DISKS_EXCLUDE" | tr ',' '\n' | while read -r spec; do
+            normalize_disk_id "$spec"
+        done)
+    fi
+    base=$(echo "$base" | awk 'NF>0' | while read -r d; do
+        if ! echo "$exclude" | grep -qxF "$d"; then
+            echo "$d"
+        fi
+    done)
+
+    # --- Merge REQUIRED_DISKS (present ones get SMART-checked too) ---
+    # Only explicit-list REQUIRED_DISKS merge here; "all" mode already
+    # derives from system state, and merging that back would be tautological.
+    required=""
+    case "${REQUIRED_DISKS:-}" in
+        ""|none|NONE|all|ALL) ;;
+        *)
+            required=$(echo "$REQUIRED_DISKS" | tr ',' '\n' | while read -r spec; do
+                normalize_disk_id "$spec"
+            done)
+            ;;
+    esac
+
+    printf '%s\n%s\n' "$base" "$required" | awk 'NF>0 && !seen[$0]++'
+}
+
+# Resolve list of physical disks to SMART-check. Returns only disks that
+# are CURRENTLY PRESENT on the system. Missing disks are silently skipped
+# here; the presence check (check_disk_presence) is the designated place
+# to alert about them.
+resolve_monitored_disks() {
+    resolve_expected_disks | while read -r d; do
+        [ -n "$d" ] || continue
+        if diskutil info "/dev/$d" >/dev/null 2>&1; then
+            echo "$d"
+        fi
+    done
+}
+
+# Presence check for disks. Fires alerts when a disk in REQUIRED_DISKS is
+# not currently attached. Uses a grace period to debounce transient
+# disappearances (Thunderbolt enclosure waking, USB re-enumeration).
+#
+# Config:
+#   ALERT_ON_MISSING_DISK    yes|no           master switch
+#   REQUIRED_DISKS           all|list|""      scope (see resolve_required_disks)
+#   MISSING_DISK_SEVERITY    warn|crit
+#   MISSING_DISK_GRACE_PERIOD   duration         seconds missing before alerting
+check_disk_presence() {
+    [ "${ALERT_ON_MISSING_DISK:-no}" = "yes" ] || return 0
+
+    sev="${MISSING_DISK_SEVERITY:-crit}"
+    case "$sev" in
+        warn|crit) ;;
+        *) log_warn "Invalid MISSING_DISK_SEVERITY='$sev'; using 'crit'"; sev=crit ;;
+    esac
+
+    grace="${MISSING_DISK_GRACE_PERIOD:-300}"
+    required=$(resolve_required_disks)
+    [ -n "$required" ] || return 0
+
+    echo "$required" | awk 'NF>0 && !seen[$0]++' | while read -r d; do
+        [ -n "$d" ] || continue
+        if diskutil info "/dev/$d" >/dev/null 2>&1; then
+            # Present - clear any pending grace timer for it.
+            grace_clear "disk" "$d"
+        else
+            # Missing - check grace period.
+            if grace_check "disk" "$d" "$grace"; then
+                h=$(problem_hash "disk-missing" "$d" "not-present")
+                seen_add "$h"
+                handle_problem "disk-missing" "$d" "not-present" "$sev" \
+                    "Expected disk /dev/$d is NOT attached"
+            fi
+        fi
+    done
+}
+
+# Presence check for RAID sets. Fires alerts when a set in REQUIRED_SETS
+# is not currently present in 'diskutil appleRAID list'. Degraded/Failed
+# sets ARE present (and caught separately by check_raid_sets), so this
+# function specifically targets the "set disappeared entirely" case.
+#
+# Config:
+#   ALERT_ON_MISSING_SET     yes|no           master switch
+#   REQUIRED_SETS            all|list|""      scope (see resolve_required_sets)
+#   MISSING_SET_SEVERITY     warn|crit
+#   MISSING_SET_GRACE_PERIOD    duration         seconds missing before alerting
+check_set_presence() {
+    [ "${ALERT_ON_MISSING_SET:-no}" = "yes" ] || return 0
+
+    sev="${MISSING_SET_SEVERITY:-crit}"
+    case "$sev" in
+        warn|crit) ;;
+        *) log_warn "Invalid MISSING_SET_SEVERITY='$sev'; using 'crit'"; sev=crit ;;
+    esac
+
+    grace="${MISSING_SET_GRACE_PERIOD:-300}"
+    required=$(resolve_required_sets)
+    [ -n "$required" ] || return 0
+
+    # Build a list of currently-present set names for fast lookup.
+    present_names=$(diskutil appleRAID list 2>/dev/null | awk -F': +' '
+        /^Name:/ { n=$2; sub(/ +$/,"",n); if (n!="") print n }
+    ')
+
+    echo "$required" | awk 'NF>0 && !seen[$0]++' | while read -r name; do
+        [ -n "$name" ] || continue
+        if echo "$present_names" | grep -qxF "$name"; then
+            grace_clear "set" "$name"
+        else
+            if grace_check "set" "$name" "$grace"; then
+                h=$(problem_hash "set-missing" "$name" "not-present")
+                seen_add "$h"
+                handle_problem "set-missing" "$name" "not-present" "$sev" \
+                    "Required RAID set '$name' is NOT present in diskutil appleRAID list"
+            fi
+        fi
+    done
+}
+
+# Auto-baseline: when enabled, extend the baseline to include sets that
+# have been consistently observed for at least AUTO_BASELINE_GRACE_PERIOD.
+# Only runs if REQUIRED_SETS=all (otherwise the baseline file isn't
+# authoritative - the user is managing an explicit list manually).
+check_auto_baseline_sets() {
+    [ "${AUTO_BASELINE_FOR_SETS_ON_HEALTH:-no}" = "yes" ] || return 0
+    case "${REQUIRED_SETS:-}" in all|ALL) ;; *) return 0 ;; esac
+    [ "${ALERT_ON_MISSING_SET:-no}" = "yes" ] || return 0
+
+    grace="${AUTO_BASELINE_GRACE_PERIOD:-86400}"
+    # Current baseline for lookup.
+    current=$(baseline_read_sets 2>/dev/null)
+    # Present set names.
+    present=$(diskutil appleRAID list 2>/dev/null | awk -F': +' '
+        /^Name:/ { n=$2; sub(/ +$/,"",n); if (n!="") print n }
+    ')
+
+    echo "$present" | awk 'NF>0 && !seen[$0]++' | while read -r name; do
+        [ -n "$name" ] || continue
+        if echo "$current" | grep -qxF "$name"; then
+            # Already baselined; clear any stale sighting timer.
+            auto_baseline_clear "set" "$name"
+        else
+            if auto_baseline_check "set" "$name" "$grace"; then
+                log_info "Auto-baselining new RAID set: $name (present >= ${grace}s)"
+                baseline_write_sets
+                auto_baseline_clear "set" "$name"
+            fi
+        fi
+    done
+    # NOTE: we intentionally do NOT auto-remove sets that have been
+    # missing-and-grace-expired. Auto-removal of persistent items is
+    # riskier than auto-adding of long-present ones - the user can
+    # always force a refresh with 'appleRAID baseline --sets'. The
+    # AUTO_BASELINE_FOR_SETS_ON_DESTROY path handles the clean case
+    # where the user deliberately destroyed a set.
+    return 0
+}
+
+# Auto-baseline for disks: same logic as sets, but for physical disk
+# identifiers.
+check_auto_baseline_disks() {
+    [ "${AUTO_BASELINE_FOR_DISKS_ON_HEALTH:-no}" = "yes" ] || return 0
+    case "${REQUIRED_DISKS:-}" in all|ALL) ;; *) return 0 ;; esac
+    [ "${ALERT_ON_MISSING_DISK:-no}" = "yes" ] || return 0
+
+    grace="${AUTO_BASELINE_GRACE_PERIOD:-86400}"
+    current=$(baseline_read_disks 2>/dev/null)
+    present=$(list_all_physical_disks)
+
+    echo "$present" | awk 'NF>0 && !seen[$0]++' | while read -r d; do
+        [ -n "$d" ] || continue
+        if echo "$current" | grep -qxF "$d"; then
+            auto_baseline_clear "disk" "$d"
+        else
+            if auto_baseline_check "disk" "$d" "$grace"; then
+                log_info "Auto-baselining new disk: $d (present >= ${grace}s)"
+                baseline_write_disks
+                auto_baseline_clear "disk" "$d"
+            fi
+        fi
+    done
+    return 0
+}
+
 check_smart() {
     smart_should_run || return 0
-    log_info "Running SMART check (runs every ${SMART_POLL_INTERVAL_SEC}s)"
+    log_info "Running SMART check (runs every ${SMART_POLL_INTERVAL}s)"
     disks=$(resolve_monitored_disks)
     [ -n "$disks" ] || { log_warn "No disks resolved for SMART check"; return 0; }
 
@@ -834,8 +1355,17 @@ check_smart() {
         dev="/dev/$d"
         [ -e "$dev" ] || { log_warn "Skipping $dev (not present)"; continue; }
 
+        # Determine and cache the correct `smartctl -d` type for this
+        # disk. Some USB/Thunderbolt bridges need an explicit -d; the
+        # cache avoids re-probing on every run.
+        sc=$(smart_cmd "$d")
+        if [ "$sc" = "smartctl" ] && [ "$(smart_dtype_for "$d")" = "" ]; then
+            log_debug "No SMART support for $d; skipping"
+            continue
+        fi
+
         # Overall health (PASSED/FAILED)
-        health=$(smartctl -H "$dev" 2>/dev/null | awk -F': *' \
+        health=$($sc -H "$dev" 2>/dev/null | awk -F': *' \
             '/SMART overall-health/ {print $2; exit}
              /SMART Health Status/   {print $2; exit}')
         health=$(echo "$health" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
@@ -848,7 +1378,7 @@ check_smart() {
         fi
 
         # Temperature (attribute 194 or 190)
-        temp=$(smartctl -A "$dev" 2>/dev/null | awk '
+        temp=$($sc -A "$dev" 2>/dev/null | awk '
             /^[[:space:]]*(194|190)[[:space:]]+Temperature/ { print $10; exit }
         ')
         if [ -n "$temp" ]; then
@@ -869,7 +1399,7 @@ check_smart() {
         # "Killer" attributes: any non-zero raw value warrants attention.
         # Reallocated_Sector_Ct (5), Current_Pending_Sector (197),
         # Offline_Uncorrectable (198), UDMA_CRC_Error_Count (199)
-        smartctl -A "$dev" 2>/dev/null | awk '
+        $sc -A "$dev" 2>/dev/null | awk '
             /^[[:space:]]*(5|197|198|199)[[:space:]]/ {
                 id=$1; name=$2; raw=$10
                 # raw may be "0" or "0/0" etc.; take first numeric token
@@ -923,16 +1453,17 @@ run_selftests() {
         dev="/dev/$d"
         [ -e "$dev" ] || continue
 
+        sc=$(smart_cmd "$d")
         short_sentinel="${STATE_DIR}/selftest-short-${d}"
         long_sentinel="${STATE_DIR}/selftest-long-${d}"
 
         if selftest_should_run "${SELFTEST_SHORT_SCHEDULE:-never}" "$short_sentinel"; then
             log_info "Starting SHORT self-test on $d"
-            smartctl -t short "$dev" >/dev/null 2>&1 && touch "$short_sentinel"
+            $sc -t short "$dev" >/dev/null 2>&1 && touch "$short_sentinel"
         fi
         if selftest_should_run "${SELFTEST_LONG_SCHEDULE:-daily}" "$long_sentinel"; then
             log_info "Starting LONG self-test on $d (runs in background, ~24-30h on 26TB)"
-            smartctl -t long "$dev" >/dev/null 2>&1 && touch "$long_sentinel"
+            $sc -t long "$dev" >/dev/null 2>&1 && touch "$long_sentinel"
         fi
     done
 }
@@ -964,14 +1495,18 @@ cmd_health() {
         alert_email() { log_info "(dry) would email: $1"; }
     fi
     if [ "$force" = "1" ]; then
-        ALARM_INTERVAL_SEC=0
-        EMAIL_INTERVAL_SEC=0
+        ALARM_INTERVAL=0
+        EMAIL_INTERVAL=0
     fi
 
     log_debug "Config loaded from: $LOADED_CONFIG"
     log_debug "Monitoring sets: $MONITOR_SETS"
 
     check_raid_sets
+    check_auto_baseline_sets
+    check_auto_baseline_disks
+    check_set_presence
+    check_disk_presence
     check_smart
     run_selftests
 
@@ -1005,20 +1540,59 @@ cmd_show_config() {
     step "Effective configuration"
     info "Config file loaded: $LOADED_CONFIG"
     echo
-    # Print every known key in a stable order.
+    # Print every known key in a stable order. For duration-valued keys
+    # (*_INTERVAL, *_PERIOD), also show the normalized value in a
+    # human-readable form so "86400" is annotated as "1d" for easier
+    # verification.
     for k in \
-        MONITOR_SETS MONITOR_DISKS \
+        MONITOR_SETS MONITOR_SETS_EXCLUDE \
+        REQUIRED_SETS ALERT_ON_MISSING_SET MISSING_SET_SEVERITY MISSING_SET_GRACE_PERIOD \
+        MONITOR_DISKS MONITOR_DISKS_EXCLUDE \
+        REQUIRED_DISKS ALERT_ON_MISSING_DISK MISSING_DISK_SEVERITY MISSING_DISK_GRACE_PERIOD \
+        AUTO_BASELINE_FOR_SETS_ON_CREATE AUTO_BASELINE_FOR_SETS_ON_DESTROY \
+        AUTO_BASELINE_FOR_SETS_ON_HEALTH AUTO_BASELINE_FOR_DISKS_ON_HEALTH \
+        AUTO_BASELINE_GRACE_PERIOD \
         TEMP_WARN_C TEMP_CRIT_C SMART_CHECK_ENABLED \
-        ALARM_SOUND ALARM_VOLUME ALARM_VOLUME_MODE ALARM_INTERVAL_SEC ALARM_ENABLED \
-        EMAIL_TO EMAIL_FROM EMAIL_SENDER EMAIL_INTERVAL_SEC \
-        SMART_POLL_INTERVAL_SEC SELFTEST_SHORT_SCHEDULE SELFTEST_LONG_SCHEDULE SELFTEST_HOUR \
+        ALARM_SOUND ALARM_VOLUME ALARM_VOLUME_MODE ALARM_INTERVAL ALARM_ENABLED \
+        EMAIL_TO EMAIL_FROM EMAIL_SENDER EMAIL_INTERVAL \
+        SMART_POLL_INTERVAL SELFTEST_SHORT_SCHEDULE SELFTEST_LONG_SCHEDULE SELFTEST_HOUR \
         STATE_DIR LOG_FILE LOG_LEVEL \
-        LAUNCHD_PLIST LAUNCHD_LABEL LAUNCHD_INTERVAL_SEC
+        LAUNCHD_PLIST LAUNCHD_LABEL LAUNCHD_INTERVAL
     do
-        # Indirect variable expansion: eval is the POSIX way.
         eval "v=\${$k}"
-        printf '  %-28s = %s\n' "$k" "$v"
+        # Annotate duration-valued keys (_INTERVAL or _PERIOD suffix).
+        case "$k" in
+            *_INTERVAL|*_PERIOD)
+                case "$v" in
+                    ''|*[!0-9]*) printf '  %-28s = %s\n' "$k" "$v" ;;
+                    *)           printf '  %-28s = %s  (%s)\n' "$k" "$v" "$(format_duration "$v")" ;;
+                esac
+                ;;
+            *) printf '  %-28s = %s\n' "$k" "$v" ;;
+        esac
     done
+}
+
+# Format an integer number of seconds as the most natural human-readable
+# duration string. Exact multiples round trip cleanly: 86400 -> "1d",
+# 3600 -> "1h", 300 -> "5m", etc. Non-exact values fall back to "N s".
+format_duration() {
+    s="$1"
+    case "$s" in
+        ''|*[!0-9]*) echo "?"; return ;;
+    esac
+    [ "$s" -eq 0 ] 2>/dev/null && { echo "0s"; return; }
+    if [ $(( s % 604800 )) -eq 0 ] && [ "$s" -ge 604800 ]; then
+        echo "$(( s / 604800 ))w"
+    elif [ $(( s % 86400 )) -eq 0 ] && [ "$s" -ge 86400 ]; then
+        echo "$(( s / 86400 ))d"
+    elif [ $(( s % 3600 )) -eq 0 ] && [ "$s" -ge 3600 ]; then
+        echo "$(( s / 3600 ))h"
+    elif [ $(( s % 60 )) -eq 0 ] && [ "$s" -ge 60 ]; then
+        echo "$(( s / 60 ))m"
+    else
+        echo "${s}s"
+    fi
 }
 
 # ----------------------------------------------------------------------
@@ -1050,20 +1624,159 @@ cmd_create_config() {
 #
 # Every key has a built-in default; you only need to set the ones you
 # want to change.
+#
+# ----------------------------------------------------------------------
+# DURATION SYNTAX (applies to *_INTERVAL and *_PERIOD keys)
+# ----------------------------------------------------------------------
+# All keys whose name ends in _INTERVAL or _PERIOD accept either a bare
+# number (interpreted as seconds) or a value with a time-unit suffix:
+#   60       -> 60 seconds
+#   30s      -> 30 seconds
+#   5m       -> 5 minutes  (300 s)
+#   2h       -> 2 hours    (7200 s)
+#   1d       -> 1 day      (86400 s)
+#   1w       -> 1 week     (604800 s)
+# Suffix is case-insensitive. The parser warns and falls back to 0 on
+# invalid input (typos, unknown units).
 # ======================================================================
 
 
-# --- What to monitor -------------------------------------------------
+# --- RAID monitoring -------------------------------------------------
 
-# Which RAID sets to monitor.
-#   "all"                -> every AppleRAID set on the system
-#   "NameA,NameB,uuid"   -> comma-separated list of names or UUIDs
+# Which RAID sets to SMART-monitor and status-check.
+#   "all" / "auto"    -> every AppleRAID set on the system (synonyms)
+#   "NameA,NameB"     -> comma-list of set names or UUIDs
 MONITOR_SETS="all"
 
+# RAID sets to subtract from MONITOR_SETS (comma-list of names/UUIDs).
+# Useful when you want "all except this one scratch mirror".
+MONITOR_SETS_EXCLUDE=""
+
+# Which RAID sets MUST exist in 'diskutil appleRAID list'. When a
+# required set is missing entirely (not just degraded), the daemon
+# alerts. Degraded/Failed status is ALWAYS caught separately by the
+# standard RAID check - this key only adds the "set vanished" case.
+#
+#   "all"              -> snapshot current sets as the baseline; alert
+#                         if any of them later goes missing. Run
+#                         'appleRAID baseline --sets' after deliberately
+#                         adding or removing a RAID set.
+#   "NameA,NameB"      -> explicit list; compared directly, no snapshot.
+#   ""                 -> disabled (no presence check for sets).
+REQUIRED_SETS="all"
+
+# Master switch for REQUIRED_SETS. Set to "no" to disable the presence
+# check entirely without losing the REQUIRED_SETS value.
+ALERT_ON_MISSING_SET=yes
+
+# Severity of a missing-set alert:
+#   warn -> log + email (rate-limited), NO audible alarm
+#   crit -> log + email + audible alarm (rate-limited)
+MISSING_SET_SEVERITY=crit
+
+# Debounce: how long a set must be missing before alerting.
+# Thunderbolt enclosures can take 5-30 seconds to re-enumerate after
+# sleep/wake, so a too-aggressive alert would fire falsely. 5m gives
+# comfortable headroom; lower it if your attachments are more stable.
+# Accepts duration suffixes (see top of file): 60, 5m, 2h, 1d.
+MISSING_SET_GRACE_PERIOD=5m
+
+
+# --- Disk monitoring -------------------------------------------------
+
 # Which physical disks to run SMART checks against.
-#   "auto"               -> derive from members of monitored RAID sets
-#   "disk2,disk3,..."    -> explicit list (without /dev/ prefix)
+#   "auto"               -> members of monitored RAID sets. Good default:
+#                           SMART on the drives you care about most
+#                           without waking idle archive disks.
+#   "all"                -> every whole physical disk attached (internal
+#                           + external). Blanket coverage. Note: idle
+#                           USB drives will spin up once per
+#                           SMART_POLL_INTERVAL.
+#   "disk2,disk3,..."    -> explicit list. Accepts bare numbers (3),
+#                           names (disk3), or full paths (/dev/disk3).
+#                           Partition suffixes (s2) are stripped.
 MONITOR_DISKS="auto"
+
+# Disks to subtract from MONITOR_DISKS (comma-list).
+# Example: MONITOR_DISKS=all, MONITOR_DISKS_EXCLUDE="disk8"  -- monitor
+# everything except the external scratch drive on disk8.
+MONITOR_DISKS_EXCLUDE=""
+
+# Which disks MUST be attached. When a required disk is missing, the
+# daemon alerts (after MISSING_DISK_GRACE_PERIOD debounce).
+#
+#   "all"              -> snapshot currently-attached disks as the
+#                         baseline; alert if any go missing later.
+#                         Suitable for servers where drives are stable
+#                         fixtures. Less suitable for laptops where USB
+#                         drives come and go - you'd need to rebaseline
+#                         after every unplug. Use an explicit list in
+#                         that case.
+#   "disk2,disk8"      -> explicit list; compared directly.
+#   ""                 -> disabled.
+#
+# REQUIRED_DISKS entries are AUTOMATICALLY included in the SMART scope
+# when present (you don't need to also list them in MONITOR_DISKS).
+REQUIRED_DISKS="all"
+
+# Master switch for REQUIRED_DISKS.
+ALERT_ON_MISSING_DISK=yes
+
+# Severity of a missing-disk alert: warn|crit
+MISSING_DISK_SEVERITY=crit
+
+# Debounce: how long a disk must be missing before alerting.
+# Accepts duration suffixes.
+MISSING_DISK_GRACE_PERIOD=5m
+
+
+# --- Auto-baseline ---------------------------------------------------
+#
+# When REQUIRED_SETS=all / REQUIRED_DISKS=all, the daemon uses baseline
+# files to know which sets/disks are supposed to exist. These files can
+# be updated manually (`appleRAID baseline`) or automatically by the
+# five keys below. All default to "yes" to keep the baseline in lockstep
+# with reality on a stable-hardware server.
+#
+# There are three trigger events across two subsystems:
+#
+#   SETS:   - ON_CREATE   fires when 'appleRAID create' succeeds
+#           - ON_DESTROY  fires when 'appleRAID destroy' succeeds
+#           - ON_HEALTH   fires during 'appleRAID health' poll when a
+#                         new set has been observed continuously for
+#                         AUTO_BASELINE_GRACE_PERIOD
+#
+#   DISKS:  - ON_HEALTH   fires during 'appleRAID health' poll when a
+#                         new disk has been observed continuously for
+#                         AUTO_BASELINE_GRACE_PERIOD
+#                         (no CREATE/DESTROY commands exist for disks -
+#                          macOS handles attach/detach itself, so only
+#                          the health poll can observe disk changes)
+#
+# When a trigger fires AND the subsystem uses REQUIRED_*=all, the
+# corresponding baseline file is regenerated from current system state.
+# Items that have been intentionally removed are therefore automatically
+# forgotten on the next matching event (e.g. destroying a set with
+# AUTO_BASELINE_FOR_SETS_ON_DESTROY=yes also removes it from the
+# baseline in the same step).
+#
+# Set any key to "no" to require manual 'appleRAID baseline' commands
+# for the corresponding event.
+
+AUTO_BASELINE_FOR_SETS_ON_CREATE=yes
+AUTO_BASELINE_FOR_SETS_ON_DESTROY=yes
+AUTO_BASELINE_FOR_SETS_ON_HEALTH=yes
+AUTO_BASELINE_FOR_DISKS_ON_HEALTH=yes
+
+# How long a new set/disk must be continuously present before the
+# ON_HEALTH auto-baseliner adds it. This filters out test plug-ins,
+# flaky USB hubs, and other transient attachments that you don't
+# actually want permanently tracked.
+#
+# Accepts duration suffixes: 1h, 6h, 1d, 1w.
+# Default 1d: a drive must stay attached for a full day before the
+# daemon concludes it's a "keeper".
+AUTO_BASELINE_GRACE_PERIOD=1d
 
 
 # --- Thresholds ------------------------------------------------------
@@ -1102,9 +1815,10 @@ ALARM_VOLUME=0.8
 # In all cases, the previous system volume is restored after alarm.
 ALARM_VOLUME_MODE=boost
 
-# Minimum seconds between alarm playbacks for the SAME ongoing problem.
-# Set high (e.g. 300) if you find the every-minute alarm too aggressive.
-ALARM_INTERVAL_SEC=60
+# Minimum time between alarm playbacks for the SAME ongoing problem.
+# Accepts duration suffixes (see top of file): 60, 60s, 5m, 2h, 1d, 1w.
+# Set higher (e.g. 5m) if you find the every-minute alarm too aggressive.
+ALARM_INTERVAL=1m
 
 
 # --- Email alerts ----------------------------------------------------
@@ -1120,18 +1834,21 @@ EMAIL_FROM="appleRAID@localhost"
 # Configure ~/.msmtprc per the smartmontools setup we discussed earlier.
 EMAIL_SENDER="/usr/local/bin/msmtp"
 
-# Minimum seconds between emails for the SAME ongoing problem.
-# Default 14400 = 4 hours (6 emails/day max per problem).
-EMAIL_INTERVAL_SEC=14400
+# Minimum time between emails for the SAME ongoing problem.
+# Accepts duration suffixes (see top of file): 60, 60s, 5m, 2h, 1d, 1w.
+# Default 4h gives 6 emails/day max per problem.
+EMAIL_INTERVAL=4h
 
 
 # --- SMART polling schedule -----------------------------------------
 
-# How often to run SMART health+attribute checks (in seconds).
-# Default 86400 = once per day. Running more often wastes power (causes
+# How often to run SMART health + attribute checks.
+# Accepts duration suffixes (see top of file): 60, 5m, 2h, 1d, 1w.
+# Default 1d = once per day. Running more often wastes power (causes
 # drive spin-ups on idle drives) without meaningful benefit - attribute
-# changes unfold over hours/days, not seconds.
-SMART_POLL_INTERVAL_SEC=86400
+# changes unfold over hours/days, not seconds. For mostly-idle USB
+# drives where every spin-up matters, 1w is a sensible alternative.
+SMART_POLL_INTERVAL=1d
 
 # SMART self-test schedules: "never" | "daily" | "weekly".
 # Self-tests run IN THE BACKGROUND on the drive's own firmware - the
@@ -1139,7 +1856,7 @@ SMART_POLL_INTERVAL_SEC=86400
 #
 #   short: ~2 minutes. Exercises electronics + a small media sample.
 #          Default "never" because the daily attribute scan
-#          (SMART_POLL_INTERVAL_SEC) already catches most failures
+#          (SMART_POLL_INTERVAL) already catches most failures
 #          short tests would catch. Set to "daily" if you want belt
 #          and braces - cost is negligible.
 #
@@ -1184,15 +1901,103 @@ LAUNCHD_PLIST="/Library/LaunchDaemons/local.appleRAID.health.plist"
 # (minus .plist).
 LAUNCHD_LABEL="local.appleRAID.health"
 
-# How often launchd should invoke `appleRAID health`, in seconds.
-# 60 = every minute. Cheap: RAID checks are fast; SMART is rate-limited
-# internally by SMART_POLL_INTERVAL_SEC.
-LAUNCHD_INTERVAL_SEC=60
+# How often launchd should invoke `appleRAID health`.
+# Accepts duration suffixes (see top of file): 60, 1m, 5m, etc.
+# 1m = every minute. Cheap: RAID checks are fast; SMART is rate-limited
+# internally by SMART_POLL_INTERVAL.
+LAUNCHD_INTERVAL=1m
 EOF
 
     chmod 644 "$path" 2>/dev/null || true
     ok "Wrote default config to: $path"
     info "Edit it, then verify with: $SCRIPT_NAME show-config"
+}
+
+# ----------------------------------------------------------------------
+# `baseline` - snapshot currently-existing RAID sets and/or attached
+# disks into the "expected" baseline used by REQUIRED_SETS=all /
+# REQUIRED_DISKS=all. Run this after deliberately adding or removing a
+# RAID set, or when you change your disk lineup.
+#
+# Does NOT affect SMART monitoring - SMART uses absolute thresholds,
+# not a baseline.
+# ----------------------------------------------------------------------
+cmd_baseline() {
+    cfg_load
+    state_init
+
+    do_sets=1
+    do_disks=1
+    show_only=0
+    for a in "$@"; do
+        case "$a" in
+            --sets)  do_sets=1; do_disks=0 ;;
+            --disks) do_sets=0; do_disks=1 ;;
+            --show)  show_only=1 ;;
+            -h|--help)
+                cat <<EOF
+Usage: $SCRIPT_NAME baseline [--sets|--disks|--show]
+
+Snapshots the currently-existing RAID sets and/or attached disks into
+the "expected baseline" used by REQUIRED_SETS=all / REQUIRED_DISKS=all.
+
+  (no args)  Update both set and disk baselines.
+  --sets     Update the RAID set baseline only.
+  --disks    Update the disk baseline only.
+  --show     Print the current baseline files without modifying them.
+
+Baseline files:
+  $(baseline_sets_file)
+  $(baseline_disks_file)
+EOF
+                return 0
+                ;;
+            *)
+                die "Unknown baseline option: $a (try: --sets | --disks | --show | --help)"
+                ;;
+        esac
+    done
+
+    if [ "$show_only" = "1" ]; then
+        step "Current baseline"
+        f=$(baseline_sets_file)
+        if [ -f "$f" ]; then
+            info "RAID sets ($f):"
+            sed 's/^/    /' "$f"
+        else
+            warn "No set baseline file yet: $f"
+        fi
+        echo
+        f=$(baseline_disks_file)
+        if [ -f "$f" ]; then
+            info "Disks ($f):"
+            sed 's/^/    /' "$f"
+        else
+            warn "No disk baseline file yet: $f"
+        fi
+        return 0
+    fi
+
+    if [ "$do_sets" = "1" ]; then
+        step "Updating RAID set baseline"
+        explain "Snapshotting names of all currently-existing RAID sets to:"
+        explain "  $(baseline_sets_file)"
+        baseline_write_sets
+        info "Baselined RAID sets:"
+        baseline_read_sets | sed 's/^/    /'
+    fi
+
+    if [ "$do_disks" = "1" ]; then
+        step "Updating disk baseline"
+        explain "Snapshotting identifiers of all currently-attached physical disks to:"
+        explain "  $(baseline_disks_file)"
+        baseline_write_disks
+        info "Baselined disks:"
+        baseline_read_disks | sed 's/^/    /'
+    fi
+
+    ok "Baseline updated."
+    info "REQUIRED_SETS=all / REQUIRED_DISKS=all will compare against these files."
 }
 
 # ----------------------------------------------------------------------
@@ -1202,7 +2007,7 @@ cmd_install_daemon() {
     cfg_load
     plist="${LAUNCHD_PLIST}"
     label="${LAUNCHD_LABEL}"
-    interval="${LAUNCHD_INTERVAL_SEC:-60}"
+    interval="${LAUNCHD_INTERVAL:-60}"
 
     # Self path: the absolute path to this script, so the plist can call it.
     self=$(cd "$(dirname "$0")" && pwd)/$(basename "$0")
@@ -1282,6 +2087,190 @@ EOF
     info "Status:     sudo launchctl list | grep $label"
 }
 
+# ----------------------------------------------------------------------
+# `daemon-status` - show the health-monitoring daemon's state: plist
+# file presence, launchd registration, last exit status, log activity,
+# and whether the daemon can actually write to its state dir and log.
+#
+# Designed to answer "is it actually running properly?" in one place.
+# Pure read-only: no sudo, no state changes.
+# ----------------------------------------------------------------------
+cmd_daemon_status() {
+    cfg_load
+    plist="${LAUNCHD_PLIST}"
+    label="${LAUNCHD_LABEL}"
+
+    step "appleRAID daemon status"
+    info "Config file:   $LOADED_CONFIG"
+    info "Plist path:    $plist"
+    info "Launchd label: $label"
+    info "Run interval:  ${LAUNCHD_INTERVAL}s ($(format_duration "$LAUNCHD_INTERVAL"))"
+    echo
+
+    # --- Check 1/7: plist file on disk -----------------------------
+    step "Check 1/7: Plist file"
+    if [ -f "$plist" ]; then
+        mtime=$(stat -f '%Sm' -t '%Y-%m-%d %H:%M:%S' "$plist" 2>/dev/null)
+        ok "Present. Last modified: $mtime"
+    else
+        err "Plist file missing: $plist"
+        warn "Run:  sudo $SCRIPT_NAME install-daemon"
+        return 1
+    fi
+    echo
+
+    # --- Check 2/7: plist content matches current config -----------
+    step "Check 2/7: Plist content vs current config"
+    # The plist embeds the absolute path of this script and the interval
+    # value. If someone renamed the script or changed LAUNCHD_INTERVAL,
+    # the on-disk plist is stale.
+    self=$(cd "$(dirname "$0")" && pwd)/$(basename "$0")
+    stale=0
+    if ! grep -qF "<string>$self</string>" "$plist" 2>/dev/null; then
+        warn "Plist references a DIFFERENT script path than this one:"
+        warn "  This script: $self"
+        warn "  In plist:    $(grep -A0 '<string>.*/appleRAID</string>' "$plist" 2>/dev/null | head -1 | sed 's/^[[:space:]]*//')"
+        stale=1
+    fi
+    plist_interval=$(awk '
+        /<key>StartInterval<\/key>/ { next_is_int=1; next }
+        next_is_int && /<integer>/ {
+            sub(/.*<integer>/,""); sub(/<\/integer>.*/,""); print; exit
+        }
+    ' "$plist" 2>/dev/null)
+    if [ -n "$plist_interval" ] && [ "$plist_interval" != "$LAUNCHD_INTERVAL" ]; then
+        warn "StartInterval in plist ($plist_interval) differs from config ($LAUNCHD_INTERVAL)"
+        stale=1
+    fi
+    if [ "$stale" = "1" ]; then
+        info "Re-run:  sudo $SCRIPT_NAME install-daemon    to regenerate the plist"
+    else
+        ok "Plist content matches current script + config."
+    fi
+    echo
+
+    # --- Check 3/7: loaded in launchd ------------------------------
+    step "Check 3/7: launchd registration"
+    # 'launchctl list <label>' returns 0 if loaded, non-zero if not.
+    # No sudo needed for a system-domain query read-only lookup.
+    if launchctl list "$label" >/dev/null 2>&1; then
+        ok "Loaded (launchctl list '$label' succeeds)."
+    elif sudo -n launchctl list "$label" >/dev/null 2>&1; then
+        ok "Loaded (visible via sudo)."
+    else
+        err "NOT loaded in launchd."
+        warn "Run:  sudo launchctl bootstrap system $plist"
+        warn "Or:   sudo $SCRIPT_NAME install-daemon"
+        # Continue with remaining checks anyway - the log / state info
+        # is still useful even when not loaded.
+    fi
+    echo
+
+    # --- Check 4/7: PID + last exit status -------------------------
+    step "Check 4/7: Process + last exit status"
+    # Try both userspace and (if available) sudo to read the job dict.
+    out=$(launchctl list "$label" 2>/dev/null || sudo -n launchctl list "$label" 2>/dev/null)
+    if [ -n "$out" ]; then
+        pid=$(echo "$out" | awk -F'[=;]' '/"PID"/ {gsub(/[ \t]/, "", $2); print $2}')
+        last_exit=$(echo "$out" | awk -F'[=;]' '/"LastExitStatus"/ {gsub(/[ \t]/, "", $2); print $2}')
+        case "$pid" in
+            ""|0) info "Not currently running (expected - launchd invokes it every ${LAUNCHD_INTERVAL}s)." ;;
+            *)    info "Currently running as PID $pid" ;;
+        esac
+        case "$last_exit" in
+            ""|0) ok "Last exit status: 0 (healthy)" ;;
+            *)    warn "Last exit status: $last_exit (non-zero - check log)" ;;
+        esac
+    else
+        warn "Could not read launchd job state (try: sudo $SCRIPT_NAME daemon-status)"
+    fi
+    echo
+
+    # --- Check 5/7: log file -------------------------------------
+    step "Check 5/7: Log file"
+    if [ -n "${LOG_FILE:-}" ] && [ -f "$LOG_FILE" ]; then
+        lmtime=$(stat -f '%m' "$LOG_FILE" 2>/dev/null)
+        if [ -n "$lmtime" ]; then
+            ago=$(( $(date +%s) - lmtime ))
+            human=$(stat -f '%Sm' -t '%Y-%m-%d %H:%M:%S' "$LOG_FILE" 2>/dev/null)
+            info "Log: $LOG_FILE"
+            info "  Last write: $human (${ago}s ago)"
+            # If the log hasn't been touched in >2x the interval, something's
+            # probably wrong.
+            threshold=$(( LAUNCHD_INTERVAL * 2 + 30 ))
+            if [ "$ago" -gt "$threshold" ]; then
+                warn "Log hasn't been written to in ${ago}s (interval is ${LAUNCHD_INTERVAL}s)."
+                warn "The daemon may not be running. Check:"
+                warn "  tail /var/log/appleRAID.launchd.err"
+            else
+                ok "Log activity is recent."
+            fi
+        fi
+        # Last few log lines for quick visual check.
+        info "Last 3 log lines:"
+        tail -3 "$LOG_FILE" 2>/dev/null | sed 's/^/    /'
+    else
+        warn "Log file not present or not configured: ${LOG_FILE:-<unset>}"
+        info "  (launchd stderr/stdout logs may still exist at"
+        info "   /var/log/appleRAID.launchd.{err,out} - check those.)"
+    fi
+    echo
+
+    # --- Check 6/7: launchd stderr (last errors) -------------------
+    step "Check 6/7: Launchd stderr log"
+    err_log="/var/log/appleRAID.launchd.err"
+    if [ -f "$err_log" ]; then
+        sz=$(stat -f '%z' "$err_log" 2>/dev/null)
+        if [ "${sz:-0}" = "0" ]; then
+            ok "Stderr log empty (no recent errors)."
+        else
+            warn "Stderr log has content ($sz bytes). Last 5 lines:"
+            tail -5 "$err_log" 2>/dev/null | sed 's/^/    /'
+        fi
+    else
+        info "No stderr log yet: $err_log"
+    fi
+    echo
+
+    # --- Check 7/7: state dir writable -----------------------------
+    step "Check 7/7: Writable paths"
+    # The daemon runs as root via launchd, but if it were ever run
+    # manually as a non-root user, the state dir may not be writable.
+    # Check the *current* user's ability to touch these paths - a
+    # best-effort diagnostic.
+    if [ -d "$STATE_DIR" ]; then
+        if [ -w "$STATE_DIR" ]; then
+            ok "State dir writable by current user: $STATE_DIR"
+        else
+            warn "State dir NOT writable by current user: $STATE_DIR"
+            info "  (Daemon runs as root via launchd, so this is probably fine."
+            info "   But you won't be able to run 'appleRAID health' manually)"
+        fi
+    else
+        warn "State dir does not exist: $STATE_DIR"
+        info "  Will be auto-created on first daemon run."
+    fi
+    if [ -n "${LOG_FILE:-}" ]; then
+        parent=$(dirname "$LOG_FILE")
+        if [ -w "$parent" ]; then
+            ok "Log directory writable by current user: $parent"
+        else
+            info "Log directory NOT writable by current user: $parent"
+            info "  (Daemon runs as root via launchd, so this is probably fine.)"
+        fi
+    fi
+    echo
+
+    step "Quick actions"
+    cat <<EOF
+  Tail the log live:       tail -f ${LOG_FILE:-/var/log/appleRAID.log}
+  Tail launchd stderr:     tail -f /var/log/appleRAID.launchd.err
+  Force an immediate run:  sudo launchctl kickstart -k system/$label
+  Reload the plist:        sudo $SCRIPT_NAME uninstall-daemon && sudo $SCRIPT_NAME install-daemon
+  Full health overview:    $SCRIPT_NAME report
+EOF
+}
+
 cmd_uninstall_daemon() {
     cfg_load
     plist="${LAUNCHD_PLIST}"
@@ -1296,6 +2285,487 @@ cmd_uninstall_daemon() {
         || warn "launchctl unload failed (maybe not loaded)"
     run sudo rm -f "$plist"
     ok "Uninstalled."
+}
+
+# ======================================================================
+# SoftRAID detection + migration helpers
+# ======================================================================
+
+# Return whole-disk identifiers (diskN) that appear to be SoftRAID
+# members, based on `diskutil info` content markers. Conservative:
+# prefers false-negative over false-positive. Empty output when
+# SoftRAID is not installed or no SoftRAID volumes exist.
+list_softraid_disks() {
+    list_all_physical_disks | while read -r d; do
+        [ -n "$d" ] || continue
+        if diskutil info "/dev/$d" 2>/dev/null | grep -qiE "SoftRAID"; then
+            echo "$d"
+            continue
+        fi
+        # Also probe partitions.
+        diskutil list "/dev/$d" 2>/dev/null \
+            | awk '/^ *[0-9]+:/ {print $NF}' \
+            | while read -r part; do
+                [ -n "$part" ] || continue
+                if diskutil info "/dev/$part" 2>/dev/null | grep -qiE "SoftRAID"; then
+                    echo "$d"
+                    break
+                fi
+            done
+    done | awk '!seen[$0]++'
+}
+
+# True if SoftRAID app or background daemon is currently running.
+softraid_is_running() {
+    pgrep -i -f "SoftRAID\\|softraidd" >/dev/null 2>&1
+}
+
+# True if the SoftRAID system extension / kext appears loaded.
+softraid_extension_loaded() {
+    if command -v systemextensionsctl >/dev/null 2>&1; then
+        if systemextensionsctl list 2>/dev/null | grep -qi softraid; then
+            return 0
+        fi
+    fi
+    if command -v kextstat >/dev/null 2>&1; then
+        if kextstat 2>/dev/null | grep -qi softraid; then
+            return 0
+        fi
+    fi
+    return 1
+}
+
+# ----------------------------------------------------------------------
+# `uninstall-softraid` - pre-flight + post-flight checklist for
+# removing SoftRAID. This command does NOT delete anything itself -
+# use SoftRAID's own uninstaller (handles the system extension
+# correctly) and AppCleaner (handles app bundle remnants).
+# ----------------------------------------------------------------------
+cmd_uninstall_softraid() {
+    step "SoftRAID uninstall verification"
+    explain "This command checks whether SoftRAID has been cleanly removed."
+    explain "It does NOT delete anything itself - the right tools are:"
+    explain "  1. SoftRAID.app -> SoftRAID menu -> Uninstall SoftRAID..."
+    explain "  2. AppCleaner (drag the SoftRAID app into it for leftover files)"
+    echo
+
+    step "Check 1/3: SoftRAID volumes"
+    sr_disks=$(list_softraid_disks)
+    if [ -z "$sr_disks" ]; then
+        ok "No SoftRAID volumes detected."
+    else
+        err "SoftRAID membership still present on:"
+        echo "$sr_disks" | sed 's|^|    /dev/|'
+        warn "Migrate or delete these volumes BEFORE uninstalling SoftRAID."
+        warn "Use: appleRAID migrate-softraid"
+    fi
+    echo
+
+    step "Check 2/3: Running processes"
+    if softraid_is_running; then
+        warn "SoftRAID app or daemon is running. Quit it before uninstalling:"
+        pgrep -l -f "SoftRAID\\|softraidd" 2>/dev/null | sed 's/^/    /'
+    else
+        ok "No SoftRAID processes running."
+    fi
+    echo
+
+    step "Check 3/3: System extension / kext"
+    if softraid_extension_loaded; then
+        warn "SoftRAID system extension (or kext) is still registered."
+        if command -v systemextensionsctl >/dev/null 2>&1; then
+            systemextensionsctl list 2>/dev/null | grep -i softraid | sed 's/^/    /'
+        fi
+        info "This is removed by SoftRAID's own uninstaller + a reboot."
+    else
+        ok "No SoftRAID system extension / kext detected."
+    fi
+    echo
+
+    step "Uninstall checklist (do these in order)"
+    cat <<EOF
+  1. Open SoftRAID.app
+  2. SoftRAID menu -> "Uninstall SoftRAID..."
+  3. Enter your admin password when prompted
+  4. Reboot  (required for system-extension removal)
+  5. After reboot, run AppCleaner and drop SoftRAID.app onto it
+     to catch leftover preferences / caches / logs
+  6. Re-run '$SCRIPT_NAME uninstall-softraid' to verify
+
+This command does NOT delete anything itself.
+EOF
+}
+
+# ----------------------------------------------------------------------
+# `migrate-softraid` - guided, per-mirror migration from SoftRAID to
+# AppleRAID. Intended to be run once per existing SoftRAID mirror.
+#
+# Flow:
+#   1. List detected SoftRAID member disks, let the user pick a pair
+#   2. Confirm the user has backed up the data
+#   3. Walk through SoftRAID-side volume deletion + "delete secrets"
+#      (which the user does inside SoftRAID.app, verified afterwards)
+#   4. Wipe both disks (first+last 100 MB)
+#   5. Create AppleRAID mirror
+#
+# This wraps existing primitives (wipe + create) around SoftRAID-
+# specific steps. It does NOT mount SoftRAID volumes, manipulate
+# SoftRAID's internal state, or touch the SoftRAID app - those are
+# the user's responsibility.
+# ----------------------------------------------------------------------
+cmd_migrate_softraid() {
+    step "Guided SoftRAID-to-AppleRAID migration (one mirror)"
+    explain "This command walks you through migrating ONE SoftRAID mirror to"
+    explain "AppleRAID. Run it once per mirror you want to convert. The other"
+    explain "SoftRAID mirrors keep working throughout - you migrate one at a time."
+    echo
+
+    step "Step 1: Detect SoftRAID disks"
+    sr_disks=$(list_softraid_disks)
+    if [ -z "$sr_disks" ]; then
+        warn "No SoftRAID member disks detected. Nothing to migrate."
+        info "If you believe SoftRAID disks are present, verify manually with:"
+        info "  diskutil info /dev/diskN | grep -i softraid"
+        return 0
+    fi
+    info "Disks that appear to be SoftRAID members:"
+    echo "$sr_disks" | while read -r d; do
+        [ -n "$d" ] || continue
+        describe_disk "/dev/$d"
+    done
+    echo
+    warn "Detection is heuristic - verify with SoftRAID.app if in doubt."
+    echo
+
+    step "Step 2: Pre-flight checklist"
+    cat <<EOF
+Before proceeding, confirm:
+  [ ] You have backed up the mirror's data (migration is destructive)
+  [ ] You have the two member disk numbers ready
+  [ ] You have done the SoftRAID-side cleanup for this specific mirror:
+        * In SoftRAID.app: select the volume -> Volume menu -> Delete Volume
+        * For each member disk: Disk menu -> "Erase Disk" or the
+          equivalent command to remove SoftRAID secrets
+      (if "Delete Secrets" is not in your SoftRAID version's menu, see:
+       '$SCRIPT_NAME' earlier conversation / SoftRAID docs)
+  [ ] The OTHER SoftRAID mirrors on this Mac are still intact and will
+      remain managed by SoftRAID during this migration
+EOF
+    echo
+    confirm "All four items above are done?" || die "Aborted. Complete the checklist first."
+    echo
+
+    step "Step 3: Select the two disks"
+    printf 'Enter disk NUMBER of first member (e.g. 2): '
+    read -r n1
+    printf 'Enter disk NUMBER of second member (e.g. 3): '
+    read -r n2
+    if [ -z "$n1" ] || [ -z "$n2" ]; then
+        die "Both disk numbers are required."
+    fi
+    [ "$n1" = "$n2" ] && die "Cannot mirror a disk to itself."
+
+    dev1=$(resolve_disk "$n1") || die "Invalid: $n1"
+    dev2=$(resolve_disk "$n2") || die "Invalid: $n2"
+
+    printf 'Enter a name for the new AppleRAID mirror (e.g. Mirror2): '
+    read -r new_name
+    [ -n "$new_name" ] || die "Name is required."
+    echo
+
+    step "Step 4: Confirm plan"
+    info "About to:"
+    info "  - WIPE first + last 100 MB of $dev1"
+    info "  - WIPE first + last 100 MB of $dev2"
+    info "  - Create AppleRAID mirror '$new_name' (APFS) from $dev1 + $dev2"
+    echo
+    confirm "Proceed?" || die "Aborted."
+    echo
+
+    step "Step 5: Handing off to '$SCRIPT_NAME create' with prepared disks"
+    # cmd_create will do its own confirmations. We've pre-confirmed here,
+    # but the existing create flow's safety prompts are valuable and we
+    # don't short-circuit them.
+    cmd_create "$new_name" "$n1" "$n2"
+
+    echo
+    ok "Migration complete for mirror '$new_name'."
+    info "Next steps:"
+    info "  - Restore data from backup into /Volumes/$new_name"
+    info "  - Migrate remaining SoftRAID mirrors: re-run 'appleRAID migrate-softraid'"
+    info "  - Once ALL mirrors are migrated, run 'appleRAID uninstall-softraid'"
+    info "    for the final uninstall checklist."
+}
+
+# ======================================================================
+# Human-readable health report
+# ======================================================================
+
+# ----------------------------------------------------------------------
+# `report` - overview of everything the daemon currently thinks, in
+# readable form. Pure read-only: doesn't trigger alerts, doesn't
+# modify state.
+# ----------------------------------------------------------------------
+cmd_report() {
+    cfg_load
+    state_init 2>/dev/null || true
+
+    step "appleRAID health report"
+    info "Generated: $(now_iso)"
+    info "Host:      $(hostname)"
+    info "Config:    $LOADED_CONFIG"
+    echo
+
+    # --- RAID sets ---
+    step "RAID sets"
+    uuids=$(raid_list_uuids)
+    if [ -z "$uuids" ]; then
+        warn "No AppleRAID sets present."
+    else
+        for u in $uuids; do
+            name=$(diskutil appleRAID list | awk -F': +' -v u="$u" '
+                /^Name:/      { cur = $2; sub(/ +$/, "", cur) }
+                /^Unique ID:/ { uuid = $2; sub(/ +$/, "", uuid); if (uuid == u) { print cur; exit } }
+            ')
+            st=$(raid_status "$u")
+            dev=$(raid_uuid_to_device "$u")
+            case "$st" in
+                Online)   color="$C_GREEN" ;;
+                Degraded) color="$C_YELLOW" ;;
+                *)        color="$C_RED" ;;
+            esac
+            printf '  %-20s  %s%-12s%s  dev=/dev/%s\n' \
+                "$name" "$color" "$st" "$C_RESET" "$dev"
+            # Per-member line
+            diskutil appleRAID list "$u" 2>/dev/null | awk '
+                /^[0-9]+[ \t]+disk/ {
+                    devnode = $2
+                    status = ""
+                    for (i = 4; i < NF; i++) {
+                        status = (status == "" ? $i : status " " $i)
+                    }
+                    printf "      %-10s %s\n", devnode, status
+                }
+            '
+        done
+    fi
+    echo
+
+    # --- Required set/disk baselines ---
+    step "Baselines (for REQUIRED_*=all presence checks)"
+    f=$(baseline_sets_file)
+    if [ -f "$f" ]; then
+        info "Set baseline ($f):"
+        baseline_read_sets | sed 's/^/    /'
+    else
+        warn "No set baseline file yet (will be auto-created on first health run)."
+    fi
+    f=$(baseline_disks_file)
+    if [ -f "$f" ]; then
+        info "Disk baseline ($f):"
+        baseline_read_disks | sed 's/^/    /'
+    else
+        warn "No disk baseline file yet (will be auto-created on first health run)."
+    fi
+    echo
+
+    # --- Active problems ---
+    step "Active problems (state DB)"
+    if [ ! -f "${STATE_FILE:-/nonexistent}" ]; then
+        info "No state file yet (daemon hasn't run, or state dir not writable)."
+    else
+        hashes=$(state_list_hashes)
+        if [ -z "$hashes" ]; then
+            ok "No active problems recorded."
+        else
+            printf '  %-6s  %-20s  %s\n' "SEV" "FIRST SEEN" "SUMMARY"
+            printf '  %-6s  %-20s  %s\n' "---" "----------" "-------"
+            for h in $hashes; do
+                sev=$(state_field "$h" 2)
+                first=$(state_field "$h" 3)
+                summary=$(state_field "$h" 6)
+                case "$sev" in
+                    crit) col="$C_RED" ;;
+                    warn) col="$C_YELLOW" ;;
+                    *)    col="" ;;
+                esac
+                printf '  %s%-6s%s  %-20s  %s\n' \
+                    "$col" "$sev" "$C_RESET" "${first%%+*}" "$summary"
+            done
+        fi
+    fi
+    echo
+
+    # --- Pending grace timers ---
+    step "Pending grace timers"
+    pending_found=0
+    # Use shell expansion with guard to handle the "no match" case.
+    for f in "${STATE_DIR}"/pending-*; do
+        [ -f "$f" ] || continue
+        pending_found=1
+        nm=$(basename "$f" | sed 's/^pending-//')
+        ts=$(cat "$f" 2>/dev/null)
+        if [ -n "$ts" ]; then
+            elapsed=$(( $(date +%s) - ts ))
+            printf '  MISSING  %-25s  elapsed %ss\n' "$nm" "$elapsed"
+        fi
+    done
+    for f in "${STATE_DIR}"/seen-*; do
+        [ -f "$f" ] || continue
+        pending_found=1
+        nm=$(basename "$f" | sed 's/^seen-//')
+        ts=$(cat "$f" 2>/dev/null)
+        if [ -n "$ts" ]; then
+            elapsed=$(( $(date +%s) - ts ))
+            printf '  PRESENT  %-25s  elapsed %ss (auto-baseline pending)\n' "$nm" "$elapsed"
+        fi
+    done
+    [ "$pending_found" = "0" ] && ok "No pending timers."
+    echo
+
+    # --- SMART last run ---
+    step "SMART polling"
+    f=$(smart_last_run_file)
+    if [ -f "$f" ]; then
+        last=$(cat "$f" 2>/dev/null)
+        if [ -n "$last" ]; then
+            ago=$(( $(date +%s) - last ))
+            info "Last SMART poll:  $(date -r "$last" '+%Y-%m-%d %H:%M:%S')  (${ago}s ago)"
+            info "Next scheduled:   every ${SMART_POLL_INTERVAL}s ($(format_duration "$SMART_POLL_INTERVAL"))"
+        fi
+    else
+        info "SMART has not run yet."
+    fi
+    echo
+
+    # --- SoftRAID status (informational) ---
+    step "SoftRAID presence"
+    if softraid_extension_loaded; then
+        warn "SoftRAID system extension / kext is loaded."
+    else
+        ok "No SoftRAID extension / kext detected."
+    fi
+    sr=$(list_softraid_disks)
+    if [ -n "$sr" ]; then
+        warn "SoftRAID member disks still present:"
+        echo "$sr" | sed 's|^|    /dev/|'
+    else
+        ok "No SoftRAID member disks detected."
+    fi
+}
+
+# ======================================================================
+# SMART USB/Thunderbolt bridge-type auto-detection with per-disk cache
+# ======================================================================
+# smartctl on macOS needs '-d <type>' for many USB/Thunderbolt bridges.
+# Wrong type = empty/meaningless output. We probe the common types and
+# cache the working value per (disk, drive-serial) pair, so a disk
+# re-enumerating at a different /dev/diskN still uses its correct type
+# but a different physical drive at the same diskN doesn't inherit a
+# stale cached value.
+#
+# Cache file: $STATE_DIR/smart-dtype-cache
+# Format:    diskN|serial-hash|dtype
+# Values:    'native' | 'sat' | 'usbjmicron' | 'usbprolific' | 'usbsunplus' | 'nvme'
+# ----------------------------------------------------------------------
+
+smart_cache_file() { echo "${STATE_DIR}/smart-dtype-cache"; }
+
+# Stable short hash of a disk's serial number (first 16 chars of SHA1).
+# If we can't get the serial, return 'unknown' - still cacheable but
+# not drive-movement-stable.
+disk_serial_hash() {
+    dev="/dev/${1#/dev/}"
+    serial=$(diskutil info "$dev" 2>/dev/null \
+        | awk -F': *' '/Media Serial Number|Volume UUID/ {print $2; exit}')
+    if [ -z "$serial" ]; then
+        echo "unknown"
+    else
+        printf '%s' "$serial" | shasum | awk '{print substr($1,1,16)}'
+    fi
+}
+
+# Look up cached -d type for this disk+serial. Empty if not cached.
+smart_dtype_lookup() {
+    disk="$1"; serial_hash="$2"
+    f=$(smart_cache_file)
+    [ -f "$f" ] || return 0
+    awk -F'|' -v d="$disk" -v s="$serial_hash" '
+        /^#/ { next }
+        $1 == d && $2 == s { print $3; exit }
+    ' "$f"
+}
+
+# Store -d type in cache (replaces any prior entry for same disk+serial).
+smart_dtype_store() {
+    disk="$1"; serial_hash="$2"; dtype="$3"
+    f=$(smart_cache_file)
+    if [ ! -f "$f" ]; then
+        {
+            echo "# appleRAID smartctl -d type cache"
+            echo "# Format: disk|serial_hash|dtype"
+        } > "$f"
+    fi
+    tmp=$(mktemp "${f}.XXXXXX") || return 1
+    awk -F'|' -v d="$disk" -v s="$serial_hash" '
+        /^#/ { print; next }
+        !($1 == d && $2 == s) { print }
+    ' "$f" > "$tmp"
+    printf '%s|%s|%s\n' "$disk" "$serial_hash" "$dtype" >> "$tmp"
+    mv "$tmp" "$f"
+}
+
+# Probe smartctl with the given -d type. Returns 0 if smartctl was
+# able to retrieve attributes (indicating the type is correct).
+smart_dtype_probe() {
+    dev="$1"; dtype="$2"
+    case "$dtype" in
+        native) out=$(smartctl -A "$dev" 2>/dev/null) ;;
+        *)      out=$(smartctl -A -d "$dtype" "$dev" 2>/dev/null) ;;
+    esac
+    # A working probe returns the attribute table header.
+    echo "$out" | grep -qE '^ID#.*ATTRIBUTE_NAME|^SMART Attributes' 2>/dev/null
+}
+
+# Determine the correct -d type for a disk, caching the result.
+# Returns the dtype on stdout ('native' | 'sat' | 'usbjmicron' | ...).
+# Empty output if no type works (disk doesn't support SMART).
+smart_dtype_for() {
+    d="$1"
+    dev="/dev/$d"
+    sh=$(disk_serial_hash "$d")
+
+    cached=$(smart_dtype_lookup "$d" "$sh")
+    if [ -n "$cached" ]; then
+        echo "$cached"
+        return 0
+    fi
+
+    log_debug "Probing smartctl -d types for $dev (serial=$sh)"
+    for candidate in native sat usbjmicron usbprolific usbsunplus nvme; do
+        if smart_dtype_probe "$dev" "$candidate"; then
+            log_info "Cached smartctl type for $d: $candidate"
+            smart_dtype_store "$d" "$sh" "$candidate"
+            echo "$candidate"
+            return 0
+        fi
+    done
+    log_warn "No smartctl -d type works for $dev - SMART unavailable on this disk"
+    smart_dtype_store "$d" "$sh" "none"
+    echo ""
+}
+
+# Helper: build the `smartctl` command-line prefix for a disk, using
+# the cached dtype. Example usage in a caller:
+#   $(smart_cmd "$d") -H /dev/$d
+smart_cmd() {
+    d="$1"
+    t=$(smart_dtype_for "$d")
+    case "$t" in
+        ""|none) echo "smartctl" ;;
+        native)  echo "smartctl" ;;
+        *)       echo "smartctl -d $t" ;;
+    esac
 }
 
 # ----------------------------------------------------------------------
@@ -1366,15 +2836,27 @@ ${C_BOLD}COMMANDS${C_RESET}
                               write/read probe, RAID consistency.
   ${C_CYAN}destroy${C_RESET} [name|uuid]         Delete a RAID set (data loss - confirms twice).
 
+  ${C_BOLD}-- SoftRAID migration --${C_RESET}
+  ${C_CYAN}migrate-softraid${C_RESET}            Interactive per-mirror guide: detect SoftRAID
+                              members, wipe them, and create an AppleRAID
+                              mirror in their place. Run once per mirror.
+                              Wraps the existing wipe+create flow with
+                              SoftRAID-specific pre-flight checks.
+  ${C_CYAN}uninstall-softraid${C_RESET}          Pre/post-flight verification for removing
+                              SoftRAID. Does NOT delete anything itself -
+                              points you at SoftRAID's own uninstaller
+                              and AppCleaner. Run it before AND after to
+                              verify clean removal.
+
   ${C_BOLD}-- Health monitoring (designed for launchd) --${C_RESET}
   ${C_CYAN}health${C_RESET} [--dry-run|--once|-v]
                               Run one monitoring pass. Checks RAID set
                               state on every call. Runs SMART checks
-                              once per SMART_POLL_INTERVAL_SEC (default:
+                              once per SMART_POLL_INTERVAL (default:
                               daily). On new/ongoing problems: plays
-                              alarm (rate-limited by ALARM_INTERVAL_SEC),
+                              alarm (rate-limited by ALARM_INTERVAL),
                               sends email (rate-limited by
-                              EMAIL_INTERVAL_SEC), and logs.
+                              EMAIL_INTERVAL), and logs.
                                 --dry-run  perform checks, no alerts
                                 --once     bypass rate limits (testing)
                                 -v         debug logging for this run
@@ -1384,14 +2866,35 @@ ${C_BOLD}COMMANDS${C_RESET}
   ${C_CYAN}create-config${C_RESET} <path>        Write an annotated default config file to
                               <path>. Example:
                                 ${SCRIPT_NAME} create-config ~/.appleRAID.conf
+  ${C_CYAN}baseline${C_RESET} [--sets|--disks|--show]
+                              Snapshot the currently-existing RAID sets
+                              and/or attached disks into the "expected
+                              baseline" used by REQUIRED_SETS=all /
+                              REQUIRED_DISKS=all. Run this after
+                              deliberately adding or removing a RAID
+                              set, or changing your disk lineup.
+                              Does NOT affect SMART monitoring.
+                                --sets   only update the set baseline
+                                --disks  only update the disk baseline
+                                --show   print current baselines only
   ${C_CYAN}test-alerts${C_RESET}                 Exercise every alerting channel (sound,
                               email, log). Run once after setup to
                               verify alerts reach you.
+  ${C_CYAN}report${C_RESET}                      Human-readable health summary: RAID set
+                              status, baselines, active problems from the
+                              state DB, pending grace timers, SMART poll
+                              age, SoftRAID presence. Read-only.
   ${C_CYAN}install-daemon${C_RESET}              Generate and load a LaunchDaemon plist.
                               Path/label/interval from config keys
                               LAUNCHD_PLIST, LAUNCHD_LABEL,
-                              LAUNCHD_INTERVAL_SEC. Requires sudo.
+                              LAUNCHD_INTERVAL. Requires sudo.
   ${C_CYAN}uninstall-daemon${C_RESET}            Unload and remove the LaunchDaemon.
+  ${C_CYAN}daemon-status${C_RESET}               Diagnose the daemon: plist on disk, plist vs
+                              config drift, launchd registration, last
+                              exit status, log recency, stderr tail,
+                              writable paths. Read-only. No sudo needed
+                              (though a few fields are more informative
+                              when run with sudo).
 
   ${C_CYAN}help${C_RESET}, --help, -h            This message.
 
@@ -1720,6 +3223,20 @@ cmd_create() {
     run diskutil list
 
     ok "Mirror '$name' created successfully."
+
+    # Auto-baseline hook: if the user has opted in (via config or by
+    # default), add the new set to the baseline immediately so the
+    # health daemon's REQUIRED_SETS=all check knows about it right away.
+    cfg_load 2>/dev/null || true
+    if [ "${AUTO_BASELINE_FOR_SETS_ON_CREATE:-no}" = "yes" ]; then
+        state_init 2>/dev/null || true
+        baseline_write_sets
+        info "auto-baseline: '$name' added to $(baseline_sets_file)"
+    else
+        info "tip: if you're using the health daemon with REQUIRED_SETS=all, run:"
+        info "       $SCRIPT_NAME baseline --sets"
+        info "     to include '$name' in the expected-set baseline."
+    fi
 }
 
 # Non-interactive wipe used by 'create'. Assumes outer command has
@@ -2025,6 +3542,20 @@ cmd_destroy() {
     run diskutil list
 
     ok "RAID set $SELECTED_UUID destroyed."
+
+    cfg_load 2>/dev/null || true
+    if [ "${AUTO_BASELINE_FOR_SETS_ON_DESTROY:-no}" = "yes" ]; then
+        state_init 2>/dev/null || true
+        # Re-snapshot whatever sets remain - the destroyed one is now gone
+        # from `diskutil appleRAID list`, so baseline_write_sets will
+        # simply not include it.
+        baseline_write_sets
+        info "auto-baseline: $(baseline_sets_file) updated (destroyed set removed)"
+    else
+        info "tip: if you're using the health daemon with REQUIRED_SETS=all, run:"
+        info "       $SCRIPT_NAME baseline --sets"
+        info "     so the daemon stops alerting about the removed set."
+    fi
 }
 
 # ----------------------------------------------------------------------
@@ -2057,9 +3588,14 @@ main() {
         health)             cmd_health "$@" ;;
         show-config)        cmd_show_config "$@" ;;
         create-config)      cmd_create_config "$@" ;;
+        baseline)           cmd_baseline "$@" ;;
+        report)             cmd_report "$@" ;;
         test-alerts)        cmd_test_alerts "$@" ;;
         install-daemon)     cmd_install_daemon "$@" ;;
         uninstall-daemon)   cmd_uninstall_daemon "$@" ;;
+        daemon-status)      cmd_daemon_status "$@" ;;
+        migrate-softraid)   cmd_migrate_softraid "$@" ;;
+        uninstall-softraid) cmd_uninstall_softraid "$@" ;;
         *)
             err "Unknown command: $cmd"
             echo
