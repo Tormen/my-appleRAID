@@ -3275,12 +3275,18 @@ EOF
             "---" "---" "----" "----" "-----" "----"
     fi
 
-    # Iterate every whole disk.
-    diskutil list 2>/dev/null | awk '/^\/dev\/disk[0-9]+/ {
+    # Capture the disk list FIRST into a variable, then iterate with
+    # a for-loop rather than a `while read`. This avoids the classic
+    # POSIX hazard where subshells inside `while read -r d; do ... done`
+    # inherit stdin from the enclosing pipe - commands like smartctl
+    # consume the remaining input and truncate the loop.
+    disks_list=$(diskutil list 2>/dev/null | awk '/^\/dev\/disk[0-9]+/ {
         sub(/:$/, "", $1)
         sub(/^\/dev\//, "", $1)
         print $1
-    }' | while read -r d; do
+    }')
+
+    for d in $disks_list; do
         [ -n "$d" ] || continue
         dev="/dev/$d"
         info_out=$(diskutil info "$dev" 2>/dev/null) || continue
@@ -3344,10 +3350,17 @@ EOF
 
             temp="-"; smart="-"; rot="-"
             if command -v smartctl >/dev/null 2>&1 && [ "$virtual" != "Yes" ]; then
-                sc=$(smart_cmd "$d" 2>/dev/null)
+                # IMPORTANT: every $(...) below inherits stdin from the
+                # enclosing `while read -r d` loop's pipe. smartctl reads
+                # stdin (it tries to open the device only, but the shell
+                # still attaches stdin before exec), which CONSUMES the
+                # remaining disk names and causes the loop to exit after
+                # one iteration. Redirect stdin from /dev/null on every
+                # call to prevent this.
+                sc=$(smart_cmd "$d" </dev/null 2>/dev/null)
                 [ -z "$sc" ] && sc="smartctl"
-                attrs=$($sc -A "$dev" 2>/dev/null)
-                health_raw=$($sc -H "$dev" 2>/dev/null | awk -F': *' '
+                attrs=$($sc -A "$dev" </dev/null 2>/dev/null)
+                health_raw=$($sc -H "$dev" </dev/null 2>/dev/null | awk -F': *' '
                     /SMART overall-health/ { print $2; exit }
                     /SMART Health Status/  { print $2; exit }')
                 health_raw=$(echo "$health_raw" | sed 's/^ *//;s/ *$//')
@@ -3360,7 +3373,7 @@ EOF
                     /^[[:space:]]*(194|190)[[:space:]]+Temperature/ { print $10 "C"; exit }
                 ')
                 [ -z "$temp" ] && temp="-"
-                rot=$($sc -i "$dev" 2>/dev/null | awk -F': +' '/Rotation Rate:/ {
+                rot=$($sc -i "$dev" </dev/null 2>/dev/null | awk -F': +' '/Rotation Rate:/ {
                     gsub(/ *rpm.*/, "", $2); print $2; exit
                 }')
                 case "$rot" in
