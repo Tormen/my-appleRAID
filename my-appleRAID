@@ -345,9 +345,11 @@ cfg_set_defaults() {
     STATE_DIR="/var/db/my-appleRAID"
     LOG_FILE="/var/log/my-appleRAID.log"
     LOG_LEVEL=info                         # error|warn|info|debug
-    # LaunchDaemon installation target (used by install-daemon)
-    LAUNCHD_PLIST="/Library/LaunchDaemons/local.my-appleRAID.health.plist"
-    LAUNCHD_LABEL="local.my-appleRAID.health"
+    # LaunchDaemon installation target (used by install-daemon).
+    # LAUNCHD_LABEL is derived from LAUNCHD_PLIST at load time - do not set manually.
+    LAUNCHD_PLIST="/Library/LaunchDaemons/eu.no-panic.my-appleRAID_health.plist"
+    LAUNCHD_STDOUT_LOG="/var/log/my-appleRAID.launchd.out"
+    LAUNCHD_STDERR_LOG="/var/log/my-appleRAID.launchd.err"
     LAUNCHD_INTERVAL=60
 }
 
@@ -377,6 +379,14 @@ cfg_load() {
         fi
     done
     [ -n "$LOADED_CONFIG" ] || LOADED_CONFIG="(none - defaults in use)"
+
+    # Derive LAUNCHD_LABEL from LAUNCHD_PLIST: strip directory + ".plist".
+    # Doing this after sourcing the config file means the user only needs
+    # to set LAUNCHD_PLIST; the label stays in sync automatically.
+    if [ -n "${LAUNCHD_PLIST:-}" ]; then
+        _tmp="${LAUNCHD_PLIST##*/}"     # basename
+        LAUNCHD_LABEL="${_tmp%.plist}"  # strip extension
+    fi
 
     # Normalize duration-valued config keys: accept either a bare number
     # (seconds) or a suffix like 30s / 5m / 2h / 1d / 1w. Done once at
@@ -1584,7 +1594,7 @@ cmd_show_config() {
         EMAIL_TO EMAIL_FROM EMAIL_SENDER EMAIL_INTERVAL \
         SMART_POLL_INTERVAL SELFTEST_SHORT_SCHEDULE SELFTEST_LONG_SCHEDULE SELFTEST_HOUR \
         STATE_DIR LOG_FILE LOG_LEVEL \
-        LAUNCHD_PLIST LAUNCHD_LABEL LAUNCHD_INTERVAL
+        LAUNCHD_PLIST LAUNCHD_STDOUT_LOG LAUNCHD_STDERR_LOG LAUNCHD_INTERVAL
     do
         eval "v=\${$k}"
         # Annotate duration-valued keys (_INTERVAL or _PERIOD suffix).
@@ -1598,6 +1608,11 @@ cmd_show_config() {
             *) printf '  %-28s = %s\n' "$k" "$v" ;;
         esac
     done
+
+    # Derived values (not user-settable).
+    echo
+    printf '%sDerived:%s\n' "${C_DIM}" "${C_RESET}"
+    printf '  %-28s = %s  (from LAUNCHD_PLIST filename)\n' "LAUNCHD_LABEL" "${LAUNCHD_LABEL:-<unset>}"
 }
 
 # Format an integer number of seconds as the most natural human-readable
@@ -1928,13 +1943,25 @@ LOG_LEVEL=info
 
 # --- LaunchDaemon installation (used by `install-daemon`) -----------
 
-# Full path to the plist. Change this if you prefer a different filename
-# or location (e.g. a user LaunchAgent).
-LAUNCHD_PLIST="/Library/LaunchDaemons/local.my-appleRAID.health.plist"
+# Full path to the plist.
+# The label (used internally by launchd and visible in 'launchctl list')
+# is automatically derived from this filename - you do NOT set it
+# separately. Example:
+#   LAUNCHD_PLIST=".../eu.no-panic.my-appleRAID_health.plist"
+#   -> label becomes  "eu.no-panic.my-appleRAID_health"
+# Use reverse-DNS naming (yourdomain.tld.product_component) to avoid
+# clashes with other launch items.
+LAUNCHD_PLIST="/Library/LaunchDaemons/eu.no-panic.my-appleRAID_health.plist"
 
-# Label - must be unique across launchd and should match the filename
-# (minus .plist).
-LAUNCHD_LABEL="local.my-appleRAID.health"
+# Where launchd writes the daemon's stdout and stderr. These are the
+# paths that end up inside the plist as StandardOutPath / StandardErrorPath,
+# and are the destinations for anything the script prints *outside* the
+# structured log (LOG_FILE). In practice: stdout stays empty, stderr
+# captures any unexpected tracebacks or crash output.
+#
+# Must be writable by root (the daemon runs as root via launchd).
+LAUNCHD_STDOUT_LOG="/var/log/my-appleRAID.launchd.out"
+LAUNCHD_STDERR_LOG="/var/log/my-appleRAID.launchd.err"
 
 # How often launchd should invoke `appleRAID health`.
 # Accepts duration suffixes (see top of file): 60, 1m, 5m, etc.
@@ -2043,15 +2070,19 @@ cmd_install_daemon() {
     plist="${LAUNCHD_PLIST}"
     label="${LAUNCHD_LABEL}"
     interval="${LAUNCHD_INTERVAL:-60}"
+    stdout_log="${LAUNCHD_STDOUT_LOG:-/var/log/my-appleRAID.launchd.out}"
+    stderr_log="${LAUNCHD_STDERR_LOG:-/var/log/my-appleRAID.launchd.err}"
 
     # Self path: the absolute path to this script, so the plist can call it.
     self=$(cd "$(dirname "$0")" && pwd)/$(basename "$0")
 
     step "LaunchDaemon installation plan"
     info "Plist path:   $plist"
-    info "Label:        $label"
+    info "Label:        $label  (derived from plist filename)"
     info "Interval:     ${interval}s"
     info "Script path:  $self"
+    info "Stdout log:   $stdout_log"
+    info "Stderr log:   $stderr_log"
     echo
 
     cat <<EOF
@@ -2074,9 +2105,9 @@ The following plist will be written:
   <key>RunAtLoad</key>
   <true/>
   <key>StandardOutPath</key>
-  <string>/var/log/my-appleRAID.launchd.out</string>
+  <string>$stdout_log</string>
   <key>StandardErrorPath</key>
-  <string>/var/log/my-appleRAID.launchd.err</string>
+  <string>$stderr_log</string>
 </dict>
 </plist>
 
@@ -2102,9 +2133,9 @@ EOF
   <key>RunAtLoad</key>
   <true/>
   <key>StandardOutPath</key>
-  <string>/var/log/my-appleRAID.launchd.out</string>
+  <string>$stdout_log</string>
   <key>StandardErrorPath</key>
-  <string>/var/log/my-appleRAID.launchd.err</string>
+  <string>$stderr_log</string>
 </dict>
 </plist>
 EOF
@@ -2118,7 +2149,7 @@ EOF
         || warn "Could not load the plist automatically. Reboot or run 'sudo launchctl bootstrap system $plist' manually."
 
     ok "LaunchDaemon installed and loaded."
-    info "View logs:  tail -f /var/log/my-appleRAID.launchd.err /var/log/my-appleRAID.log"
+    info "View logs:  tail -f $stderr_log ${LOG_FILE:-/var/log/my-appleRAID.log}"
     info "Status:     sudo launchctl list | grep $label"
 }
 
@@ -2138,7 +2169,7 @@ cmd_daemon_status() {
     step "appleRAID daemon status"
     info "Config file:   $LOADED_CONFIG"
     info "Plist path:    $plist"
-    info "Launchd label: $label"
+    info "Launchd label: $label  (derived from plist filename)"
     info "Run interval:  ${LAUNCHD_INTERVAL}s ($(format_duration "$LAUNCHD_INTERVAL"))"
     echo
 
@@ -2236,7 +2267,7 @@ cmd_daemon_status() {
             if [ "$ago" -gt "$threshold" ]; then
                 warn "Log hasn't been written to in ${ago}s (interval is ${LAUNCHD_INTERVAL}s)."
                 warn "The daemon may not be running. Check:"
-                warn "  tail /var/log/my-appleRAID.launchd.err"
+                warn "  tail ${LAUNCHD_STDERR_LOG:-/var/log/my-appleRAID.launchd.err}"
             else
                 ok "Log activity is recent."
             fi
@@ -2247,13 +2278,15 @@ cmd_daemon_status() {
     else
         warn "Log file not present or not configured: ${LOG_FILE:-<unset>}"
         info "  (launchd stderr/stdout logs may still exist at"
-        info "   /var/log/my-appleRAID.launchd.{err,out} - check those.)"
+        info "   ${LAUNCHD_STDERR_LOG:-/var/log/my-appleRAID.launchd.err}"
+        info "   ${LAUNCHD_STDOUT_LOG:-/var/log/my-appleRAID.launchd.out}"
+        info "   - check those.)"
     fi
     echo
 
     # --- Check 6/7: launchd stderr (last errors) -------------------
     step "Check 6/7: Launchd stderr log"
-    err_log="/var/log/my-appleRAID.launchd.err"
+    err_log="${LAUNCHD_STDERR_LOG:-/var/log/my-appleRAID.launchd.err}"
     if [ -f "$err_log" ]; then
         sz=$(stat -f '%z' "$err_log" 2>/dev/null)
         if [ "${sz:-0}" = "0" ]; then
@@ -2299,7 +2332,7 @@ cmd_daemon_status() {
     step "Quick actions"
     cat <<EOF
   Tail the log live:       tail -f ${LOG_FILE:-/var/log/my-appleRAID.log}
-  Tail launchd stderr:     tail -f /var/log/my-appleRAID.launchd.err
+  Tail launchd stderr:     tail -f ${LAUNCHD_STDERR_LOG:-/var/log/my-appleRAID.launchd.err}
   Force an immediate run:  sudo launchctl kickstart -k system/$label
   Reload the plist:        sudo $SCRIPT_NAME uninstall-daemon && sudo $SCRIPT_NAME install-daemon
   Full health overview:    $SCRIPT_NAME report
