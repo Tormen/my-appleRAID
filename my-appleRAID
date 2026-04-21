@@ -2891,13 +2891,112 @@ cmd_report() {
 
 smart_cache_file() { echo "${STATE_DIR}/smart-dtype-cache"; }
 
+# Resolve a disk's stable identifier for use as "serial". Behavior
+# depends on disk type:
+#
+#   Physical disks: tries, in order:
+#     1. `diskutil info`   'Media Serial Number'     (macOS 11+)
+#     2. `diskutil info`   'Device / Media Serial'   (some variants)
+#     3. `smartctl -i`     'Serial Number'           (always works if SMART works)
+#
+#   Virtual / synthesized disks: no physical serial exists. Returns:
+#     1. AppleRAID Set UUID     (for AppleRAID virtual devices)
+#     2. Disk / Partition UUID  (for APFS containers / synthesized disks)
+#     3. Volume UUID            (last resort - less stable)
+#
+# Empty output only when nothing at all can be determined. Returning
+# the UUID for virtuals means the SERIAL column always has SOMETHING
+# meaningful in it - blank would be wasted screen real estate for what
+# is in fact a perfectly good stable identifier.
+#
+# We NEVER return a physical disk's Volume UUID - that's a filesystem
+# identifier, not a drive identifier, and would change if the volume
+# is reformatted.
+disk_serial() {
+    dev="/dev/${1#/dev/}"
+
+    info_out=$(diskutil info "$dev" 2>/dev/null) || return 0
+
+    # --- Virtual / synthesized disks ---
+    # These have no physical serial, but they DO have stable identifiers
+    # that belong in the SERIAL column: the RAID set UUID for AppleRAID
+    # virtual devices, or the container/partition UUID for APFS / other
+    # synthesized disks. Prefer the most specific / stable one available.
+    _virt=$(echo "$info_out" | awk -F': +' '/Virtual:/ {print $2; exit}')
+    if [ "$_virt" = "Yes" ]; then
+        # AppleRAID Set UUID is most specific for RAID virtual devices.
+        s=$(echo "$info_out" | awk -F': +' '/AppleRAID Set UUID:/ {print $2; exit}')
+        s=$(printf '%s' "$s" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+        if [ -n "$s" ]; then
+            printf '%s' "$s"
+            return 0
+        fi
+        # APFS container / synthesized disk: use Disk/Partition UUID.
+        s=$(echo "$info_out" | awk -F': +' '/Disk \/ Partition UUID:/ {print $2; exit}')
+        s=$(printf '%s' "$s" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+        if [ -n "$s" ]; then
+            printf '%s' "$s"
+            return 0
+        fi
+        # Last-ditch for virtuals: Volume UUID (less stable - changes if
+        # the volume is recreated - but better than nothing for display).
+        s=$(echo "$info_out" | awk -F': +' '/Volume UUID:/ {print $2; exit}')
+        s=$(printf '%s' "$s" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+        if [ -n "$s" ]; then
+            printf '%s' "$s"
+            return 0
+        fi
+        return 0
+    fi
+
+    # --- Physical disks ---
+    # Try diskutil's 'Media Serial Number' field first.
+    s=$(echo "$info_out" | awk -F': +' '/Media Serial Number:/ {print $2; exit}')
+    s=$(printf '%s' "$s" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+    if [ -n "$s" ]; then
+        printf '%s' "$s"
+        return 0
+    fi
+
+    # Some diskutil variants use 'Device / Media Serial' (rare).
+    s=$(echo "$info_out" | awk -F': +' '/Device \/ Media Serial/ {print $2; exit}')
+    s=$(printf '%s' "$s" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+    if [ -n "$s" ]; then
+        printf '%s' "$s"
+        return 0
+    fi
+
+    # Fallback: ask smartctl directly. This is the most reliable source
+    # on macOS for drives behind SATA / USB bridges where diskutil omits
+    # the field.
+    #
+    # NOTE: we intentionally do NOT use smart_cmd() here - that function
+    # would call smart_dtype_for() -> disk_serial_hash() -> disk_serial()
+    # -> infinite recursion. Instead we try a small static list of -d
+    # types directly. This is only used for the SERIAL column display
+    # and for first-time cache priming, so simplicity beats optimality.
+    if command -v smartctl >/dev/null 2>&1; then
+        for _dt in "" "-d sat" "-d usbjmicron" "-d usbprolific" "-d nvme"; do
+            # shellcheck disable=SC2086  # intentional word-split on _dt
+            s=$(smartctl -i $_dt "$dev" </dev/null 2>/dev/null \
+                | awk -F': +' '/^Serial Number:/ {print $2; exit}')
+            s=$(printf '%s' "$s" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+            if [ -n "$s" ]; then
+                printf '%s' "$s"
+                return 0
+            fi
+        done
+    fi
+
+    # No serial available.
+    return 0
+}
+
 # Stable short hash of a disk's serial number (first 16 chars of SHA1).
 # If we can't get the serial, return 'unknown' - still cacheable but
 # not drive-movement-stable.
 disk_serial_hash() {
-    dev="/dev/${1#/dev/}"
-    serial=$(diskutil info "$dev" 2>/dev/null \
-        | awk -F': *' '/Media Serial Number|Volume UUID/ {print $2; exit}')
+    serial=$(disk_serial "$1")
     if [ -z "$serial" ]; then
         echo "unknown"
     else
@@ -3334,7 +3433,7 @@ EOF
         fi
 
         if [ "$VERBOSE" = "1" ]; then
-            serial=$(echo "$info_out" | awk -F': +' '/Disk \/ Partition UUID|Media Serial Number/ {print $2; exit}')
+            serial=$(disk_serial "$d")
             [ -z "$serial" ] && serial="-"
             serial=$(printf '%s' "$serial" | cut -c1-18)
 
