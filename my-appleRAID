@@ -5,6 +5,28 @@
 # POSIX/dash-compatible. Verbose by default: every destructive or
 # state-changing command is printed before being executed.
 #
+# Feature overview:
+#   - Interactive management of AppleRAID mirror sets (list, create, repair,
+#     test, destroy, wipe-and-add).
+#   - Unattended health monitoring (`appleRAID health`) that integrates with
+#     launchd. Polls RAID set state every minute (cheap) and runs SMART
+#     checks once per day (cheap on power / spin-up wear).
+#   - On problems: plays an audible alarm (configurable volume strategy),
+#     logs, and sends rate-limited email via msmtp.
+#   - State-change aware: only re-alarms/re-emails on configurable intervals
+#     so a failed drive doesn't produce 1440 emails per day.
+#   - Self-tests: schedulable SMART short/long self-tests via smartctl -t.
+#
+# Config search path (first readable file wins):
+#   $APPLERAID_CONFIG        (env var, for testing)
+#   /LINKS/default/appleRAID.conf
+#   $HOME/.appleRAID.conf
+#   /usr/local/etc/appleRAID.conf
+#   /etc/appleRAID.conf
+#
+# See `appleRAID --help` for full command list and `appleRAID create-config
+# <path>` to produce a well-commented default config.
+#
 # Author: generated assistant helper script
 # License: public domain / do-what-you-want
 #
@@ -64,7 +86,7 @@ confirm() {
     prompt="$1"
     printf '%s%s%s (yes/no) ' "${C_YELLOW}" "$prompt" "${C_RESET}"
     read -r answer || return 1
-    [ "$answer" = "yes" ] || [ "$answer" = "y" ] || [ "$answer" = "YES" ]
+    [ "$answer" = "yes" ] || [ "$answer" = "y" ] || [ "$answer" = "YES" ] || [ "$answer" = "Y" ]
 }
 
 # Press-enter-to-continue gate.
@@ -124,6 +146,39 @@ assert_whole_disk() {
     fi
 }
 
+# Reject devices that should never be wiped or used as a RAID member:
+#   - internal system disks (prevent catastrophic mistakes)
+#   - virtual disks (AppleRAID virtual device, APFS synthesized)
+#   - disks currently acting as a RAID member for some existing set
+assert_safe_target() {
+    dev="$1"
+    short="${dev#/dev/}"
+
+    # Check Virtual flag
+    virt=$(diskutil info "$dev" 2>/dev/null | awk -F': *' '/Virtual:/ {print $2; exit}')
+    if [ "$virt" = "Yes" ]; then
+        die "$dev is a VIRTUAL device (RAID/APFS container). Refusing to use as a target."
+    fi
+
+    # Check Internal flag - refuse unless user types an extra 'yes-internal'
+    internal=$(diskutil info "$dev" 2>/dev/null | awk -F': *' '/Internal:/ {print $2; exit}')
+    if [ "$internal" = "Yes" ]; then
+        warn "$dev is an INTERNAL disk!"
+        warn "This is most likely your system drive. Using it as a RAID target will DESTROY macOS."
+        confirm "Type 'yes' only if you are ABSOLUTELY certain this is the right disk" \
+            || die "Aborted - internal disk safety check."
+    fi
+
+    # Check if this disk is already a RAID member of any existing set.
+    # diskutil appleRAID list reports member DevNodes like 'disk2s2' - we match disk2.
+    if diskutil appleRAID list 2>/dev/null \
+         | awk '/^[0-9]+[ \t]+disk/ {print $2}' \
+         | sed 's/s[0-9]*$//' \
+         | grep -qx "$short"; then
+        die "$dev is currently a member of an existing AppleRAID set. Destroy that set first."
+    fi
+}
+
 # Print a one-line summary for a disk.
 describe_disk() {
     dev="$1"
@@ -151,18 +206,19 @@ raid_list_uuids() {
 # Given a RAID set UUID, return its virtual device node (e.g. "disk4").
 raid_uuid_to_device() {
     uuid="$1"
-    diskutil appleRAID list 2>/dev/null | awk -v u="$uuid" '
-        /^Unique ID:/   { cur = $3 }
-        /^Device Node:/ { if (cur == u) { print $3; exit } }
+    diskutil appleRAID list 2>/dev/null | awk -F': +' -v u="$uuid" '
+        /^Unique ID:/   { cur = $2; sub(/ +$/, "", cur) }
+        /^Device Node:/ { dev = $2; sub(/ +$/, "", dev); if (cur == u) { print dev; exit } }
     '
 }
 
 # Given a RAID set name, return its UUID.
+# Uses ': *' separator + trim to handle names with spaces.
 raid_name_to_uuid() {
     name="$1"
-    diskutil appleRAID list 2>/dev/null | awk -v n="$name" '
-        /^Name:/       { cur = $2 }
-        /^Unique ID:/  { if (cur == n) { print $3; exit } }
+    diskutil appleRAID list 2>/dev/null | awk -F': +' -v n="$name" '
+        /^Name:/       { cur = $2; sub(/ +$/, "", cur) }
+        /^Unique ID:/  { uuid = $2; sub(/ +$/, "", uuid); if (cur == n) { print uuid; exit } }
     '
 }
 
@@ -171,18 +227,18 @@ raid_device_to_uuid() {
     dev="$1"
     # Strip /dev/ if present.
     short="${dev#/dev/}"
-    diskutil appleRAID list 2>/dev/null | awk -v d="$short" '
-        /^Unique ID:/   { uuid = $3 }
-        /^Device Node:/ { if ($3 == d) { print uuid; exit } }
+    diskutil appleRAID list 2>/dev/null | awk -F': +' -v d="$short" '
+        /^Unique ID:/   { uuid = $2; sub(/ +$/, "", uuid) }
+        /^Device Node:/ { devn = $2; sub(/ +$/, "", devn); if (devn == d) { print uuid; exit } }
     '
 }
 
 # Get status of a RAID set by UUID.
 raid_status() {
     uuid="$1"
-    diskutil appleRAID list 2>/dev/null | awk -v u="$uuid" '
-        /^Unique ID:/ { cur = $3 }
-        /^Status:/    { if (cur == u) { print $2; exit } }
+    diskutil appleRAID list 2>/dev/null | awk -F': +' -v u="$uuid" '
+        /^Unique ID:/ { cur = $2; sub(/ +$/, "", cur) }
+        /^Status:/    { st  = $2; sub(/ +$/, "", st);  if (cur == u) { print st; exit } }
     '
 }
 
@@ -227,6 +283,1061 @@ pick_raid_set() {
     die "No RAID set matches '$choice'."
 }
 
+# ======================================================================
+# Configuration, state, alerting, and health-monitoring machinery
+# ----------------------------------------------------------------------
+# The functions below are only used by `appleRAID health`, `create-config`,
+# `install-daemon`, `uninstall-daemon`, `show-config`, and `test-alerts`.
+# They are deliberately grouped together so that the management-only
+# portion of the script above remains self-contained and simple.
+# ======================================================================
+
+# ----------------------------------------------------------------------
+# Default values for every config key.
+# Each is also documented in the template written by create-config.
+# When a config file is loaded, values it sets OVERRIDE these defaults;
+# values it omits remain at the defaults below.
+# ----------------------------------------------------------------------
+cfg_set_defaults() {
+    # What to monitor
+    MONITOR_SETS="all"                     # "all" or comma-list of names/UUIDs
+    MONITOR_DISKS="auto"                   # "auto" = derive from RAID members
+    # Thresholds
+    TEMP_WARN_C=50
+    TEMP_CRIT_C=58
+    SMART_CHECK_ENABLED=yes                # yes/no: run smartctl -H / -A
+    # Alarm
+    ALARM_SOUND="/System/Library/Sounds/Basso.aiff"
+    ALARM_VOLUME=0.8                       # 0.0 - 1.0
+    ALARM_VOLUME_MODE=boost                # boost|cap|set
+    ALARM_INTERVAL_SEC=60
+    ALARM_ENABLED=yes
+    # Email
+    EMAIL_TO=""                            # empty disables email
+    EMAIL_FROM="appleRAID@$(hostname)"
+    EMAIL_SENDER="/usr/local/bin/msmtp"
+    EMAIL_INTERVAL_SEC=14400               # 4 hours
+    # SMART polling & self-tests
+    SMART_POLL_INTERVAL_SEC=86400          # 1 day
+    SELFTEST_SHORT_SCHEDULE="never"        # never|daily|weekly
+    SELFTEST_LONG_SCHEDULE="weekly"        # never|daily|weekly
+    SELFTEST_HOUR=3                        # 0-23, when scheduled tests kick off
+    # State / logging
+    STATE_DIR="/var/db/appleRAID"
+    LOG_FILE="/var/log/appleRAID.log"
+    LOG_LEVEL=info                         # error|warn|info|debug
+    # LaunchDaemon installation target (used by install-daemon)
+    LAUNCHD_PLIST="/Library/LaunchDaemons/local.appleRAID.health.plist"
+    LAUNCHD_LABEL="local.appleRAID.health"
+    LAUNCHD_INTERVAL_SEC=60
+}
+
+# Path of the config file actually used by this run (for show-config).
+LOADED_CONFIG=""
+
+# ----------------------------------------------------------------------
+# Load config: try each search-path location, source the first that exists.
+# Silent on success; prints [INFO] line if nothing found (defaults used).
+# ----------------------------------------------------------------------
+cfg_load() {
+    cfg_set_defaults
+    # Candidate search path, in priority order.
+    for candidate in \
+        "${APPLERAID_CONFIG:-}" \
+        "/LINKS/default/appleRAID.conf" \
+        "${HOME:-/}/.appleRAID.conf" \
+        "/usr/local/etc/appleRAID.conf" \
+        "/etc/appleRAID.conf"
+    do
+        [ -n "$candidate" ] || continue
+        if [ -r "$candidate" ]; then
+            # shellcheck disable=SC1090
+            . "$candidate"
+            LOADED_CONFIG="$candidate"
+            return 0
+        fi
+    done
+    LOADED_CONFIG="(none - defaults in use)"
+    return 0
+}
+
+# ----------------------------------------------------------------------
+# Logging (respects LOG_LEVEL and writes to LOG_FILE if set).
+# Usage: log_<level> "message..."
+# Levels: error(1) warn(2) info(3) debug(4). Lower = more severe.
+# ----------------------------------------------------------------------
+log_level_num() {
+    case "$1" in
+        error) echo 1 ;;
+        warn)  echo 2 ;;
+        info)  echo 3 ;;
+        debug) echo 4 ;;
+        *)     echo 3 ;;
+    esac
+}
+
+log_write() {
+    lvl="$1"; shift
+    msg="$*"
+    cur=$(log_level_num "${LOG_LEVEL:-info}")
+    this=$(log_level_num "$lvl")
+    [ "$this" -le "$cur" ] || return 0
+    ts=$(date '+%Y-%m-%d %H:%M:%S')
+    line=$(printf '%s [%s] %s' "$ts" "$lvl" "$msg")
+    # Always echo to stderr so launchd stderr log catches it.
+    printf '%s\n' "$line" >&2
+    if [ -n "${LOG_FILE:-}" ]; then
+        # Best effort. Ignore failure (e.g. /var/log not writable as user).
+        printf '%s\n' "$line" >> "$LOG_FILE" 2>/dev/null || true
+    fi
+}
+log_error() { log_write error "$@"; }
+log_warn()  { log_write warn  "$@"; }
+log_info()  { log_write info  "$@"; }
+log_debug() { log_write debug "$@"; }
+
+# ----------------------------------------------------------------------
+# State file (flat pipe-separated, with commented header + explanation).
+# One line per current problem. When a problem clears, its line is removed.
+#
+# Layout:
+#   hash|severity|first_seen|last_alarm|last_email|summary
+#
+# hash       - SHA1 of "kind|target|detail". Identifies a unique problem
+#              across runs so we don't re-alert for an already-known issue.
+# severity   - warn|crit
+# first_seen - ISO8601 timestamp when the problem was first observed.
+# last_alarm - ISO8601 timestamp of last alarm playback.
+# last_email - ISO8601 timestamp of last email sent (or "-" if never).
+# summary    - human-readable one-liner.
+# ----------------------------------------------------------------------
+STATE_FILE=""    # set by state_init based on STATE_DIR
+
+state_init() {
+    STATE_FILE="${STATE_DIR}/state.db"
+    if [ ! -d "$STATE_DIR" ]; then
+        mkdir -p "$STATE_DIR" 2>/dev/null || {
+            log_warn "Could not create state dir $STATE_DIR - using /tmp"
+            STATE_DIR="/tmp"
+            STATE_FILE="${STATE_DIR}/appleRAID-state.db"
+            mkdir -p "$STATE_DIR" 2>/dev/null || true
+        }
+    fi
+    if [ ! -f "$STATE_FILE" ]; then
+        {
+            echo "# appleRAID state file - DO NOT EDIT BY HAND"
+            echo "# One line per active problem. Format:"
+            echo "#   hash|severity|first_seen|last_alarm|last_email|summary"
+            echo "# Lines starting with '#' are ignored."
+        } > "$STATE_FILE"
+    fi
+}
+
+# Return a stable hash for a problem.
+# Args: kind (raid|smart|temp|selftest), target (set/disk name), detail (what's wrong)
+problem_hash() {
+    printf '%s|%s|%s' "$1" "$2" "$3" | shasum | awk '{print $1}'
+}
+
+# Look up a problem by hash. Prints the matching line or empty.
+state_get() {
+    h="$1"
+    [ -f "$STATE_FILE" ] || return 0
+    awk -F'|' -v h="$h" '
+        /^#/ { next }
+        $1 == h { print; exit }
+    ' "$STATE_FILE"
+}
+
+# Upsert a problem: write or replace the line for a given hash.
+# Args: hash, severity, first_seen, last_alarm, last_email, summary
+state_put() {
+    h="$1"; sev="$2"; first="$3"; alarm="$4"; email="$5"; summary="$6"
+    tmp=$(mktemp "${STATE_FILE}.XXXXXX") || die "mktemp failed"
+    awk -F'|' -v h="$h" '
+        /^#/ { print; next }
+        $1 != h { print }
+    ' "$STATE_FILE" > "$tmp"
+    printf '%s|%s|%s|%s|%s|%s\n' "$h" "$sev" "$first" "$alarm" "$email" "$summary" >> "$tmp"
+    mv "$tmp" "$STATE_FILE"
+}
+
+# Remove a problem by hash.
+state_delete() {
+    h="$1"
+    [ -f "$STATE_FILE" ] || return 0
+    tmp=$(mktemp "${STATE_FILE}.XXXXXX") || return 1
+    awk -F'|' -v h="$h" '
+        /^#/ { print; next }
+        $1 != h { print }
+    ' "$STATE_FILE" > "$tmp"
+    mv "$tmp" "$STATE_FILE"
+}
+
+# List all current problem hashes (one per line).
+state_list_hashes() {
+    [ -f "$STATE_FILE" ] || return 0
+    awk -F'|' '/^#/{next} NF>=1 && $1!="" {print $1}' "$STATE_FILE"
+}
+
+# Get field N (1-based) from the state line for a given hash.
+state_field() {
+    h="$1"; n="$2"
+    line=$(state_get "$h")
+    [ -n "$line" ] || return 0
+    echo "$line" | awk -F'|' -v n="$n" '{print $n}'
+}
+
+# Seconds between two ISO8601 timestamps (macOS date parsing).
+# Args: earlier, later  (either may be "-" meaning "infinity ago")
+seconds_between() {
+    a="$1"; b="$2"
+    [ "$a" = "-" ] && { echo 999999999; return 0; }
+    # macOS date -j -f parsing
+    ta=$(date -j -f "%Y-%m-%dT%H:%M:%S%z" "$a" +%s 2>/dev/null)
+    tb=$(date -j -f "%Y-%m-%dT%H:%M:%S%z" "$b" +%s 2>/dev/null)
+    if [ -z "$ta" ] || [ -z "$tb" ]; then
+        echo 0
+    else
+        echo $(( tb - ta ))
+    fi
+}
+
+now_iso() {
+    # ISO8601 with numeric timezone offset (macOS date -j compatible).
+    date '+%Y-%m-%dT%H:%M:%S%z'
+}
+
+# ----------------------------------------------------------------------
+# Alerting: sound + email.
+# alert_sound plays ALARM_SOUND using afplay, respecting ALARM_VOLUME_MODE.
+# ----------------------------------------------------------------------
+
+# Get current system output volume as a 0.0-1.0 float.
+# macOS 'osascript' reports 0-100, so we divide.
+sys_volume_get() {
+    out=$(osascript -e 'output volume of (get volume settings)' 2>/dev/null)
+    [ -n "$out" ] || { echo "0.5"; return; }
+    # 'missing value' = muted or inaccessible; treat as 0
+    case "$out" in missing*) echo "0.0"; return ;; esac
+    awk -v v="$out" 'BEGIN { printf "%.2f", v / 100 }'
+}
+
+sys_volume_set() {
+    # Arg: float 0.0-1.0
+    v="$1"
+    pct=$(awk -v v="$v" 'BEGIN { printf "%d", v * 100 }')
+    osascript -e "set volume output volume $pct" 2>/dev/null || true
+}
+
+alert_sound() {
+    [ "${ALARM_ENABLED:-yes}" = "yes" ] || return 0
+    [ -n "${ALARM_SOUND:-}" ] || return 0
+    [ -r "${ALARM_SOUND}" ] || { log_warn "Alarm sound not readable: $ALARM_SOUND"; return 0; }
+    command -v afplay >/dev/null 2>&1 || { log_warn "afplay not found"; return 0; }
+
+    saved=$(sys_volume_get)
+    target="${ALARM_VOLUME:-0.8}"
+
+    case "${ALARM_VOLUME_MODE:-boost}" in
+        set)
+            sys_volume_set "$target"
+            ;;
+        cap)
+            # If current > target, reduce to target; else leave alone.
+            awk -v s="$saved" -v t="$target" 'BEGIN { exit (s > t) ? 0 : 1 }' \
+                && sys_volume_set "$target"
+            ;;
+        boost)
+            # If current < target, raise to target; else leave alone.
+            awk -v s="$saved" -v t="$target" 'BEGIN { exit (s < t) ? 0 : 1 }' \
+                && sys_volume_set "$target"
+            ;;
+        *)
+            log_warn "Unknown ALARM_VOLUME_MODE: $ALARM_VOLUME_MODE"
+            ;;
+    esac
+
+    afplay "$ALARM_SOUND" 2>/dev/null || true
+
+    # Restore previous volume (only if we changed it).
+    case "${ALARM_VOLUME_MODE:-boost}" in
+        set|cap|boost) sys_volume_set "$saved" ;;
+    esac
+}
+
+alert_email() {
+    # Args: subject, body
+    subject="$1"; body="$2"
+    [ -n "${EMAIL_TO:-}" ] || { log_debug "Email disabled (no EMAIL_TO)"; return 0; }
+    [ -n "${EMAIL_SENDER:-}" ] || { log_debug "Email disabled (no EMAIL_SENDER)"; return 0; }
+    [ -x "$EMAIL_SENDER" ] || { log_warn "Email sender not executable: $EMAIL_SENDER"; return 0; }
+
+    {
+        printf 'From: %s\n' "${EMAIL_FROM}"
+        printf 'To: %s\n'   "${EMAIL_TO}"
+        printf 'Subject: %s\n' "$subject"
+        printf 'Content-Type: text/plain; charset=utf-8\n'
+        printf '\n'
+        printf '%s\n' "$body"
+    } | "$EMAIL_SENDER" "$EMAIL_TO" 2>/dev/null \
+        || log_warn "Email send failed (check msmtp config and $EMAIL_SENDER --debug)"
+}
+
+# ----------------------------------------------------------------------
+# Problem handler: given a detected problem, decide whether to alert.
+# Args: kind, target, detail, severity, summary
+# severity: warn|crit. Only crit triggers alarm sound; warn logs+emails only.
+# ----------------------------------------------------------------------
+handle_problem() {
+    kind="$1"; target="$2"; detail="$3"; sev="$4"; summary="$5"
+    h=$(problem_hash "$kind" "$target" "$detail")
+    now=$(now_iso)
+    existing=$(state_get "$h")
+
+    if [ -z "$existing" ]; then
+        # NEW problem
+        log_error "NEW $sev: $summary"
+        [ "$sev" = "crit" ] && alert_sound
+        alert_email "[appleRAID/$sev] $summary" \
+            "New problem detected at $now
+
+Kind:     $kind
+Target:   $target
+Detail:   $detail
+Severity: $sev
+
+$(diskutil appleRAID list 2>/dev/null)
+"
+        state_put "$h" "$sev" "$now" "$now" "$now" "$summary"
+    else
+        # ONGOING problem - apply rate limits
+        first=$(echo  "$existing" | awk -F'|' '{print $3}')
+        la=$(echo     "$existing" | awk -F'|' '{print $4}')
+        le=$(echo     "$existing" | awk -F'|' '{print $5}')
+        since_alarm=$(seconds_between "$la" "$now")
+        since_email=$(seconds_between "$le" "$now")
+
+        new_la="$la"
+        new_le="$le"
+
+        if [ "$sev" = "crit" ] && [ "${since_alarm:-0}" -ge "${ALARM_INTERVAL_SEC:-60}" ]; then
+            alert_sound
+            new_la="$now"
+        fi
+
+        if [ "${since_email:-0}" -ge "${EMAIL_INTERVAL_SEC:-14400}" ]; then
+            alert_email "[appleRAID/$sev] (recurring) $summary" \
+                "Problem still present (first seen: $first)
+
+Kind:     $kind
+Target:   $target
+Detail:   $detail
+Severity: $sev
+
+$(diskutil appleRAID list 2>/dev/null)
+"
+            new_le="$now"
+        fi
+
+        state_put "$h" "$sev" "$first" "$new_la" "$new_le" "$summary"
+    fi
+}
+
+# Called when a previously-known problem is gone. Sends ONE "all clear"
+# email (if email configured) then removes the state entry.
+handle_resolved() {
+    h="$1"
+    line=$(state_get "$h")
+    [ -n "$line" ] || return 0
+    summary=$(echo "$line" | awk -F'|' '{print $6}')
+    log_info "RESOLVED: $summary"
+    alert_email "[appleRAID/OK] Resolved: $summary" \
+        "The following problem is no longer present:
+
+$summary
+
+Cleared at: $(now_iso)
+"
+    state_delete "$h"
+}
+
+# ----------------------------------------------------------------------
+# RAID health check
+# ----------------------------------------------------------------------
+
+# Returns the list of RAID UUIDs to monitor, based on MONITOR_SETS.
+resolve_monitored_sets() {
+    case "${MONITOR_SETS:-all}" in
+        all|ALL|"")
+            raid_list_uuids
+            ;;
+        *)
+            for item in $(echo "$MONITOR_SETS" | tr ',' ' '); do
+                # Accept UUID directly or look up by name.
+                found=0
+                for u in $(raid_list_uuids); do
+                    if [ "$u" = "$item" ]; then
+                        echo "$u"
+                        found=1
+                        break
+                    fi
+                done
+                if [ "$found" = "0" ]; then
+                    u=$(raid_name_to_uuid "$item")
+                    [ -n "$u" ] && echo "$u"
+                fi
+            done
+            ;;
+    esac
+}
+
+# Produces newline-separated list of problem-hashes seen THIS run.
+# Used to detect resolved problems (anything in state but not in this list).
+SEEN_HASHES_FILE=""
+
+seen_init() {
+    SEEN_HASHES_FILE=$(mktemp "${STATE_DIR}/seen.XXXXXX") || die "mktemp failed"
+}
+
+seen_cleanup() {
+    [ -n "$SEEN_HASHES_FILE" ] && rm -f "$SEEN_HASHES_FILE"
+}
+
+seen_add() {
+    echo "$1" >> "$SEEN_HASHES_FILE"
+}
+
+seen_has() {
+    h="$1"
+    [ -f "$SEEN_HASHES_FILE" ] || return 1
+    grep -qxF "$h" "$SEEN_HASHES_FILE"
+}
+
+check_raid_sets() {
+    uuids=$(resolve_monitored_sets)
+    if [ -z "$uuids" ]; then
+        log_warn "No RAID sets match MONITOR_SETS='$MONITOR_SETS'"
+        return 0
+    fi
+
+    for u in $uuids; do
+        name=$(diskutil appleRAID list | awk -F': +' -v u="$u" '
+            /^Name:/      { cur = $2; sub(/ +$/, "", cur) }
+            /^Unique ID:/ { uuid = $2; sub(/ +$/, "", uuid); if (uuid == u) { print cur; exit } }
+        ')
+        [ -n "$name" ] || name="$u"
+        st=$(raid_status "$u")
+
+        # Overall set status
+        case "$st" in
+            Online)
+                log_debug "RAID $name: Online"
+                ;;
+            Degraded)
+                h=$(problem_hash "raid-status" "$name" "Degraded")
+                seen_add "$h"
+                handle_problem "raid-status" "$name" "Degraded" "crit" \
+                    "RAID set '$name' is DEGRADED"
+                ;;
+            *)
+                h=$(problem_hash "raid-status" "$name" "$st")
+                seen_add "$h"
+                handle_problem "raid-status" "$name" "$st" "crit" \
+                    "RAID set '$name' status: $st"
+                ;;
+        esac
+
+        # Per-member check (captures Rebuilding/Missing even when set=Online)
+        diskutil appleRAID list "$u" 2>/dev/null | awk '
+            /^[0-9]+[ \t]+disk/ {
+                devnode = $2
+                status = ""
+                for (i = 4; i < NF; i++) {
+                    status = (status == "" ? $i : status " " $i)
+                }
+                print devnode "|" status
+            }
+        ' | while IFS='|' read -r devnode memstat; do
+            [ -n "$devnode" ] || continue
+            case "$memstat" in
+                Online)
+                    log_debug "  $devnode: Online"
+                    ;;
+                *[Rr]ebuilding*)
+                    h=$(problem_hash "raid-member" "$name/$devnode" "rebuilding")
+                    seen_add "$h"
+                    handle_problem "raid-member" "$name/$devnode" "rebuilding" "warn" \
+                        "RAID $name member $devnode is rebuilding ($memstat)"
+                    ;;
+                *)
+                    h=$(problem_hash "raid-member" "$name/$devnode" "$memstat")
+                    seen_add "$h"
+                    handle_problem "raid-member" "$name/$devnode" "$memstat" "crit" \
+                        "RAID $name member $devnode status: $memstat"
+                    ;;
+            esac
+        done
+    done
+}
+
+# ----------------------------------------------------------------------
+# SMART health check. Runs at most once per SMART_POLL_INTERVAL_SEC.
+# Uses a sentinel file ($STATE_DIR/last-smart) to rate-limit across runs.
+# ----------------------------------------------------------------------
+
+smart_last_run_file() { echo "${STATE_DIR}/last-smart"; }
+
+smart_should_run() {
+    [ "${SMART_CHECK_ENABLED:-yes}" = "yes" ] || return 1
+    command -v smartctl >/dev/null 2>&1 || {
+        log_debug "smartctl not installed; skipping SMART"
+        return 1
+    }
+    f=$(smart_last_run_file)
+    if [ ! -f "$f" ]; then return 0; fi
+    last=$(cat "$f" 2>/dev/null)
+    now=$(date +%s)
+    diff=$(( now - ${last:-0} ))
+    [ "$diff" -ge "${SMART_POLL_INTERVAL_SEC:-86400}" ]
+}
+
+smart_mark_ran() {
+    date +%s > "$(smart_last_run_file)" 2>/dev/null || true
+}
+
+# Resolve list of physical disks to check.
+resolve_monitored_disks() {
+    case "${MONITOR_DISKS:-auto}" in
+        auto|AUTO|"")
+            # Collect unique parent disks from all monitored RAID members.
+            uuids=$(resolve_monitored_sets)
+            for u in $uuids; do
+                diskutil appleRAID list "$u" 2>/dev/null \
+                    | awk '/^[0-9]+[ \t]+disk/ {print $2}' \
+                    | sed 's/s[0-9]*$//'
+            done | sort -u
+            ;;
+        *)
+            echo "$MONITOR_DISKS" | tr ',' '\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//'
+            ;;
+    esac
+}
+
+check_smart() {
+    smart_should_run || return 0
+    log_info "Running SMART check (runs every ${SMART_POLL_INTERVAL_SEC}s)"
+    disks=$(resolve_monitored_disks)
+    [ -n "$disks" ] || { log_warn "No disks resolved for SMART check"; return 0; }
+
+    for d in $disks; do
+        dev="/dev/$d"
+        [ -e "$dev" ] || { log_warn "Skipping $dev (not present)"; continue; }
+
+        # Overall health (PASSED/FAILED)
+        health=$(smartctl -H "$dev" 2>/dev/null | awk -F': *' \
+            '/SMART overall-health/ {print $2; exit}
+             /SMART Health Status/   {print $2; exit}')
+        health=$(echo "$health" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+
+        if [ -n "$health" ] && [ "$health" != "PASSED" ] && [ "$health" != "OK" ]; then
+            h=$(problem_hash "smart-health" "$d" "$health")
+            seen_add "$h"
+            handle_problem "smart-health" "$d" "$health" "crit" \
+                "SMART overall health for $d: $health"
+        fi
+
+        # Temperature (attribute 194 or 190)
+        temp=$(smartctl -A "$dev" 2>/dev/null | awk '
+            /^[[:space:]]*(194|190)[[:space:]]+Temperature/ { print $10; exit }
+        ')
+        if [ -n "$temp" ]; then
+            log_debug "Disk $d temperature: ${temp}C"
+            if [ "$temp" -ge "${TEMP_CRIT_C:-58}" ] 2>/dev/null; then
+                h=$(problem_hash "smart-temp" "$d" "critical")
+                seen_add "$h"
+                handle_problem "smart-temp" "$d" "critical" "crit" \
+                    "Disk $d temperature ${temp}C >= CRIT ${TEMP_CRIT_C}C"
+            elif [ "$temp" -ge "${TEMP_WARN_C:-50}" ] 2>/dev/null; then
+                h=$(problem_hash "smart-temp" "$d" "warn")
+                seen_add "$h"
+                handle_problem "smart-temp" "$d" "warn" "warn" \
+                    "Disk $d temperature ${temp}C >= WARN ${TEMP_WARN_C}C"
+            fi
+        fi
+
+        # "Killer" attributes: any non-zero raw value warrants attention.
+        # Reallocated_Sector_Ct (5), Current_Pending_Sector (197),
+        # Offline_Uncorrectable (198), UDMA_CRC_Error_Count (199)
+        smartctl -A "$dev" 2>/dev/null | awk '
+            /^[[:space:]]*(5|197|198|199)[[:space:]]/ {
+                id=$1; name=$2; raw=$10
+                # raw may be "0" or "0/0" etc.; take first numeric token
+                if (raw+0 > 0) printf "%s|%s|%s\n", id, name, raw
+            }
+        ' | while IFS='|' read -r aid aname araw; do
+            [ -n "$aid" ] || continue
+            h=$(problem_hash "smart-attr" "$d" "$aid")
+            seen_add "$h"
+            handle_problem "smart-attr" "$d" "$aid" "warn" \
+                "Disk $d attribute $aname ($aid) = $araw (non-zero)"
+        done
+    done
+    smart_mark_ran
+}
+
+# ----------------------------------------------------------------------
+# SMART self-tests (short/long), scheduled daily or weekly at SELFTEST_HOUR.
+# Uses a per-disk sentinel file to avoid re-running within the same window.
+# ----------------------------------------------------------------------
+selftest_should_run() {
+    schedule="$1"     # daily|weekly|never
+    sentinel="$2"
+    case "$schedule" in
+        never|"") return 1 ;;
+    esac
+    h=$(date '+%H')
+    # Only run during the scheduled hour (avoids mid-day surprises).
+    [ "$h" = "$(printf '%02d' "${SELFTEST_HOUR:-3}")" ] || return 1
+    # Don't re-run within window.
+    if [ -f "$sentinel" ]; then
+        last_day=$(stat -f '%Sm' -t '%Y-%m-%d' "$sentinel" 2>/dev/null)
+        today=$(date '+%Y-%m-%d')
+        case "$schedule" in
+            daily)
+                [ "$last_day" != "$today" ] || return 1
+                ;;
+            weekly)
+                last_epoch=$(stat -f '%m' "$sentinel" 2>/dev/null || echo 0)
+                now_epoch=$(date +%s)
+                [ $(( now_epoch - last_epoch )) -ge 604800 ] || return 1
+                ;;
+        esac
+    fi
+    return 0
+}
+
+run_selftests() {
+    command -v smartctl >/dev/null 2>&1 || return 0
+    for d in $(resolve_monitored_disks); do
+        dev="/dev/$d"
+        [ -e "$dev" ] || continue
+
+        short_sentinel="${STATE_DIR}/selftest-short-${d}"
+        long_sentinel="${STATE_DIR}/selftest-long-${d}"
+
+        if selftest_should_run "${SELFTEST_SHORT_SCHEDULE:-never}" "$short_sentinel"; then
+            log_info "Starting SHORT self-test on $d"
+            smartctl -t short "$dev" >/dev/null 2>&1 && touch "$short_sentinel"
+        fi
+        if selftest_should_run "${SELFTEST_LONG_SCHEDULE:-daily}" "$long_sentinel"; then
+            log_info "Starting LONG self-test on $d (runs in background, ~24-30h on 26TB)"
+            smartctl -t long "$dev" >/dev/null 2>&1 && touch "$long_sentinel"
+        fi
+    done
+}
+
+# ----------------------------------------------------------------------
+# The `health` subcommand itself.
+# ----------------------------------------------------------------------
+cmd_health() {
+    cfg_load
+    state_init
+    seen_init
+    # Trap so we always clean up the temp seen-file.
+    trap 'seen_cleanup' EXIT INT TERM
+
+    dry=0
+    force=0
+    for a in "$@"; do
+        case "$a" in
+            --dry-run) dry=1 ;;
+            --once)    force=1 ;;
+            -v|--verbose) LOG_LEVEL=debug ;;
+        esac
+    done
+
+    if [ "$dry" = "1" ]; then
+        log_info "DRY RUN - no alarms/emails will be sent"
+        # Override alert functions to no-op
+        alert_sound() { log_info "(dry) would play alarm: $ALARM_SOUND"; }
+        alert_email() { log_info "(dry) would email: $1"; }
+    fi
+    if [ "$force" = "1" ]; then
+        ALARM_INTERVAL_SEC=0
+        EMAIL_INTERVAL_SEC=0
+    fi
+
+    log_debug "Config loaded from: $LOADED_CONFIG"
+    log_debug "Monitoring sets: $MONITOR_SETS"
+
+    check_raid_sets
+    check_smart
+    run_selftests
+
+    # Detect resolved problems: anything in state file not seen this run.
+    for h in $(state_list_hashes); do
+        if ! seen_has "$h"; then
+            handle_resolved "$h"
+        fi
+    done
+
+    # Exit code reflects worst severity still present.
+    worst=0
+    for h in $(state_list_hashes); do
+        sev=$(state_field "$h" 2)
+        case "$sev" in
+            crit) worst=2 ;;
+            warn) [ "$worst" -lt 1 ] && worst=1 ;;
+        esac
+    done
+    log_debug "Health check complete. Exit=$worst"
+    seen_cleanup
+    trap - EXIT INT TERM
+    return $worst
+}
+
+# ----------------------------------------------------------------------
+# `show-config` - dump effective config and which file it came from.
+# ----------------------------------------------------------------------
+cmd_show_config() {
+    cfg_load
+    step "Effective configuration"
+    info "Config file loaded: $LOADED_CONFIG"
+    echo
+    # Print every known key in a stable order.
+    for k in \
+        MONITOR_SETS MONITOR_DISKS \
+        TEMP_WARN_C TEMP_CRIT_C SMART_CHECK_ENABLED \
+        ALARM_SOUND ALARM_VOLUME ALARM_VOLUME_MODE ALARM_INTERVAL_SEC ALARM_ENABLED \
+        EMAIL_TO EMAIL_FROM EMAIL_SENDER EMAIL_INTERVAL_SEC \
+        SMART_POLL_INTERVAL_SEC SELFTEST_SHORT_SCHEDULE SELFTEST_LONG_SCHEDULE SELFTEST_HOUR \
+        STATE_DIR LOG_FILE LOG_LEVEL \
+        LAUNCHD_PLIST LAUNCHD_LABEL LAUNCHD_INTERVAL_SEC
+    do
+        # Indirect variable expansion: eval is the POSIX way.
+        eval "v=\${$k}"
+        printf '  %-28s = %s\n' "$k" "$v"
+    done
+}
+
+# ----------------------------------------------------------------------
+# `create-config <path>` - write an annotated default config file.
+# ----------------------------------------------------------------------
+cmd_create_config() {
+    [ $# -ge 1 ] || die "Usage: $SCRIPT_NAME create-config <path>"
+    path="$1"
+    if [ -e "$path" ]; then
+        confirm "File $path already exists. Overwrite?" || die "Aborted."
+    fi
+    dir=$(dirname "$path")
+    [ -d "$dir" ] || mkdir -p "$dir" || die "Cannot create directory $dir"
+
+    cat > "$path" <<'EOF'
+# ======================================================================
+# appleRAID configuration file
+# ======================================================================
+# This file is sourced by /bin/dash. Syntax: KEY=value (no spaces around
+# '='). Values with spaces must be quoted.  Lines starting with '#' are
+# comments.
+#
+# Search path (first readable file wins):
+#   $APPLERAID_CONFIG  (env var, for testing)
+#   /LINKS/default/appleRAID.conf
+#   $HOME/.appleRAID.conf
+#   /usr/local/etc/appleRAID.conf
+#   /etc/appleRAID.conf
+#
+# Every key has a built-in default; you only need to set the ones you
+# want to change.
+# ======================================================================
+
+
+# --- What to monitor -------------------------------------------------
+
+# Which RAID sets to monitor.
+#   "all"                -> every AppleRAID set on the system
+#   "NameA,NameB,uuid"   -> comma-separated list of names or UUIDs
+MONITOR_SETS="all"
+
+# Which physical disks to run SMART checks against.
+#   "auto"               -> derive from members of monitored RAID sets
+#   "disk2,disk3,..."    -> explicit list (without /dev/ prefix)
+MONITOR_DISKS="auto"
+
+
+# --- Thresholds ------------------------------------------------------
+
+# Temperature alert thresholds in degrees Celsius.
+# WD Gold / Red Pro rated operating range: 5-60C. Alert well before the
+# ceiling so you can react (improve airflow, check fans, etc.).
+TEMP_WARN_C=50
+TEMP_CRIT_C=58
+
+# Master enable for SMART attribute checking (health, temp, error counts).
+# Set to "no" if you only want RAID set monitoring (disables temp alerts
+# and attribute-based warnings too).
+SMART_CHECK_ENABLED=yes
+
+
+# --- Audible alarm ---------------------------------------------------
+
+# Master enable. "no" silences all audible alerts (email/log still work).
+ALARM_ENABLED=yes
+
+# Path to a sound file. macOS ships /System/Library/Sounds/*.aiff:
+#   Basso.aiff (deep, urgent) - default
+#   Funk.aiff / Glass.aiff / Hero.aiff / Ping.aiff / Sosumi.aiff ...
+ALARM_SOUND="/System/Library/Sounds/Basso.aiff"
+
+# Target volume (0.0 = silent, 1.0 = max).
+ALARM_VOLUME=0.8
+
+# How the script uses ALARM_VOLUME:
+#   boost - only raise volume if current system volume is LOWER than
+#           ALARM_VOLUME. Ensures audibility even if user muted. DEFAULT.
+#   cap   - only lower volume if current is HIGHER than ALARM_VOLUME.
+#           Prevents 3am full-blast if user had music at max.
+#   set   - always set volume to exactly ALARM_VOLUME.
+# In all cases, the previous system volume is restored after alarm.
+ALARM_VOLUME_MODE=boost
+
+# Minimum seconds between alarm playbacks for the SAME ongoing problem.
+# Set high (e.g. 300) if you find the every-minute alarm too aggressive.
+ALARM_INTERVAL_SEC=60
+
+
+# --- Email alerts ----------------------------------------------------
+
+# Recipient. Leave empty to disable email entirely.
+EMAIL_TO=""
+
+# From address. Must match what your SMTP relay allows.
+EMAIL_FROM="appleRAID@localhost"
+
+# Path to a sendmail-compatible sender. msmtp is recommended:
+#   brew install msmtp
+# Configure ~/.msmtprc per the smartmontools setup we discussed earlier.
+EMAIL_SENDER="/usr/local/bin/msmtp"
+
+# Minimum seconds between emails for the SAME ongoing problem.
+# Default 14400 = 4 hours (6 emails/day max per problem).
+EMAIL_INTERVAL_SEC=14400
+
+
+# --- SMART polling schedule -----------------------------------------
+
+# How often to run SMART health+attribute checks (in seconds).
+# Default 86400 = once per day. Running more often wastes power (causes
+# drive spin-ups on idle drives) without meaningful benefit - attribute
+# changes unfold over hours/days, not seconds.
+SMART_POLL_INTERVAL_SEC=86400
+
+# SMART self-test schedules: "never" | "daily" | "weekly".
+# Self-tests run IN THE BACKGROUND on the drive's own firmware - the
+# drive remains accessible but performance is slightly reduced.
+#
+#   short: ~2 minutes. Exercises electronics + a small media sample.
+#          Default "never" because the daily attribute scan
+#          (SMART_POLL_INTERVAL_SEC) already catches most failures
+#          short tests would catch. Set to "daily" if you want belt
+#          and braces - cost is negligible.
+#
+#   long:  full media scan. Duration scales with drive size:
+#          ~14h per  10TB,  ~19h per  14TB,  ~30h per  22TB,
+#          ~36h per  26TB,  and longer for bigger drives.
+#          At ~200 MB/s sequential read, a 26TB long test takes ~1.5 days,
+#          so "daily" makes no sense on large modern drives (the next
+#          test request is rejected while the previous one is still
+#          running). Default "weekly" gives room for the test to
+#          complete plus 5+ idle days. Rising bad-sector counts are
+#          caught within hours by the daily attribute poll, so the
+#          long test is a deep-scan backstop, not a primary detector.
+SELFTEST_SHORT_SCHEDULE="never"
+SELFTEST_LONG_SCHEDULE="weekly"
+
+# Hour of day (0-23) when scheduled self-tests should kick off.
+# Pick a time when the drives are likely idle (backups finished, etc.).
+SELFTEST_HOUR=3
+
+
+# --- State & logging ------------------------------------------------
+
+# Where the script keeps its state database and sentinel files.
+# Must be writable by the user running `appleRAID health`.
+STATE_DIR="/var/db/appleRAID"
+
+# Log file. Set empty to log to stderr only (launchd will capture it).
+LOG_FILE="/var/log/appleRAID.log"
+
+# Verbosity: error | warn | info | debug
+LOG_LEVEL=info
+
+
+# --- LaunchDaemon installation (used by `install-daemon`) -----------
+
+# Full path to the plist. Change this if you prefer a different filename
+# or location (e.g. a user LaunchAgent).
+LAUNCHD_PLIST="/Library/LaunchDaemons/local.appleRAID.health.plist"
+
+# Label - must be unique across launchd and should match the filename
+# (minus .plist).
+LAUNCHD_LABEL="local.appleRAID.health"
+
+# How often launchd should invoke `appleRAID health`, in seconds.
+# 60 = every minute. Cheap: RAID checks are fast; SMART is rate-limited
+# internally by SMART_POLL_INTERVAL_SEC.
+LAUNCHD_INTERVAL_SEC=60
+EOF
+
+    chmod 644 "$path" 2>/dev/null || true
+    ok "Wrote default config to: $path"
+    info "Edit it, then verify with: $SCRIPT_NAME show-config"
+}
+
+# ----------------------------------------------------------------------
+# `install-daemon` / `uninstall-daemon` - launchd integration.
+# ----------------------------------------------------------------------
+cmd_install_daemon() {
+    cfg_load
+    plist="${LAUNCHD_PLIST}"
+    label="${LAUNCHD_LABEL}"
+    interval="${LAUNCHD_INTERVAL_SEC:-60}"
+
+    # Self path: the absolute path to this script, so the plist can call it.
+    self=$(cd "$(dirname "$0")" && pwd)/$(basename "$0")
+
+    step "LaunchDaemon installation plan"
+    info "Plist path:   $plist"
+    info "Label:        $label"
+    info "Interval:     ${interval}s"
+    info "Script path:  $self"
+    echo
+
+    cat <<EOF
+The following plist will be written:
+
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>$label</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>$self</string>
+    <string>health</string>
+  </array>
+  <key>StartInterval</key>
+  <integer>$interval</integer>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>/var/log/appleRAID.launchd.out</string>
+  <key>StandardErrorPath</key>
+  <string>/var/log/appleRAID.launchd.err</string>
+</dict>
+</plist>
+
+EOF
+    confirm "Install and load this LaunchDaemon (requires sudo)?" || die "Aborted."
+
+    # Write plist via sudo
+    run sudo sh -c "cat > '$plist'" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>$label</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>$self</string>
+    <string>health</string>
+  </array>
+  <key>StartInterval</key>
+  <integer>$interval</integer>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>/var/log/appleRAID.launchd.out</string>
+  <key>StandardErrorPath</key>
+  <string>/var/log/appleRAID.launchd.err</string>
+</dict>
+</plist>
+EOF
+
+    run sudo chown root:wheel "$plist"
+    run sudo chmod 644 "$plist"
+
+    # Load (bootstrap on modern macOS).
+    run sudo launchctl bootstrap system "$plist" \
+        || run sudo launchctl load -w "$plist" \
+        || warn "Could not load the plist automatically. Reboot or run 'sudo launchctl bootstrap system $plist' manually."
+
+    ok "LaunchDaemon installed and loaded."
+    info "View logs:  tail -f /var/log/appleRAID.launchd.err /var/log/appleRAID.log"
+    info "Status:     sudo launchctl list | grep $label"
+}
+
+cmd_uninstall_daemon() {
+    cfg_load
+    plist="${LAUNCHD_PLIST}"
+    label="${LAUNCHD_LABEL}"
+    step "Uninstalling LaunchDaemon"
+    info "Plist: $plist"
+    info "Label: $label"
+    confirm "Unload and delete?" || die "Aborted."
+
+    run sudo launchctl bootout system "$plist" 2>/dev/null \
+        || run sudo launchctl unload "$plist" 2>/dev/null \
+        || warn "launchctl unload failed (maybe not loaded)"
+    run sudo rm -f "$plist"
+    ok "Uninstalled."
+}
+
+# ----------------------------------------------------------------------
+# `test-alerts` - exercise every alerting channel.
+# ----------------------------------------------------------------------
+cmd_test_alerts() {
+    cfg_load
+    state_init
+    step "Testing alert channels"
+    info "Config file: $LOADED_CONFIG"
+    echo
+
+    info "1/3 Playing alarm sound ($ALARM_SOUND) in mode=$ALARM_VOLUME_MODE vol=$ALARM_VOLUME"
+    alert_sound
+    ok "Alarm test complete (did you hear it?)"
+    echo
+
+    info "2/3 Sending test email to '${EMAIL_TO:-<disabled>}'"
+    if [ -n "${EMAIL_TO:-}" ]; then
+        alert_email "[appleRAID] Test alert" \
+            "This is a test from appleRAID test-alerts.
+
+Host:   $(hostname)
+Time:   $(now_iso)
+Config: $LOADED_CONFIG
+
+If you received this, the email alert chain is working."
+        ok "Test email dispatched - check your inbox."
+    else
+        warn "Email disabled (EMAIL_TO is empty)."
+    fi
+    echo
+
+    info "3/3 Writing a test log line"
+    log_info "TEST: test-alerts invoked at $(now_iso)"
+    ok "Log write complete. See: ${LOG_FILE:-<stderr>}"
+}
+
+# ======================================================================
+# End of health/monitoring machinery
+# ======================================================================
+
 # ----------------------------------------------------------------------
 # Subcommand: help
 # ----------------------------------------------------------------------
@@ -254,7 +1365,44 @@ ${C_BOLD}COMMANDS${C_RESET}
   ${C_CYAN}test${C_RESET} [name|uuid]            Run non-destructive tests: mount status,
                               write/read probe, RAID consistency.
   ${C_CYAN}destroy${C_RESET} [name|uuid]         Delete a RAID set (data loss - confirms twice).
+
+  ${C_BOLD}-- Health monitoring (designed for launchd) --${C_RESET}
+  ${C_CYAN}health${C_RESET} [--dry-run|--once|-v]
+                              Run one monitoring pass. Checks RAID set
+                              state on every call. Runs SMART checks
+                              once per SMART_POLL_INTERVAL_SEC (default:
+                              daily). On new/ongoing problems: plays
+                              alarm (rate-limited by ALARM_INTERVAL_SEC),
+                              sends email (rate-limited by
+                              EMAIL_INTERVAL_SEC), and logs.
+                                --dry-run  perform checks, no alerts
+                                --once     bypass rate limits (testing)
+                                -v         debug logging for this run
+                              Exit: 0=ok, 1=warn, 2=crit.
+  ${C_CYAN}show-config${C_RESET}                 Print effective config values and which
+                              config file (if any) was loaded.
+  ${C_CYAN}create-config${C_RESET} <path>        Write an annotated default config file to
+                              <path>. Example:
+                                ${SCRIPT_NAME} create-config ~/.appleRAID.conf
+  ${C_CYAN}test-alerts${C_RESET}                 Exercise every alerting channel (sound,
+                              email, log). Run once after setup to
+                              verify alerts reach you.
+  ${C_CYAN}install-daemon${C_RESET}              Generate and load a LaunchDaemon plist.
+                              Path/label/interval from config keys
+                              LAUNCHD_PLIST, LAUNCHD_LABEL,
+                              LAUNCHD_INTERVAL_SEC. Requires sudo.
+  ${C_CYAN}uninstall-daemon${C_RESET}            Unload and remove the LaunchDaemon.
+
   ${C_CYAN}help${C_RESET}, --help, -h            This message.
+
+${C_BOLD}CONFIG FILE SEARCH PATH${C_RESET}
+  First readable file wins:
+    \$APPLERAID_CONFIG              (env var, for testing)
+    /LINKS/default/appleRAID.conf
+    ~/.appleRAID.conf
+    /usr/local/etc/appleRAID.conf
+    /etc/appleRAID.conf
+  If none found, built-in defaults are used. 'show-config' will tell you.
 
 ${C_BOLD}VERBOSE BY DESIGN${C_RESET}
   Every state-changing command is echoed (with a leading '\$') right
@@ -263,6 +1411,7 @@ ${C_BOLD}VERBOSE BY DESIGN${C_RESET}
   noise.
 
 ${C_BOLD}EXAMPLES${C_RESET}
+  ${C_BOLD}-- Management --${C_RESET}
   ${SCRIPT_NAME} list
   ${SCRIPT_NAME} disks
   ${SCRIPT_NAME} wipe 3
@@ -270,6 +1419,20 @@ ${C_BOLD}EXAMPLES${C_RESET}
   ${SCRIPT_NAME} repair BackupGold
   ${SCRIPT_NAME} status
   ${SCRIPT_NAME} test BackupGold
+
+  ${C_BOLD}-- Health monitoring setup --${C_RESET}
+  # 1. Create and edit a config file
+  ${SCRIPT_NAME} create-config /usr/local/etc/appleRAID.conf
+  vi /usr/local/etc/appleRAID.conf        # set EMAIL_TO, thresholds, etc.
+  ${SCRIPT_NAME} show-config              # verify what will be used
+  # 2. Dry-run a health pass (no alerts)
+  ${SCRIPT_NAME} health --dry-run -v
+  # 3. Verify alerting works end-to-end
+  ${SCRIPT_NAME} test-alerts
+  # 4. Install the LaunchDaemon (runs every 60s as root)
+  sudo ${SCRIPT_NAME} install-daemon
+  # 5. Tail the log
+  tail -f /var/log/appleRAID.log
 
 ${C_BOLD}SAFETY NOTES${C_RESET}
   - This script will run 'sudo' for destructive operations. It will
@@ -363,9 +1526,9 @@ cmd_status() {
 
     step "AppleRAID status summary"
     for u in $uuids; do
-        name=$(diskutil appleRAID list | awk -v u="$u" '
-            /^Name:/      { cur = $2 }
-            /^Unique ID:/ { if ($3 == u) { print cur; exit } }
+        name=$(diskutil appleRAID list | awk -F': +' -v u="$u" '
+            /^Name:/      { cur = $2; sub(/ +$/, "", cur) }
+            /^Unique ID:/ { uuid = $2; sub(/ +$/, "", uuid); if (uuid == u) { print cur; exit } }
         ')
         st=$(raid_status "$u")
         dev=$(raid_uuid_to_device "$u")
@@ -413,6 +1576,7 @@ cmd_wipe() {
     rdev="/dev/r${dev#/dev/}"
 
     assert_whole_disk "$dev"
+    assert_safe_target "$dev"
 
     step "Wipe plan for $dev"
     describe_disk "$dev"
@@ -506,6 +1670,8 @@ cmd_create() {
 
     assert_whole_disk "$dev1"
     assert_whole_disk "$dev2"
+    assert_safe_target "$dev1"
+    assert_safe_target "$dev2"
 
     step "Create AppleRAID mirror: $name"
     echo "  Member 1:"
@@ -634,14 +1800,19 @@ cmd_repair() {
     [ -n "$disknum" ] || die "No disk number entered."
     dev=$(resolve_disk "$disknum") || die "Invalid disk spec: $disknum"
     assert_whole_disk "$dev"
+    assert_safe_target "$dev"
 
     step "Replacement disk details"
     describe_disk "$dev"
     echo
 
     # Size check vs RAID member size.
+    # Member line format:
+    #   <idx>  <devnode>  <uuid>  <status (1+ words)>  <size-bytes>
+    # We can't rely on fixed column count because status may be multi-word
+    # during rebuild (e.g. "1% (rebuilding)"). Use $1 digit + $NF as size.
     raid_member_size=$(diskutil appleRAID list "$SELECTED_UUID" 2>/dev/null \
-        | awk '/^#/{seen=1;next} seen && NF>=5 {print $5; exit}')
+        | awk '/^[0-9]+[ \t]+disk/ {print $NF; exit}')
     new_size=$(disk_size_bytes "$dev")
     if [ -n "$raid_member_size" ] && [ -n "$new_size" ]; then
         info "Existing member size: $raid_member_size bytes"
@@ -719,8 +1890,21 @@ cmd_test() {
 
     # T2
     step "T2: member statuses"
-    bad_members=$(diskutil appleRAID list "$SELECTED_UUID" 2>/dev/null \
-        | awk '/^#/{seen=1;next} seen && NF>=4 && $4 != "Online" {print $2" ("$4")"}')
+    # Member line format (status may be multi-word during rebuild):
+    #   <idx>  <devnode>  <uuid>  <status (1+ words)>  <size-bytes>
+    # We extract everything between $3 (UUID) and $NF (size) as the status.
+    bad_members=$(diskutil appleRAID list "$SELECTED_UUID" 2>/dev/null | awk '
+        /^[0-9]+[ \t]+disk/ {
+            devnode = $2
+            status = ""
+            for (i = 4; i < NF; i++) {
+                status = (status == "" ? $i : status " " $i)
+            }
+            if (status != "Online") {
+                print devnode " (" status ")"
+            }
+        }
+    ')
     if [ -z "$bad_members" ]; then
         ok "All members are Online."
     else
@@ -870,6 +2054,12 @@ main() {
         repair)             cmd_repair "$@" ;;
         test)               cmd_test "$@" ;;
         destroy)            cmd_destroy "$@" ;;
+        health)             cmd_health "$@" ;;
+        show-config)        cmd_show_config "$@" ;;
+        create-config)      cmd_create_config "$@" ;;
+        test-alerts)        cmd_test_alerts "$@" ;;
+        install-daemon)     cmd_install_daemon "$@" ;;
+        uninstall-daemon)   cmd_uninstall_daemon "$@" ;;
         *)
             err "Unknown command: $cmd"
             echo
