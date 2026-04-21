@@ -60,6 +60,58 @@ fi
 SCRIPT_NAME="$(basename "$0")"
 
 # ----------------------------------------------------------------------
+# Global verbosity flags.
+# Set by parse_global_flags(), which is called both at the top of main()
+# and by individual subcommands that want to accept these flags in any
+# position (before or after the subcommand name).
+#
+# VERBOSE=1  -> LOG_LEVEL=debug + subcommand-specific extra detail
+# DEBUG=1    -> everything VERBOSE does + shell tracing (set -x) +
+#               `run` echoes every subprocess invocation at debug level
+#
+# If both are passed, DEBUG wins.
+# ----------------------------------------------------------------------
+VERBOSE=0
+DEBUG=0
+
+# Parse -V/--verbose and -D/--debug from an argv list. Because this
+# function has to run in a $(...) subshell to feed its output back to
+# the caller (variable assignments inside a subshell don't escape),
+# we emit a snippet of shell code that the caller evaluates via `eval`.
+# That snippet sets VERBOSE/DEBUG/LOG_LEVEL and positional params in
+# the caller's own shell.
+#
+# Idiomatic use:
+#     eval "$(parse_global_flags "$@")"
+#
+# Output format (one line, shell-quoted):
+#     VERBOSE=1; DEBUG=0; LOG_LEVEL=debug; set -- 'disks' '--dry-run'
+#
+# For safety across weird args (spaces, quotes), we single-quote each
+# remaining arg and escape embedded single quotes as '\''.
+parse_global_flags() {
+    _v=0; _d=0
+    _args=""
+    for _arg in "$@"; do
+        case "$_arg" in
+            -V|--verbose) _v=1 ;;
+            -D|--debug)   _d=1; _v=1 ;;
+            *)
+                # Shell-safe single-quote: wrap, escape any embedded "'"
+                # by closing the quote, emitting \' , then re-opening.
+                _q=$(printf "%s" "$_arg" | sed "s/'/'\\\\''/g")
+                _args="$_args '$_q'"
+                ;;
+        esac
+    done
+    _ll=""
+    if [ "$_d" = "1" ] || [ "$_v" = "1" ]; then
+        _ll="LOG_LEVEL=debug; "
+    fi
+    printf 'VERBOSE=%d; DEBUG=%d; %sset --%s' "$_v" "$_d" "$_ll" "$_args"
+}
+
+# ----------------------------------------------------------------------
 # Logging helpers
 # ----------------------------------------------------------------------
 info()    { printf '%s[INFO]%s %s\n'  "${C_BLUE}"   "${C_RESET}" "$*"; }
@@ -1035,12 +1087,25 @@ check_raid_sets() {
 
 smart_last_run_file() { echo "${STATE_DIR}/last-smart"; }
 
+# Global flag: set to 1 when smartctl is not installed / not in PATH.
+# cmd_health inspects this at the end and emits a prominent warning.
+# Missing smartctl is a SILENT FAILURE MODE - the daemon would happily
+# claim "no problems" while never actually checking SMART - so we make
+# this extremely visible.
+SMART_UNAVAILABLE=0
+
 smart_should_run() {
     [ "${SMART_CHECK_ENABLED:-yes}" = "yes" ] || return 1
-    command -v smartctl >/dev/null 2>&1 || {
-        log_debug "smartctl not installed; skipping SMART"
+    if ! command -v smartctl >/dev/null 2>&1; then
+        # Escalated from log_debug to log_warn: this is a silent failure
+        # mode where the daemon would keep running without ever checking
+        # SMART. Surface it every run so it can't go unnoticed.
+        SMART_UNAVAILABLE=1
+        log_warn "smartctl NOT FOUND - SMART checks are completely disabled"
+        log_warn "  Install with:   brew install smartmontools"
+        log_warn "  Or set SMART_CHECK_ENABLED=no to silence this warning."
         return 1
-    }
+    fi
     f=$(smart_last_run_file)
     if [ ! -f "$f" ]; then return 0; fi
     last=$(cat "$f" 2>/dev/null)
@@ -1458,7 +1523,13 @@ selftest_should_run() {
 }
 
 run_selftests() {
-    command -v smartctl >/dev/null 2>&1 || return 0
+    if ! command -v smartctl >/dev/null 2>&1; then
+        # Already reported by smart_should_run - don't double-log, just
+        # ensure the flag is set in case SMART_CHECK_ENABLED=no but we
+        # still got here somehow.
+        SMART_UNAVAILABLE=1
+        return 0
+    fi
     for d in $(resolve_monitored_disks); do
         dev="/dev/$d"
         [ -e "$dev" ] || continue
@@ -1482,6 +1553,9 @@ run_selftests() {
 # The `health` subcommand itself.
 # ----------------------------------------------------------------------
 cmd_health() {
+    # Accept global -V/-D after the subcommand name.
+    eval "$(parse_global_flags "$@")"
+
     cfg_load
     state_init
     seen_init
@@ -1494,7 +1568,8 @@ cmd_health() {
         case "$a" in
             --dry-run) dry=1 ;;
             --once)    force=1 ;;
-            -v|--verbose) LOG_LEVEL=debug ;;
+            # Legacy lowercase -v accepted as alias for -V.
+            -v)        VERBOSE=1; LOG_LEVEL=debug ;;
         esac
     done
 
@@ -1537,6 +1612,47 @@ cmd_health() {
         esac
     done
     log_debug "Health check complete. Exit=$worst"
+
+    # --- Prominent end-of-run SMART-missing warning ---
+    # If smartctl was discovered missing during this run, emit a visible
+    # banner. This goes to stderr (so launchd captures it in
+    # LAUNCHD_STDERR_LOG) and also through the structured logger at warn
+    # level (so it ends up in LOG_FILE and any mail digest).
+    #
+    # Rationale: smartctl-missing is the single most dangerous silent
+    # failure mode for this daemon. Without it, temperature, reallocated
+    # sectors, pending sectors, UDMA errors, and overall health are ALL
+    # uninspected. The daemon would keep reporting "Online" while a
+    # drive quietly fails. Make it impossible to miss.
+    if [ "${SMART_UNAVAILABLE:-0}" = "1" ]; then
+        {
+            echo
+            echo "================================================================"
+            echo "  WARNING: smartctl IS NOT INSTALLED"
+            echo "================================================================"
+            echo "  SMART monitoring is COMPLETELY DISABLED."
+            echo "  The daemon is NOT checking:"
+            echo "    - Drive temperature"
+            echo "    - Reallocated / pending / uncorrectable sectors"
+            echo "    - UDMA CRC errors"
+            echo "    - Overall drive health (PASSED/FAILED)"
+            echo "    - SMART self-tests"
+            echo
+            echo "  Only RAID set/member presence is being monitored."
+            echo "  A failing drive may go unnoticed until it causes RAID"
+            echo "  degradation or data loss."
+            echo
+            echo "  FIX:   brew install smartmontools"
+            echo "  Or:    set SMART_CHECK_ENABLED=no in the config to"
+            echo "         silence this warning if you truly do not want"
+            echo "         SMART monitoring."
+            echo "================================================================"
+        } >&2
+        # Elevate exit code so scripts/monitoring that check \$? see this
+        # is not a clean run. Promote to at least warn (1).
+        [ "$worst" -lt 1 ] && worst=1
+    fi
+
     seen_cleanup
     trap - EXIT INT TERM
     return $worst
@@ -2173,8 +2289,8 @@ cmd_daemon_status() {
     info "Run interval:  ${LAUNCHD_INTERVAL}s ($(format_duration "$LAUNCHD_INTERVAL"))"
     echo
 
-    # --- Check 1/7: plist file on disk -----------------------------
-    step "Check 1/7: Plist file"
+    # --- Check 1/8: plist file on disk -----------------------------
+    step "Check 1/8: Plist file"
     if [ -f "$plist" ]; then
         mtime=$(stat -f '%Sm' -t '%Y-%m-%d %H:%M:%S' "$plist" 2>/dev/null)
         ok "Present. Last modified: $mtime"
@@ -2185,8 +2301,8 @@ cmd_daemon_status() {
     fi
     echo
 
-    # --- Check 2/7: plist content matches current config -----------
-    step "Check 2/7: Plist content vs current config"
+    # --- Check 2/8: plist content matches current config -----------
+    step "Check 2/8: Plist content vs current config"
     # The plist embeds the absolute path of this script and the interval
     # value. If someone renamed the script or changed LAUNCHD_INTERVAL,
     # the on-disk plist is stale.
@@ -2215,8 +2331,8 @@ cmd_daemon_status() {
     fi
     echo
 
-    # --- Check 3/7: loaded in launchd ------------------------------
-    step "Check 3/7: launchd registration"
+    # --- Check 3/8: loaded in launchd ------------------------------
+    step "Check 3/8: launchd registration"
     # 'launchctl list <label>' returns 0 if loaded, non-zero if not.
     # No sudo needed for a system-domain query read-only lookup.
     if launchctl list "$label" >/dev/null 2>&1; then
@@ -2232,8 +2348,8 @@ cmd_daemon_status() {
     fi
     echo
 
-    # --- Check 4/7: PID + last exit status -------------------------
-    step "Check 4/7: Process + last exit status"
+    # --- Check 4/8: PID + last exit status -------------------------
+    step "Check 4/8: Process + last exit status"
     # Try both userspace and (if available) sudo to read the job dict.
     out=$(launchctl list "$label" 2>/dev/null || sudo -n launchctl list "$label" 2>/dev/null)
     if [ -n "$out" ]; then
@@ -2252,8 +2368,8 @@ cmd_daemon_status() {
     fi
     echo
 
-    # --- Check 5/7: log file -------------------------------------
-    step "Check 5/7: Log file"
+    # --- Check 5/8: log file -------------------------------------
+    step "Check 5/8: Log file"
     if [ -n "${LOG_FILE:-}" ] && [ -f "$LOG_FILE" ]; then
         lmtime=$(stat -f '%m' "$LOG_FILE" 2>/dev/null)
         if [ -n "$lmtime" ]; then
@@ -2284,8 +2400,8 @@ cmd_daemon_status() {
     fi
     echo
 
-    # --- Check 6/7: launchd stderr (last errors) -------------------
-    step "Check 6/7: Launchd stderr log"
+    # --- Check 6/8: launchd stderr (last errors) -------------------
+    step "Check 6/8: Launchd stderr log"
     err_log="${LAUNCHD_STDERR_LOG:-/var/log/my-appleRAID.launchd.err}"
     if [ -f "$err_log" ]; then
         sz=$(stat -f '%z' "$err_log" 2>/dev/null)
@@ -2300,8 +2416,8 @@ cmd_daemon_status() {
     fi
     echo
 
-    # --- Check 7/7: state dir writable -----------------------------
-    step "Check 7/7: Writable paths"
+    # --- Check 7/8: state dir writable -----------------------------
+    step "Check 7/8: Writable paths"
     # The daemon runs as root via launchd, but if it were ever run
     # manually as a non-root user, the state dir may not be writable.
     # Check the *current* user's ability to touch these paths - a
@@ -2326,6 +2442,27 @@ cmd_daemon_status() {
             info "Log directory NOT writable by current user: $parent"
             info "  (Daemon runs as root via launchd, so this is probably fine.)"
         fi
+    fi
+    echo
+
+    # --- Check 8/8: smartctl availability --------------------------
+    # The daemon's SMART-checking pipeline is silent-failure-prone
+    # when smartctl is missing. Call it out explicitly here so the
+    # "all good" conclusion of daemon-status can never be misleading
+    # when SMART is actually disabled for lack of tooling.
+    step "Check 8/8: smartctl availability"
+    if command -v smartctl >/dev/null 2>&1; then
+        ok "smartctl is installed: $(command -v smartctl)"
+        ok "  SMART monitoring is ACTIVE."
+    else
+        err "smartctl is NOT INSTALLED."
+        err "  SMART monitoring is DISABLED."
+        err "  Temperature, pending/reallocated sectors, drive health -"
+        err "  NONE of these are being monitored. A failing drive could"
+        err "  go unnoticed until it causes RAID degradation or data loss."
+        echo
+        info "  Fix:  brew install smartmontools"
+        info "  Or:   set SMART_CHECK_ENABLED=no in config to silence the warning."
     fi
     echo
 
@@ -2691,18 +2828,25 @@ cmd_report() {
     [ "$pending_found" = "0" ] && ok "No pending timers."
     echo
 
-    # --- SMART last run ---
+    # --- SMART polling ---
     step "SMART polling"
-    f=$(smart_last_run_file)
-    if [ -f "$f" ]; then
-        last=$(cat "$f" 2>/dev/null)
-        if [ -n "$last" ]; then
-            ago=$(( $(date +%s) - last ))
-            info "Last SMART poll:  $(date -r "$last" '+%Y-%m-%d %H:%M:%S')  (${ago}s ago)"
-            info "Next scheduled:   every ${SMART_POLL_INTERVAL}s ($(format_duration "$SMART_POLL_INTERVAL"))"
-        fi
+    if ! command -v smartctl >/dev/null 2>&1; then
+        err "smartctl is NOT INSTALLED - SMART checks are DISABLED."
+        err "  No temperature / sector / health monitoring is happening."
+        err "  Install with:  brew install smartmontools"
     else
-        info "SMART has not run yet."
+        ok "smartctl is available: $(command -v smartctl)"
+        f=$(smart_last_run_file)
+        if [ -f "$f" ]; then
+            last=$(cat "$f" 2>/dev/null)
+            if [ -n "$last" ]; then
+                ago=$(( $(date +%s) - last ))
+                info "Last SMART poll:  $(date -r "$last" '+%Y-%m-%d %H:%M:%S')  (${ago}s ago)"
+                info "Next scheduled:   every ${SMART_POLL_INTERVAL}s ($(format_duration "$SMART_POLL_INTERVAL"))"
+            fi
+        else
+            info "SMART has not run yet."
+        fi
     fi
     echo
 
@@ -2884,11 +3028,22 @@ cmd_help() {
 ${C_BOLD}${SCRIPT_NAME}${C_RESET} - AppleRAID management helper for macOS
 
 ${C_BOLD}USAGE${C_RESET}
-  ${SCRIPT_NAME} <command> [arguments]
+  ${SCRIPT_NAME} [-V | -D] <command> [arguments]
+  ${SCRIPT_NAME} <command> [-V | -D] [arguments]
+
+${C_BOLD}GLOBAL OPTIONS${C_RESET} (accepted before OR after the command name)
+  ${C_CYAN}-V${C_RESET}, ${C_CYAN}--verbose${C_RESET}            Show more detail. Sets LOG_LEVEL=debug.
+                              Per-command: extended views where applicable.
+  ${C_CYAN}-D${C_RESET}, ${C_CYAN}--debug${C_RESET}              Even more detail. Implies -V, plus shell
+                              tracing (set -x) and raw internal dumps.
 
 ${C_BOLD}COMMANDS${C_RESET}
   ${C_CYAN}list${C_RESET}                        List all AppleRAID sets and their members.
-  ${C_CYAN}disks${C_RESET}                       List all physical disks on the system.
+  ${C_CYAN}disks${C_RESET}                       One line per disk.
+                                (default)  compact: DEV SIZE KIND LOC MODEL ROLE
+                                -V         extended: adds SERIAL TEMP SMART
+                                           ROT TRIM PROTOCOL
+                                -D         full 'diskutil list' output
   ${C_CYAN}info${C_RESET} [name|uuid]            Show detailed info for a RAID set.
   ${C_CYAN}create${C_RESET} <name> <N1> <N2>     Create a new mirror from two disk NUMBERS
                               (e.g. '${SCRIPT_NAME} create BackupGold 2 3').
@@ -3030,13 +3185,190 @@ cmd_list() {
 
 # ----------------------------------------------------------------------
 # Subcommand: disks
+# Detail levels (controlled by GLOBAL -V/-D flags):
+#   (default)              compact one-liner: DEV SIZE KIND LOC MODEL ROLE
+#   -V / --verbose         extended: adds SERIAL TEMP SMART ROT TRIM PROTOCOL
+#                          (requires smartctl for TEMP / SMART / ROT)
+#   -D / --debug           full 'diskutil list' output (every partition)
 # ----------------------------------------------------------------------
 cmd_disks() {
-    step "Listing all disks"
-    explain "Command: diskutil list"
-    explain "Shows every block device macOS knows about: physical, virtual (RAID, APFS), and synthesized."
+    # Strip global flags that may appear after the subcommand.
+    eval "$(parse_global_flags "$@")"
+
+    # Any non-flag positional args to disks are currently unsupported,
+    # but we accept -h gracefully.
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -h|--help)
+                cat <<EOF
+Usage: $SCRIPT_NAME disks [-V | -D]
+
+Detail levels:
+  (default)       compact: DEV SIZE KIND LOC MODEL ROLE
+  -V, --verbose   extended: adds SERIAL TEMP SMART ROT TRIM PROTOCOL
+                  (TEMP/SMART/ROT require smartctl)
+  -D, --debug     full 'diskutil list' output (every partition/slice)
+EOF
+                return 0
+                ;;
+            *) warn "Unknown option: $1" ;;
+        esac
+        shift
+    done
+
+    if [ "$DEBUG" = "1" ]; then
+        step "Listing all disks (full diskutil list)"
+        explain "Command: diskutil list"
+        explain "Shows every block device: physical, virtual (RAID, APFS), and synthesized."
+        echo
+        run diskutil list
+        return 0
+    fi
+
+    if [ "$VERBOSE" = "1" ]; then
+        step "Disks (extended)"
+        explain "Use '$SCRIPT_NAME disks' for compact view, or '-D' for full 'diskutil list'."
+        if ! command -v smartctl >/dev/null 2>&1; then
+            warn "smartctl not installed - TEMP / SMART / ROT columns will be '-'"
+            warn "  Fix:  brew install smartmontools"
+        fi
+    else
+        step "Disks (compact)"
+        explain "Use '$SCRIPT_NAME disks -V' for extended info, or '-D' for full 'diskutil list'."
+    fi
     echo
-    run diskutil list
+
+    # Build a "disk -> RAID set name" lookup for the Role column.
+    raid_map=$(diskutil appleRAID list 2>/dev/null | awk -F': +' '
+        /^Name:/ { setname = $2; sub(/ +$/, "", setname) }
+        /^[ ]*[0-9]+[ \t]+disk[0-9]+/ {
+            nf = split($0, parts, /[ \t]+/)
+            for (i = 1; i <= nf; i++) {
+                if (parts[i] ~ /^disk[0-9]+(s[0-9]+)?$/) {
+                    dev = parts[i]
+                    sub(/s[0-9]+$/, "", dev)
+                    print dev "|" setname
+                    break
+                }
+            }
+        }
+    ')
+
+    # Header
+    if [ "$VERBOSE" = "1" ]; then
+        printf '  %-8s %9s  %-4s  %-9s %-24s  %-18s %5s %-6s %-4s %-4s %-10s %s\n' \
+            "DEV" "SIZE" "KIND" "LOC" "MODEL" "SERIAL" "TEMP" "SMART" "ROT" "TRIM" "PROTOCOL" "ROLE"
+        printf '  %-8s %9s  %-4s  %-9s %-24s  %-18s %5s %-6s %-4s %-4s %-10s %s\n' \
+            "---" "----" "----" "---" "-----" "------" "----" "-----" "---" "----" "--------" "----"
+    else
+        printf '  %-8s %9s  %-4s  %-9s %-28s %s\n' \
+            "DEV" "SIZE" "KIND" "LOC" "MODEL" "ROLE"
+        printf '  %-8s %9s  %-4s  %-9s %-28s %s\n' \
+            "---" "----" "----" "---" "-----" "----"
+    fi
+
+    # Iterate every whole disk.
+    diskutil list 2>/dev/null | awk '/^\/dev\/disk[0-9]+/ {
+        sub(/:$/, "", $1)
+        sub(/^\/dev\//, "", $1)
+        print $1
+    }' | while read -r d; do
+        [ -n "$d" ] || continue
+        dev="/dev/$d"
+        info_out=$(diskutil info "$dev" 2>/dev/null) || continue
+
+        size=$(echo "$info_out" | awk -F': +' '
+            /Disk Size:/ { print $2; exit }
+            /Total Size:/ { print $2; exit }
+        ')
+        size=$(echo "$size" | sed 's/ *(.*)//; s/[[:space:]]*$//')
+
+        virtual=$(echo "$info_out"  | awk -F': +' '/Virtual:/      {print $2; exit}')
+        solid=$(echo "$info_out"    | awk -F': +' '/Solid State:/  {print $2; exit}')
+        protocol=$(echo "$info_out" | awk -F': +' '/Protocol:/     {print $2; exit}')
+        if   [ "$virtual"  = "Yes" ];        then kind="virt"
+        elif [ "$protocol" = "Disk Image" ]; then kind="img"
+        elif [ "$solid"    = "Yes" ];        then kind="SSD"
+        else                                       kind="HDD"
+        fi
+
+        loc=$(echo "$info_out" | awk -F': +' '/Device Location:/ {print $2; exit}')
+        [ -z "$loc" ] && loc=$(echo "$info_out" | awk -F': +' '/Internal:/ {print ($2=="Yes"?"Internal":"External"); exit}')
+        loc=$(echo "$loc" | awk '{print $1}')
+
+        model=$(echo "$info_out" | awk -F': +' '/Device \/ Media Name:/ {print $2; exit}')
+        [ -z "$model" ] && model=$(echo "$info_out" | awk -F': +' '/Media Name:/ {print $2; exit}')
+        [ -z "$model" ] && model="-"
+
+        role=""
+        hit=$(printf '%s\n' "$raid_map" | awk -F'|' -v d="$d" '$1==d {print $2; exit}')
+        if [ -n "$hit" ]; then
+            role="RAID member ($hit)"
+        else
+            is_raid_virt=$(echo "$info_out" | awk -F': +' '/AppleRAID Set:/ {print "yes"; exit}')
+            if [ "$is_raid_virt" = "yes" ]; then
+                set_name=$(echo "$info_out" | awk -F': +' '/AppleRAID Set Name:/ {print $2; exit}')
+                [ -z "$set_name" ] && set_name="RAID set"
+                role="RAID virtual ($set_name)"
+            else
+                is_apfs=$(echo "$info_out" | awk -F': +' '/File System Personality:/ {print $2; exit}')
+                case "$is_apfs" in
+                    *APFS*) role="APFS" ;;
+                    *)      role="-" ;;
+                esac
+            fi
+        fi
+
+        if [ "$VERBOSE" = "1" ]; then
+            serial=$(echo "$info_out" | awk -F': +' '/Disk \/ Partition UUID|Media Serial Number/ {print $2; exit}')
+            [ -z "$serial" ] && serial="-"
+            serial=$(printf '%s' "$serial" | cut -c1-18)
+
+            trim=$(echo "$info_out" | awk -F': +' '/TRIM Support:/ {print $2; exit}')
+            case "$trim" in
+                Yes) trim="yes" ;;
+                No)  trim="no"  ;;
+                *)   trim="-"   ;;
+            esac
+
+            proto_short=$(echo "$protocol" | cut -c1-10)
+            [ -z "$proto_short" ] && proto_short="-"
+
+            temp="-"; smart="-"; rot="-"
+            if command -v smartctl >/dev/null 2>&1 && [ "$virtual" != "Yes" ]; then
+                sc=$(smart_cmd "$d" 2>/dev/null)
+                [ -z "$sc" ] && sc="smartctl"
+                attrs=$($sc -A "$dev" 2>/dev/null)
+                health_raw=$($sc -H "$dev" 2>/dev/null | awk -F': *' '
+                    /SMART overall-health/ { print $2; exit }
+                    /SMART Health Status/  { print $2; exit }')
+                health_raw=$(echo "$health_raw" | sed 's/^ *//;s/ *$//')
+                case "$health_raw" in
+                    PASSED|OK) smart="OK" ;;
+                    '')        smart="-"  ;;
+                    *)         smart="$(printf '%s' "$health_raw" | cut -c1-6)" ;;
+                esac
+                temp=$(echo "$attrs" | awk '
+                    /^[[:space:]]*(194|190)[[:space:]]+Temperature/ { print $10 "C"; exit }
+                ')
+                [ -z "$temp" ] && temp="-"
+                rot=$($sc -i "$dev" 2>/dev/null | awk -F': +' '/Rotation Rate:/ {
+                    gsub(/ *rpm.*/, "", $2); print $2; exit
+                }')
+                case "$rot" in
+                    "")                       rot="-" ;;
+                    "Solid State Device")     rot="SSD" ;;
+                esac
+            fi
+
+            printf '  %-8s %9s  %-4s  %-9s %-24.24s  %-18s %5s %-6s %-4s %-4s %-10s %s\n' \
+                "$d" "$size" "$kind" "${loc:-?}" "$model" "$serial" "$temp" "$smart" "$rot" "$trim" "$proto_short" "$role"
+        else
+            model_c=$(printf '%s' "$model" | cut -c1-28)
+            printf '  %-8s %9s  %-4s  %-9s %-28s %s\n' \
+                "$d" "$size" "$kind" "${loc:-?}" "$model_c" "$role"
+        fi
+    done
 }
 
 # ----------------------------------------------------------------------
@@ -3631,6 +3963,17 @@ cmd_destroy() {
 # ----------------------------------------------------------------------
 main() {
     preflight
+
+    # Global flags (-V/--verbose, -D/--debug) can appear before OR after
+    # the subcommand name. Strip them here; subcommands also re-parse
+    # their own argv via parse_global_flags so both positions work.
+    eval "$(parse_global_flags "$@")"
+
+    # Enable shell tracing AFTER flag parsing so the parser itself
+    # doesn't pollute the trace output.
+    if [ "$DEBUG" = "1" ]; then
+        set -x
+    fi
 
     if [ $# -lt 1 ]; then
         cmd_help
