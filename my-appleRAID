@@ -3040,7 +3040,7 @@ ${C_BOLD}GLOBAL OPTIONS${C_RESET} (accepted before OR after the command name)
 ${C_BOLD}COMMANDS${C_RESET}
   ${C_CYAN}list${C_RESET}                        List all AppleRAID sets and their members.
   ${C_CYAN}disks${C_RESET}                       One line per disk.
-                                (default)  compact: DEV SIZE KIND LOC MODEL ROLE
+                                (default)  compact: DEV LOC KIND SIZE MODEL ROLE
                                 -V         extended: adds SERIAL TEMP SMART
                                            ROT TRIM PROTOCOL
                                 -D         full 'diskutil list' output
@@ -3186,7 +3186,7 @@ cmd_list() {
 # ----------------------------------------------------------------------
 # Subcommand: disks
 # Detail levels (controlled by GLOBAL -V/-D flags):
-#   (default)              compact one-liner: DEV SIZE KIND LOC MODEL ROLE
+#   (default)              compact one-liner: DEV LOC KIND SIZE MODEL ROLE
 #   -V / --verbose         extended: adds SERIAL TEMP SMART ROT TRIM PROTOCOL
 #                          (requires smartctl for TEMP / SMART / ROT)
 #   -D / --debug           full 'diskutil list' output (every partition)
@@ -3204,7 +3204,7 @@ cmd_disks() {
 Usage: $SCRIPT_NAME disks [-V | -D]
 
 Detail levels:
-  (default)       compact: DEV SIZE KIND LOC MODEL ROLE
+  (default)       compact: DEV LOC KIND SIZE MODEL ROLE
   -V, --verbose   extended: adds SERIAL TEMP SMART ROT TRIM PROTOCOL
                   (TEMP/SMART/ROT require smartctl)
   -D, --debug     full 'diskutil list' output (every partition/slice)
@@ -3256,15 +3256,15 @@ EOF
 
     # Header
     if [ "$VERBOSE" = "1" ]; then
-        printf '  %-8s %9s  %-4s  %-9s %-24s  %-18s %5s %-6s %-4s %-4s %-10s %s\n' \
-            "DEV" "SIZE" "KIND" "LOC" "MODEL" "SERIAL" "TEMP" "SMART" "ROT" "TRIM" "PROTOCOL" "ROLE"
-        printf '  %-8s %9s  %-4s  %-9s %-24s  %-18s %5s %-6s %-4s %-4s %-10s %s\n' \
-            "---" "----" "----" "---" "-----" "------" "----" "-----" "---" "----" "--------" "----"
+        printf '  %-8s %-9s %-4s %9s  %-24s  %-18s %5s %-6s %-4s %-4s %-10s %s\n' \
+            "DEV" "LOC" "KIND" "SIZE" "MODEL" "SERIAL" "TEMP" "SMART" "ROT" "TRIM" "PROTOCOL" "ROLE"
+        printf '  %-8s %-9s %-4s %9s  %-24s  %-18s %5s %-6s %-4s %-4s %-10s %s\n' \
+            "---" "---" "----" "----" "-----" "------" "----" "-----" "---" "----" "--------" "----"
     else
-        printf '  %-8s %9s  %-4s  %-9s %-28s %s\n' \
-            "DEV" "SIZE" "KIND" "LOC" "MODEL" "ROLE"
-        printf '  %-8s %9s  %-4s  %-9s %-28s %s\n' \
-            "---" "----" "----" "---" "-----" "----"
+        printf '  %-8s %-9s %-4s %9s  %-28s %s\n' \
+            "DEV" "LOC" "KIND" "SIZE" "MODEL" "ROLE"
+        printf '  %-8s %-9s %-4s %9s  %-28s %s\n' \
+            "---" "---" "----" "----" "-----" "----"
     fi
 
     # Iterate every whole disk.
@@ -3361,12 +3361,12 @@ EOF
                 esac
             fi
 
-            printf '  %-8s %9s  %-4s  %-9s %-24.24s  %-18s %5s %-6s %-4s %-4s %-10s %s\n' \
-                "$d" "$size" "$kind" "${loc:-?}" "$model" "$serial" "$temp" "$smart" "$rot" "$trim" "$proto_short" "$role"
+            printf '  %-8s %-9s %-4s %9s  %-24.24s  %-18s %5s %-6s %-4s %-4s %-10s %s\n' \
+                "$d" "${loc:-?}" "$kind" "$size" "$model" "$serial" "$temp" "$smart" "$rot" "$trim" "$proto_short" "$role"
         else
             model_c=$(printf '%s' "$model" | cut -c1-28)
-            printf '  %-8s %9s  %-4s  %-9s %-28s %s\n' \
-                "$d" "$size" "$kind" "${loc:-?}" "$model_c" "$role"
+            printf '  %-8s %-9s %-4s %9s  %-28s %s\n' \
+                "$d" "${loc:-?}" "$kind" "$size" "$model_c" "$role"
         fi
     done
 }
