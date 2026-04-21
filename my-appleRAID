@@ -81,14 +81,15 @@ DEBUG=0
 # That snippet sets VERBOSE/DEBUG/LOG_LEVEL and positional params in
 # the caller's own shell.
 #
+# IMPORTANT: the emitted snippet only RAISES the verbosity level. If
+# the caller's VERBOSE or DEBUG is already set from a prior parse
+# (e.g. main() parsed '-V' and then dispatched to a subcommand which
+# also re-parses its own argv), this re-parse must not clobber the
+# earlier state back to zero. We therefore read the current values of
+# VERBOSE/DEBUG at eval time and only turn them on, never off.
+#
 # Idiomatic use:
 #     eval "$(parse_global_flags "$@")"
-#
-# Output format (one line, shell-quoted):
-#     VERBOSE=1; DEBUG=0; LOG_LEVEL=debug; set -- 'disks' '--dry-run'
-#
-# For safety across weird args (spaces, quotes), we single-quote each
-# remaining arg and escape embedded single quotes as '\''.
 parse_global_flags() {
     _v=0; _d=0
     _args=""
@@ -104,11 +105,18 @@ parse_global_flags() {
                 ;;
         esac
     done
-    _ll=""
+
+    # Emit code that ORs in the new flag values rather than replacing
+    # them. Using arithmetic evaluation: any prior 1 stays 1.
+    # shellcheck disable=SC2016  # arithmetic intentionally literal;
+                                 # the caller's eval expands it.
+    printf 'VERBOSE=$((VERBOSE | %d)); DEBUG=$((DEBUG | %d));' "$_v" "$_d"
+    # LOG_LEVEL: only escalate if we actually saw a flag this call
+    # (otherwise leave caller's choice untouched).
     if [ "$_d" = "1" ] || [ "$_v" = "1" ]; then
-        _ll="LOG_LEVEL=debug; "
+        printf ' LOG_LEVEL=debug;'
     fi
-    printf 'VERBOSE=%d; DEBUG=%d; %sset --%s' "$_v" "$_d" "$_ll" "$_args"
+    printf ' set --%s' "$_args"
 }
 
 # ----------------------------------------------------------------------
