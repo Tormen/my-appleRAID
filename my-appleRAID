@@ -18,16 +18,16 @@
 #   - Self-tests: schedulable SMART short/long self-tests via smartctl -t.
 #
 # Config search path (first readable file wins):
-#   $APPLERAID_CONFIG        (env var, for testing)
-#   /LINKS/default/appleRAID.conf
-#   $HOME/.appleRAID.conf
-#   /usr/local/etc/appleRAID.conf
-#   /etc/appleRAID.conf
+#   $MY_APPLERAID_CONFIG        (env var, for testing)
+#   /LINKS/default/my-appleRAID.conf
+#   $HOME/.my-appleRAID.conf
+#   /usr/local/etc/my-appleRAID.conf
+#   /etc/my-appleRAID.conf
 #
 # See `appleRAID --help` for full command list and `appleRAID create-config
 # <path>` to produce a well-commented default config.
 #
-# Author: generated assistant helper script
+# Author: Tormen <tormen@mail.ch>
 # License: public domain / do-what-you-want
 #
 
@@ -333,7 +333,7 @@ cfg_set_defaults() {
     ALARM_ENABLED=yes
     # Email
     EMAIL_TO=""                            # empty disables email
-    EMAIL_FROM="appleRAID@$(hostname)"
+    EMAIL_FROM="my-appleRAID@$(hostname)"
     EMAIL_SENDER="/usr/local/bin/msmtp"
     EMAIL_INTERVAL=14400                   # 4 hours
     # SMART polling & self-tests
@@ -342,12 +342,12 @@ cfg_set_defaults() {
     SELFTEST_LONG_SCHEDULE="weekly"        # never|daily|weekly
     SELFTEST_HOUR=3                        # 0-23, when scheduled tests kick off
     # State / logging
-    STATE_DIR="/var/db/appleRAID"
-    LOG_FILE="/var/log/appleRAID.log"
+    STATE_DIR="/var/db/my-appleRAID"
+    LOG_FILE="/var/log/my-appleRAID.log"
     LOG_LEVEL=info                         # error|warn|info|debug
     # LaunchDaemon installation target (used by install-daemon)
-    LAUNCHD_PLIST="/Library/LaunchDaemons/local.appleRAID.health.plist"
-    LAUNCHD_LABEL="local.appleRAID.health"
+    LAUNCHD_PLIST="/Library/LaunchDaemons/local.my-appleRAID.health.plist"
+    LAUNCHD_LABEL="local.my-appleRAID.health"
     LAUNCHD_INTERVAL=60
 }
 
@@ -362,11 +362,11 @@ cfg_load() {
     cfg_set_defaults
     # Candidate search path, in priority order.
     for candidate in \
-        "${APPLERAID_CONFIG:-}" \
-        "/LINKS/default/appleRAID.conf" \
-        "${HOME:-/}/.appleRAID.conf" \
-        "/usr/local/etc/appleRAID.conf" \
-        "/etc/appleRAID.conf"
+        "${MY_APPLERAID_CONFIG:-}" \
+        "/LINKS/default/my-appleRAID.conf" \
+        "${HOME:-/}/.my-appleRAID.conf" \
+        "/usr/local/etc/my-appleRAID.conf" \
+        "/etc/my-appleRAID.conf"
     do
         [ -n "$candidate" ] || continue
         if [ -r "$candidate" ]; then
@@ -1537,6 +1537,33 @@ cmd_health() {
 # ----------------------------------------------------------------------
 cmd_show_config() {
     cfg_load
+
+    # Refuse to display if no config file was actually loaded. Showing
+    # built-in defaults as "the config" is misleading - the user ran
+    # show-config precisely because they want to see THEIR config. If
+    # it's not there, tell them how to fix that rather than confirming
+    # a state that doesn't exist.
+    case "$LOADED_CONFIG" in
+        *"(none"*|"")
+            err "No config file found on the search path."
+            echo
+            info "Searched locations (first readable wins):"
+            info "  \$MY_APPLERAID_CONFIG              (env var, for testing)"
+            info "  /LINKS/default/my-appleRAID.conf"
+            info "  \$HOME/.my-appleRAID.conf"
+            info "  /usr/local/etc/my-appleRAID.conf"
+            info "  /etc/my-appleRAID.conf"
+            echo
+            info "To create an annotated default config at one of these paths:"
+            info "  $SCRIPT_NAME create-config /LINKS/default/my-appleRAID.conf"
+            info "Or for a per-user file:"
+            info "  $SCRIPT_NAME create-config ~/.my-appleRAID.conf"
+            echo
+            info "Then re-run:  $SCRIPT_NAME show-config"
+            exit 1
+            ;;
+    esac
+
     step "Effective configuration"
     info "Config file loaded: $LOADED_CONFIG"
     echo
@@ -1599,7 +1626,15 @@ format_duration() {
 # `create-config <path>` - write an annotated default config file.
 # ----------------------------------------------------------------------
 cmd_create_config() {
-    [ $# -ge 1 ] || die "Usage: $SCRIPT_NAME create-config <path>"
+    if [ $# -lt 1 ]; then
+        err "Usage: $SCRIPT_NAME create-config <path>"
+        echo
+        info "Suggested locations (any one works; first readable wins):"
+        info "  /LINKS/default/my-appleRAID.conf        # your symlink-based location"
+        info "  /usr/local/etc/my-appleRAID.conf        # system-wide"
+        info "  ~/.my-appleRAID.conf                    # per-user"
+        exit 1
+    fi
     path="$1"
     if [ -e "$path" ]; then
         confirm "File $path already exists. Overwrite?" || die "Aborted."
@@ -1609,18 +1644,18 @@ cmd_create_config() {
 
     cat > "$path" <<'EOF'
 # ======================================================================
-# appleRAID configuration file
+# my-appleRAID configuration file
 # ======================================================================
 # This file is sourced by /bin/dash. Syntax: KEY=value (no spaces around
 # '='). Values with spaces must be quoted.  Lines starting with '#' are
 # comments.
 #
 # Search path (first readable file wins):
-#   $APPLERAID_CONFIG  (env var, for testing)
-#   /LINKS/default/appleRAID.conf
-#   $HOME/.appleRAID.conf
-#   /usr/local/etc/appleRAID.conf
-#   /etc/appleRAID.conf
+#   $MY_APPLERAID_CONFIG  (env var, for testing)
+#   /LINKS/default/my-appleRAID.conf
+#   $HOME/.my-appleRAID.conf
+#   /usr/local/etc/my-appleRAID.conf
+#   /etc/my-appleRAID.conf
 #
 # Every key has a built-in default; you only need to set the ones you
 # want to change.
@@ -1827,7 +1862,7 @@ ALARM_INTERVAL=1m
 EMAIL_TO=""
 
 # From address. Must match what your SMTP relay allows.
-EMAIL_FROM="appleRAID@localhost"
+EMAIL_FROM="my-appleRAID@localhost"
 
 # Path to a sendmail-compatible sender. msmtp is recommended:
 #   brew install msmtp
@@ -1882,10 +1917,10 @@ SELFTEST_HOUR=3
 
 # Where the script keeps its state database and sentinel files.
 # Must be writable by the user running `appleRAID health`.
-STATE_DIR="/var/db/appleRAID"
+STATE_DIR="/var/db/my-appleRAID"
 
 # Log file. Set empty to log to stderr only (launchd will capture it).
-LOG_FILE="/var/log/appleRAID.log"
+LOG_FILE="/var/log/my-appleRAID.log"
 
 # Verbosity: error | warn | info | debug
 LOG_LEVEL=info
@@ -1895,11 +1930,11 @@ LOG_LEVEL=info
 
 # Full path to the plist. Change this if you prefer a different filename
 # or location (e.g. a user LaunchAgent).
-LAUNCHD_PLIST="/Library/LaunchDaemons/local.appleRAID.health.plist"
+LAUNCHD_PLIST="/Library/LaunchDaemons/local.my-appleRAID.health.plist"
 
 # Label - must be unique across launchd and should match the filename
 # (minus .plist).
-LAUNCHD_LABEL="local.appleRAID.health"
+LAUNCHD_LABEL="local.my-appleRAID.health"
 
 # How often launchd should invoke `appleRAID health`.
 # Accepts duration suffixes (see top of file): 60, 1m, 5m, etc.
@@ -2039,9 +2074,9 @@ The following plist will be written:
   <key>RunAtLoad</key>
   <true/>
   <key>StandardOutPath</key>
-  <string>/var/log/appleRAID.launchd.out</string>
+  <string>/var/log/my-appleRAID.launchd.out</string>
   <key>StandardErrorPath</key>
-  <string>/var/log/appleRAID.launchd.err</string>
+  <string>/var/log/my-appleRAID.launchd.err</string>
 </dict>
 </plist>
 
@@ -2067,9 +2102,9 @@ EOF
   <key>RunAtLoad</key>
   <true/>
   <key>StandardOutPath</key>
-  <string>/var/log/appleRAID.launchd.out</string>
+  <string>/var/log/my-appleRAID.launchd.out</string>
   <key>StandardErrorPath</key>
-  <string>/var/log/appleRAID.launchd.err</string>
+  <string>/var/log/my-appleRAID.launchd.err</string>
 </dict>
 </plist>
 EOF
@@ -2083,7 +2118,7 @@ EOF
         || warn "Could not load the plist automatically. Reboot or run 'sudo launchctl bootstrap system $plist' manually."
 
     ok "LaunchDaemon installed and loaded."
-    info "View logs:  tail -f /var/log/appleRAID.launchd.err /var/log/appleRAID.log"
+    info "View logs:  tail -f /var/log/my-appleRAID.launchd.err /var/log/my-appleRAID.log"
     info "Status:     sudo launchctl list | grep $label"
 }
 
@@ -2201,7 +2236,7 @@ cmd_daemon_status() {
             if [ "$ago" -gt "$threshold" ]; then
                 warn "Log hasn't been written to in ${ago}s (interval is ${LAUNCHD_INTERVAL}s)."
                 warn "The daemon may not be running. Check:"
-                warn "  tail /var/log/appleRAID.launchd.err"
+                warn "  tail /var/log/my-appleRAID.launchd.err"
             else
                 ok "Log activity is recent."
             fi
@@ -2212,13 +2247,13 @@ cmd_daemon_status() {
     else
         warn "Log file not present or not configured: ${LOG_FILE:-<unset>}"
         info "  (launchd stderr/stdout logs may still exist at"
-        info "   /var/log/appleRAID.launchd.{err,out} - check those.)"
+        info "   /var/log/my-appleRAID.launchd.{err,out} - check those.)"
     fi
     echo
 
     # --- Check 6/7: launchd stderr (last errors) -------------------
     step "Check 6/7: Launchd stderr log"
-    err_log="/var/log/appleRAID.launchd.err"
+    err_log="/var/log/my-appleRAID.launchd.err"
     if [ -f "$err_log" ]; then
         sz=$(stat -f '%z' "$err_log" 2>/dev/null)
         if [ "${sz:-0}" = "0" ]; then
@@ -2263,8 +2298,8 @@ cmd_daemon_status() {
 
     step "Quick actions"
     cat <<EOF
-  Tail the log live:       tail -f ${LOG_FILE:-/var/log/appleRAID.log}
-  Tail launchd stderr:     tail -f /var/log/appleRAID.launchd.err
+  Tail the log live:       tail -f ${LOG_FILE:-/var/log/my-appleRAID.log}
+  Tail launchd stderr:     tail -f /var/log/my-appleRAID.launchd.err
   Force an immediate run:  sudo launchctl kickstart -k system/$label
   Reload the plist:        sudo $SCRIPT_NAME uninstall-daemon && sudo $SCRIPT_NAME install-daemon
   Full health overview:    $SCRIPT_NAME report
@@ -2865,7 +2900,7 @@ ${C_BOLD}COMMANDS${C_RESET}
                               config file (if any) was loaded.
   ${C_CYAN}create-config${C_RESET} <path>        Write an annotated default config file to
                               <path>. Example:
-                                ${SCRIPT_NAME} create-config ~/.appleRAID.conf
+                                ${SCRIPT_NAME} create-config ~/.my-appleRAID.conf
   ${C_CYAN}baseline${C_RESET} [--sets|--disks|--show]
                               Snapshot the currently-existing RAID sets
                               and/or attached disks into the "expected
@@ -2900,11 +2935,11 @@ ${C_BOLD}COMMANDS${C_RESET}
 
 ${C_BOLD}CONFIG FILE SEARCH PATH${C_RESET}
   First readable file wins:
-    \$APPLERAID_CONFIG              (env var, for testing)
-    /LINKS/default/appleRAID.conf
-    ~/.appleRAID.conf
-    /usr/local/etc/appleRAID.conf
-    /etc/appleRAID.conf
+    \$MY_APPLERAID_CONFIG              (env var, for testing)
+    /LINKS/default/my-appleRAID.conf
+    ~/.my-appleRAID.conf
+    /usr/local/etc/my-appleRAID.conf
+    /etc/my-appleRAID.conf
   If none found, built-in defaults are used. 'show-config' will tell you.
 
 ${C_BOLD}VERBOSE BY DESIGN${C_RESET}
@@ -2925,8 +2960,8 @@ ${C_BOLD}EXAMPLES${C_RESET}
 
   ${C_BOLD}-- Health monitoring setup --${C_RESET}
   # 1. Create and edit a config file
-  ${SCRIPT_NAME} create-config /usr/local/etc/appleRAID.conf
-  vi /usr/local/etc/appleRAID.conf        # set EMAIL_TO, thresholds, etc.
+  ${SCRIPT_NAME} create-config /usr/local/etc/my-appleRAID.conf
+  vi /usr/local/etc/my-appleRAID.conf        # set EMAIL_TO, thresholds, etc.
   ${SCRIPT_NAME} show-config              # verify what will be used
   # 2. Dry-run a health pass (no alerts)
   ${SCRIPT_NAME} health --dry-run -v
@@ -2935,7 +2970,7 @@ ${C_BOLD}EXAMPLES${C_RESET}
   # 4. Install the LaunchDaemon (runs every 60s as root)
   sudo ${SCRIPT_NAME} install-daemon
   # 5. Tail the log
-  tail -f /var/log/appleRAID.log
+  tail -f /var/log/my-appleRAID.log
 
 ${C_BOLD}SAFETY NOTES${C_RESET}
   - This script will run 'sudo' for destructive operations. It will
