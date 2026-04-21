@@ -1,0 +1,882 @@
+#!/bin/dash
+#
+# appleRAID - Management script for macOS AppleRAID mirror sets
+#
+# POSIX/dash-compatible. Verbose by default: every destructive or
+# state-changing command is printed before being executed.
+#
+# Author: generated assistant helper script
+# License: public domain / do-what-you-want
+#
+
+set -u  # Treat unset variables as errors (but NOT -e: we want to handle
+        # errors ourselves and keep interactive flow alive).
+
+# ----------------------------------------------------------------------
+# Colors (only if stdout is a terminal)
+# ----------------------------------------------------------------------
+if [ -t 1 ]; then
+    C_BOLD=$(printf '\033[1m')
+    C_DIM=$(printf '\033[2m')
+    C_RED=$(printf '\033[31m')
+    C_GREEN=$(printf '\033[32m')
+    C_YELLOW=$(printf '\033[33m')
+    C_BLUE=$(printf '\033[34m')
+    C_CYAN=$(printf '\033[36m')
+    C_RESET=$(printf '\033[0m')
+else
+    C_BOLD=''
+    C_DIM=''
+    C_RED=''
+    C_GREEN=''
+    C_YELLOW=''
+    C_BLUE=''
+    C_CYAN=''
+    C_RESET=''
+fi
+
+SCRIPT_NAME="$(basename "$0")"
+
+# ----------------------------------------------------------------------
+# Logging helpers
+# ----------------------------------------------------------------------
+info()    { printf '%s[INFO]%s %s\n'  "${C_BLUE}"   "${C_RESET}" "$*"; }
+ok()      { printf '%s[ OK ]%s %s\n'  "${C_GREEN}"  "${C_RESET}" "$*"; }
+warn()    { printf '%s[WARN]%s %s\n'  "${C_YELLOW}" "${C_RESET}" "$*" >&2; }
+err()     { printf '%s[FAIL]%s %s\n'  "${C_RED}"    "${C_RESET}" "$*" >&2; }
+step()    { printf '\n%s=== %s ===%s\n' "${C_BOLD}${C_CYAN}" "$*" "${C_RESET}"; }
+explain() { printf '%s%s%s\n' "${C_DIM}" "$*" "${C_RESET}"; }
+
+# Print a command (with optional sudo) in bold, then execute it.
+# Use: run <cmd> <arg1> <arg2> ...
+run() {
+    printf '%s$ %s%s\n' "${C_BOLD}" "$*" "${C_RESET}"
+    "$@"
+}
+
+# Print a command without running it (for "dry" illustrations).
+show() {
+    printf '%s$ %s%s\n' "${C_DIM}" "$*" "${C_RESET}"
+}
+
+# Ask yes/no (default NO). Returns 0 on yes, 1 on no.
+confirm() {
+    prompt="$1"
+    printf '%s%s%s (yes/no) ' "${C_YELLOW}" "$prompt" "${C_RESET}"
+    read -r answer || return 1
+    [ "$answer" = "yes" ] || [ "$answer" = "y" ] || [ "$answer" = "YES" ]
+}
+
+# Press-enter-to-continue gate.
+pause() {
+    printf '%sPress Enter to continue...%s ' "${C_DIM}" "${C_RESET}"
+    read -r _dummy || true
+}
+
+die() {
+    err "$*"
+    exit 1
+}
+
+# ----------------------------------------------------------------------
+# Preflight
+# ----------------------------------------------------------------------
+preflight() {
+    # macOS check
+    if [ "$(uname)" != "Darwin" ]; then
+        die "This script requires macOS (uname reports: $(uname))"
+    fi
+
+    # Tool check
+    for tool in diskutil dd awk grep plutil; do
+        if ! command -v "$tool" >/dev/null 2>&1; then
+            die "Required tool not found: $tool"
+        fi
+    done
+}
+
+# ----------------------------------------------------------------------
+# Disk helpers
+# ----------------------------------------------------------------------
+
+# Resolve a user-supplied number (e.g. "3") or name (e.g. "disk3" or
+# "/dev/disk3") into a canonical device path "/dev/diskN".
+resolve_disk() {
+    input="$1"
+    case "$input" in
+        /dev/disk[0-9]*) echo "$input" ;;
+        disk[0-9]*)      echo "/dev/$input" ;;
+        [0-9]*)          echo "/dev/disk$input" ;;
+        *) return 1 ;;
+    esac
+}
+
+# Confirm device exists and is a whole disk (not a partition).
+assert_whole_disk() {
+    dev="$1"
+    if ! diskutil info "$dev" >/dev/null 2>&1; then
+        die "Device not found: $dev"
+    fi
+    # Whole disks have 'Whole: Yes' in diskutil info.
+    whole=$(diskutil info "$dev" | awk -F': *' '/Whole:/ {print $2; exit}')
+    if [ "$whole" != "Yes" ]; then
+        die "$dev is not a whole disk (likely a partition). Pass the parent disk."
+    fi
+}
+
+# Print a one-line summary for a disk.
+describe_disk() {
+    dev="$1"
+    size=$(diskutil info "$dev" 2>/dev/null | awk -F': *' '/Disk Size:/ {print $2; exit}')
+    proto=$(diskutil info "$dev" 2>/dev/null | awk -F': *' '/Protocol:/ {print $2; exit}')
+    model=$(diskutil info "$dev" 2>/dev/null | awk -F': *' '/Device \/ Media Name:/ {print $2; exit}')
+    printf '  %s  size=%s  proto=%s  model=%s\n' "$dev" "${size:-?}" "${proto:-?}" "${model:-?}"
+}
+
+# Get disk size in bytes.
+disk_size_bytes() {
+    dev="$1"
+    diskutil info "$dev" 2>/dev/null | awk -F'[()]' '/Disk Size/ {print $2; exit}' | awk '{print $1}'
+}
+
+# ----------------------------------------------------------------------
+# RAID helpers
+# ----------------------------------------------------------------------
+
+# List all AppleRAID set UUIDs.
+raid_list_uuids() {
+    diskutil appleRAID list 2>/dev/null | awk '/^Unique ID:/ {print $3}'
+}
+
+# Given a RAID set UUID, return its virtual device node (e.g. "disk4").
+raid_uuid_to_device() {
+    uuid="$1"
+    diskutil appleRAID list 2>/dev/null | awk -v u="$uuid" '
+        /^Unique ID:/   { cur = $3 }
+        /^Device Node:/ { if (cur == u) { print $3; exit } }
+    '
+}
+
+# Given a RAID set name, return its UUID.
+raid_name_to_uuid() {
+    name="$1"
+    diskutil appleRAID list 2>/dev/null | awk -v n="$name" '
+        /^Name:/       { cur = $2 }
+        /^Unique ID:/  { if (cur == n) { print $3; exit } }
+    '
+}
+
+# Given a virtual device ("disk4" or "/dev/disk4"), return its RAID UUID.
+raid_device_to_uuid() {
+    dev="$1"
+    # Strip /dev/ if present.
+    short="${dev#/dev/}"
+    diskutil appleRAID list 2>/dev/null | awk -v d="$short" '
+        /^Unique ID:/   { uuid = $3 }
+        /^Device Node:/ { if ($3 == d) { print uuid; exit } }
+    '
+}
+
+# Get status of a RAID set by UUID.
+raid_status() {
+    uuid="$1"
+    diskutil appleRAID list 2>/dev/null | awk -v u="$uuid" '
+        /^Unique ID:/ { cur = $3 }
+        /^Status:/    { if (cur == u) { print $2; exit } }
+    '
+}
+
+# Count RAID sets.
+raid_count() {
+    raid_list_uuids | grep -c . || true
+}
+
+# Pick a RAID set interactively (or return the only one, or fail).
+# Sets global variable SELECTED_UUID.
+pick_raid_set() {
+    n=$(raid_count)
+    if [ "$n" -eq 0 ]; then
+        die "No AppleRAID sets found."
+    fi
+    if [ "$n" -eq 1 ]; then
+        SELECTED_UUID=$(raid_list_uuids | head -1)
+        info "Only one RAID set found; auto-selecting: $SELECTED_UUID"
+        return 0
+    fi
+    # Multiple: show a menu.
+    step "Multiple RAID sets found - please pick one"
+    run diskutil appleRAID list
+    echo
+    printf 'Enter RAID set UUID (or Name): '
+    read -r choice
+    if [ -z "$choice" ]; then
+        die "No selection made."
+    fi
+    # Try as UUID first, then as name.
+    for u in $(raid_list_uuids); do
+        if [ "$u" = "$choice" ]; then
+            SELECTED_UUID="$u"
+            return 0
+        fi
+    done
+    u=$(raid_name_to_uuid "$choice")
+    if [ -n "$u" ]; then
+        SELECTED_UUID="$u"
+        return 0
+    fi
+    die "No RAID set matches '$choice'."
+}
+
+# ----------------------------------------------------------------------
+# Subcommand: help
+# ----------------------------------------------------------------------
+cmd_help() {
+    cat <<EOF
+${C_BOLD}${SCRIPT_NAME}${C_RESET} - AppleRAID management helper for macOS
+
+${C_BOLD}USAGE${C_RESET}
+  ${SCRIPT_NAME} <command> [arguments]
+
+${C_BOLD}COMMANDS${C_RESET}
+  ${C_CYAN}list${C_RESET}                        List all AppleRAID sets and their members.
+  ${C_CYAN}disks${C_RESET}                       List all physical disks on the system.
+  ${C_CYAN}info${C_RESET} [name|uuid]            Show detailed info for a RAID set.
+  ${C_CYAN}create${C_RESET} <name> <N1> <N2>     Create a new mirror from two disk NUMBERS
+                              (e.g. '${SCRIPT_NAME} create BackupGold 2 3').
+                              APFS format. Wipes both disks first.
+  ${C_CYAN}wipe${C_RESET} <N>                    Zero the first and last 100 MB of /dev/diskN
+                              to remove stale RAID metadata (SoftRAID, etc).
+  ${C_CYAN}verify-wipe${C_RESET} <N>             Check that first and last 100 MB are zeros.
+  ${C_CYAN}repair${C_RESET} [name|uuid]          Interactive guided repair of a degraded set.
+                              Handles both 'old disk returned' and 'new replacement'.
+  ${C_CYAN}status${C_RESET} [name|uuid]          Short status summary (Online / Degraded / ...).
+  ${C_CYAN}watch${C_RESET} [name|uuid]           Live-refreshing status (refreshes every 10 s).
+  ${C_CYAN}test${C_RESET} [name|uuid]            Run non-destructive tests: mount status,
+                              write/read probe, RAID consistency.
+  ${C_CYAN}destroy${C_RESET} [name|uuid]         Delete a RAID set (data loss - confirms twice).
+  ${C_CYAN}help${C_RESET}, --help, -h            This message.
+
+${C_BOLD}VERBOSE BY DESIGN${C_RESET}
+  Every state-changing command is echoed (with a leading '\$') right
+  before being executed, so you can see exactly what is happening.
+  Read-only queries (diskutil info, etc.) are mostly silent to reduce
+  noise.
+
+${C_BOLD}EXAMPLES${C_RESET}
+  ${SCRIPT_NAME} list
+  ${SCRIPT_NAME} disks
+  ${SCRIPT_NAME} wipe 3
+  ${SCRIPT_NAME} create BackupGold 2 3
+  ${SCRIPT_NAME} repair BackupGold
+  ${SCRIPT_NAME} status
+  ${SCRIPT_NAME} test BackupGold
+
+${C_BOLD}SAFETY NOTES${C_RESET}
+  - This script will run 'sudo' for destructive operations. It will
+    prompt for your password the first time and reuse the cached
+    credential for the rest of the invocation.
+  - Whole-disk operations (wipe, create, repair) require you to type
+    the literal word 'yes' to proceed. 'y' is also accepted.
+  - Always verify device numbers with '${SCRIPT_NAME} disks' before
+    running destructive commands. macOS disk numbers can shift across
+    reboots and re-plugs.
+EOF
+}
+
+# ----------------------------------------------------------------------
+# Subcommand: list
+# ----------------------------------------------------------------------
+cmd_list() {
+    step "Listing AppleRAID sets"
+    explain "Command: diskutil appleRAID list"
+    explain "Shows all AppleRAID sets (mirrors, stripes, concats) and each member's status."
+    echo
+    run diskutil appleRAID list
+}
+
+# ----------------------------------------------------------------------
+# Subcommand: disks
+# ----------------------------------------------------------------------
+cmd_disks() {
+    step "Listing all disks"
+    explain "Command: diskutil list"
+    explain "Shows every block device macOS knows about: physical, virtual (RAID, APFS), and synthesized."
+    echo
+    run diskutil list
+}
+
+# ----------------------------------------------------------------------
+# Subcommand: info
+# ----------------------------------------------------------------------
+cmd_info() {
+    if [ $# -ge 1 ]; then
+        arg="$1"
+        # Try as UUID first, then as name.
+        uuid=""
+        for u in $(raid_list_uuids); do
+            [ "$u" = "$arg" ] && uuid="$u" && break
+        done
+        [ -z "$uuid" ] && uuid=$(raid_name_to_uuid "$arg")
+        [ -z "$uuid" ] && die "No RAID set matches '$arg'."
+        SELECTED_UUID="$uuid"
+    else
+        pick_raid_set
+    fi
+
+    step "RAID set details: $SELECTED_UUID"
+    dev=$(raid_uuid_to_device "$SELECTED_UUID")
+
+    explain "Command: diskutil appleRAID list <uuid>"
+    echo
+    run diskutil appleRAID list "$SELECTED_UUID"
+
+    if [ -n "$dev" ]; then
+        echo
+        step "Virtual device backing the RAID set: /dev/$dev"
+        explain "Command: diskutil info /dev/$dev"
+        echo
+        run diskutil info "/dev/$dev"
+    fi
+}
+
+# ----------------------------------------------------------------------
+# Subcommand: status
+# ----------------------------------------------------------------------
+cmd_status() {
+    if [ $# -ge 1 ]; then
+        arg="$1"
+        uuid=""
+        for u in $(raid_list_uuids); do
+            [ "$u" = "$arg" ] && uuid="$u" && break
+        done
+        [ -z "$uuid" ] && uuid=$(raid_name_to_uuid "$arg")
+        [ -z "$uuid" ] && die "No RAID set matches '$arg'."
+        uuids="$uuid"
+    else
+        uuids=$(raid_list_uuids)
+    fi
+
+    if [ -z "$uuids" ]; then
+        warn "No AppleRAID sets found."
+        return 1
+    fi
+
+    step "AppleRAID status summary"
+    for u in $uuids; do
+        name=$(diskutil appleRAID list | awk -v u="$u" '
+            /^Name:/      { cur = $2 }
+            /^Unique ID:/ { if ($3 == u) { print cur; exit } }
+        ')
+        st=$(raid_status "$u")
+        dev=$(raid_uuid_to_device "$u")
+        case "$st" in
+            Online)    color="$C_GREEN" ;;
+            Degraded)  color="$C_YELLOW" ;;
+            *)         color="$C_RED" ;;
+        esac
+        printf '  %-20s  %s%-12s%s  uuid=%s  dev=/dev/%s\n' \
+            "$name" "$color" "$st" "$C_RESET" "$u" "$dev"
+    done
+}
+
+# ----------------------------------------------------------------------
+# Subcommand: watch
+# ----------------------------------------------------------------------
+cmd_watch() {
+    if [ $# -ge 1 ]; then
+        target="$1"
+    else
+        target=""
+    fi
+    info "Refreshing every 10 seconds. Press Ctrl-C to stop."
+    sleep 1
+    while true; do
+        clear 2>/dev/null || printf '\033[2J\033[H'
+        printf '%s[%s] AppleRAID status%s\n' "${C_BOLD}" "$(date '+%Y-%m-%d %H:%M:%S')" "${C_RESET}"
+        echo
+        if [ -n "$target" ]; then
+            diskutil appleRAID list "$target" 2>&1 || diskutil appleRAID list 2>&1
+        else
+            diskutil appleRAID list 2>&1
+        fi
+        sleep 10
+    done
+}
+
+# ----------------------------------------------------------------------
+# Subcommand: wipe
+# ----------------------------------------------------------------------
+# Zero first and last 100 MB of a whole disk.
+cmd_wipe() {
+    [ $# -ge 1 ] || die "Usage: $SCRIPT_NAME wipe <disk-number>"
+    dev=$(resolve_disk "$1") || die "Invalid disk spec: $1"
+    rdev="/dev/r${dev#/dev/}"
+
+    assert_whole_disk "$dev"
+
+    step "Wipe plan for $dev"
+    describe_disk "$dev"
+    explain "This will:"
+    explain "  1. Unmount $dev and any partitions on it."
+    explain "  2. Zero the first 100 MB (removes GPT + most RAID/filesystem headers)."
+    explain "  3. Zero the last  100 MB (removes backup GPT and tail-stored metadata)."
+    explain "  4. Verify both regions are zero."
+    explain "Total wipe time: ~2-5 seconds (only 200 MB written, not the whole drive)."
+    echo
+
+    confirm "About to WIPE $dev. Continue?" || die "Aborted."
+
+    size_bytes=$(disk_size_bytes "$dev")
+    [ -n "$size_bytes" ] || die "Could not determine size of $dev"
+    size_mb=$(( size_bytes / 1048576 ))
+    seek_mb=$(( size_mb - 100 ))
+
+    info "Disk size: $size_bytes bytes = $size_mb MiB; tail seek = $seek_mb MiB"
+
+    step "Unmounting $dev"
+    run sudo diskutil unmountDisk force "$dev" || warn "unmountDisk returned non-zero (may be already unmounted)"
+
+    step "Zeroing first 100 MB of $dev"
+    run sudo dd if=/dev/zero of="$rdev" bs=1m count=100 status=progress || die "First-100MB wipe failed"
+
+    step "Zeroing last 100 MB of $dev"
+    run sudo dd if=/dev/zero of="$rdev" bs=1m seek=$seek_mb count=100 status=progress || die "Last-100MB wipe failed"
+
+    step "Verifying wipe"
+    verify_wipe "$dev" || die "Verification failed"
+    ok "Wipe complete and verified for $dev"
+}
+
+# Verify first and last 100 MB of a disk are all zero.
+# Returns 0 on success, 1 on failure. Prints result.
+verify_wipe() {
+    dev="$1"
+    rdev="/dev/r${dev#/dev/}"
+    size_bytes=$(disk_size_bytes "$dev")
+    [ -n "$size_bytes" ] || { err "Could not determine size of $dev"; return 1; }
+    size_mb=$(( size_bytes / 1048576 ))
+    skip_mb=$(( size_mb - 100 ))
+
+    explain "Check 1/2: first 100 MB of $dev"
+    show "sudo cmp -n 104857600 $rdev /dev/zero"
+    if sudo cmp -n 104857600 "$rdev" /dev/zero >/dev/null 2>&1; then
+        first="OK"
+    else
+        first="FAIL"
+    fi
+
+    explain "Check 2/2: last 100 MB of $dev (via dd skip=$skip_mb)"
+    show "sudo dd if=$rdev bs=1m skip=$skip_mb count=100 | cmp -n 104857600 - /dev/zero"
+    if sudo dd if="$rdev" bs=1m skip=$skip_mb count=100 2>/dev/null \
+         | cmp -n 104857600 - /dev/zero >/dev/null 2>&1; then
+        last="OK"
+    else
+        last="FAIL"
+    fi
+
+    printf '  first 100 MB: %s\n' "$first"
+    printf '  last  100 MB: %s\n' "$last"
+
+    [ "$first" = "OK" ] && [ "$last" = "OK" ]
+}
+
+cmd_verify_wipe() {
+    [ $# -ge 1 ] || die "Usage: $SCRIPT_NAME verify-wipe <disk-number>"
+    dev=$(resolve_disk "$1") || die "Invalid disk spec: $1"
+    assert_whole_disk "$dev"
+    step "Verifying wipe on $dev"
+    if verify_wipe "$dev"; then
+        ok "$dev is cleanly zeroed at both ends."
+    else
+        err "$dev still has non-zero data in first or last 100 MB."
+        exit 1
+    fi
+}
+
+# ----------------------------------------------------------------------
+# Subcommand: create
+# ----------------------------------------------------------------------
+cmd_create() {
+    [ $# -ge 3 ] || die "Usage: $SCRIPT_NAME create <name> <disk-num-1> <disk-num-2>"
+    name="$1"
+    dev1=$(resolve_disk "$2") || die "Invalid disk spec: $2"
+    dev2=$(resolve_disk "$3") || die "Invalid disk spec: $3"
+
+    [ "$dev1" = "$dev2" ] && die "Cannot mirror a disk to itself."
+
+    assert_whole_disk "$dev1"
+    assert_whole_disk "$dev2"
+
+    step "Create AppleRAID mirror: $name"
+    echo "  Member 1:"
+    describe_disk "$dev1"
+    echo "  Member 2:"
+    describe_disk "$dev2"
+    echo
+
+    # Size sanity
+    s1=$(disk_size_bytes "$dev1")
+    s2=$(disk_size_bytes "$dev2")
+    if [ -n "$s1" ] && [ -n "$s2" ] && [ "$s1" != "$s2" ]; then
+        warn "Disks have different sizes ($s1 vs $s2 bytes). Mirror will use the smaller capacity."
+    fi
+
+    explain "This will:"
+    explain "  1. WIPE both disks (first and last 100 MB) to remove stale metadata."
+    explain "  2. Run 'diskutil appleRAID create mirror $name APFS $dev1 $dev2'."
+    explain "  3. Show the resulting configuration."
+    explain "The new mirror will appear as a virtual /dev/diskN device with an APFS volume named '$name'."
+    echo
+
+    confirm "PROCEED? This erases BOTH disks." || die "Aborted."
+
+    step "Wipe phase: $dev1"
+    # Call wipe but auto-confirm by echoing yes into it -- cleaner to call internals directly.
+    do_auto_wipe "$dev1"
+
+    step "Wipe phase: $dev2"
+    do_auto_wipe "$dev2"
+
+    step "Creating mirror"
+    explain "diskutil will:"
+    explain "  - Partition each disk with GPT"
+    explain "  - Create a ~200MB EFI partition, an Apple_RAID data partition, and an Apple_Boot helper"
+    explain "  - Register the Apple_RAID partitions as mirror members"
+    explain "  - Format the mirror as APFS and mount it at /Volumes/$name"
+    echo
+    run sudo diskutil appleRAID create mirror "$name" APFS "$dev1" "$dev2" \
+        || die "diskutil appleRAID create failed"
+
+    step "New RAID layout"
+    run diskutil appleRAID list
+
+    step "Full disk layout"
+    run diskutil list
+
+    ok "Mirror '$name' created successfully."
+}
+
+# Non-interactive wipe used by 'create'. Assumes outer command has
+# already obtained user confirmation.
+do_auto_wipe() {
+    dev="$1"
+    rdev="/dev/r${dev#/dev/}"
+    size_bytes=$(disk_size_bytes "$dev")
+    size_mb=$(( size_bytes / 1048576 ))
+    seek_mb=$(( size_mb - 100 ))
+
+    run sudo diskutil unmountDisk force "$dev" || true
+    run sudo dd if=/dev/zero of="$rdev" bs=1m count=100 status=progress \
+        || die "First-100MB wipe of $dev failed"
+    run sudo dd if=/dev/zero of="$rdev" bs=1m seek=$seek_mb count=100 status=progress \
+        || die "Last-100MB wipe of $dev failed"
+    verify_wipe "$dev" || die "Wipe verification failed for $dev"
+    ok "$dev wiped and verified."
+}
+
+# ----------------------------------------------------------------------
+# Subcommand: repair (interactive guided)
+# ----------------------------------------------------------------------
+cmd_repair() {
+    if [ $# -ge 1 ]; then
+        arg="$1"
+        uuid=""
+        for u in $(raid_list_uuids); do
+            [ "$u" = "$arg" ] && uuid="$u" && break
+        done
+        [ -z "$uuid" ] && uuid=$(raid_name_to_uuid "$arg")
+        [ -z "$uuid" ] && die "No RAID set matches '$arg'."
+        SELECTED_UUID="$uuid"
+    else
+        pick_raid_set
+    fi
+
+    step "Interactive repair for RAID set $SELECTED_UUID"
+    run diskutil appleRAID list "$SELECTED_UUID"
+    echo
+
+    st=$(raid_status "$SELECTED_UUID")
+    case "$st" in
+        Online)
+            warn "Set status is Online. No repair is needed."
+            confirm "Proceed anyway?" || return 0
+            ;;
+        Degraded)
+            info "Set status is Degraded - repair is appropriate."
+            ;;
+        "")
+            die "Could not determine set status. Aborting."
+            ;;
+        *)
+            warn "Set status: $st (neither Online nor Degraded)."
+            confirm "Proceed anyway?" || return 0
+            ;;
+    esac
+
+    step "Step 1: identify the replacement disk"
+    explain "Two scenarios:"
+    explain ""
+    explain "  A) The SAME drive was temporarily disconnected and has now returned."
+    explain "     -> The drive likely still has the old Apple_RAID partition and metadata."
+    explain "     -> We should WIPE it clean before re-adding, so repairMirror sees a fresh disk."
+    explain ""
+    explain "  B) A brand-new replacement drive of the same (or larger) capacity."
+    explain "     -> We WIPE it (defensive; removes any leftover metadata from prior use)."
+    explain "     -> We add it as the new member."
+    explain ""
+    explain "Either way, the operation is the same: wipe + repairMirror."
+    echo
+    info "Current disks on the system:"
+    run diskutil list | awk '/^\/dev\/disk[0-9]+ \(external/,/^$/'
+    echo
+    printf 'Enter the disk NUMBER of the replacement drive (e.g. 3): '
+    read -r disknum
+    [ -n "$disknum" ] || die "No disk number entered."
+    dev=$(resolve_disk "$disknum") || die "Invalid disk spec: $disknum"
+    assert_whole_disk "$dev"
+
+    step "Replacement disk details"
+    describe_disk "$dev"
+    echo
+
+    # Size check vs RAID member size.
+    raid_member_size=$(diskutil appleRAID list "$SELECTED_UUID" 2>/dev/null \
+        | awk '/^#/{seen=1;next} seen && NF>=5 {print $5; exit}')
+    new_size=$(disk_size_bytes "$dev")
+    if [ -n "$raid_member_size" ] && [ -n "$new_size" ]; then
+        info "Existing member size: $raid_member_size bytes"
+        info "Replacement size:     $new_size bytes"
+        if [ "$new_size" -lt "$raid_member_size" ] 2>/dev/null; then
+            err "Replacement is SMALLER than existing member. Cannot proceed."
+            exit 1
+        fi
+    fi
+
+    confirm "Wipe $dev and add it to RAID set $SELECTED_UUID?" || die "Aborted."
+
+    step "Step 2: wipe replacement disk"
+    do_auto_wipe "$dev"
+
+    step "Step 3: add disk to mirror (repairMirror)"
+    explain "'diskutil appleRAID repairMirror <set-uuid> <device>' will:"
+    explain "  - Partition the new disk to match the existing member layout"
+    explain "  - Add the Apple_RAID partition as a new mirror member"
+    explain "  - Begin rebuilding data onto it"
+    explain "The mirror stays mounted and usable during the rebuild (online rebuild)."
+    echo
+    run sudo diskutil appleRAID repairMirror "$SELECTED_UUID" "$dev" \
+        || die "repairMirror failed"
+
+    step "Step 4: post-repair status"
+    run diskutil appleRAID list "$SELECTED_UUID"
+    echo
+    ok "Repair started. Monitor with:  $SCRIPT_NAME watch $SELECTED_UUID"
+    info "Rebuild time depends on how much data is on the mirror."
+    info "  - Empty mirror: seconds."
+    info "  - Full 26 TB mirror at ~250 MB/s: ~24-30 hours."
+}
+
+# ----------------------------------------------------------------------
+# Subcommand: test
+# ----------------------------------------------------------------------
+cmd_test() {
+    if [ $# -ge 1 ]; then
+        arg="$1"
+        uuid=""
+        for u in $(raid_list_uuids); do
+            [ "$u" = "$arg" ] && uuid="$u" && break
+        done
+        [ -z "$uuid" ] && uuid=$(raid_name_to_uuid "$arg")
+        [ -z "$uuid" ] && die "No RAID set matches '$arg'."
+        SELECTED_UUID="$uuid"
+    else
+        pick_raid_set
+    fi
+
+    step "Testing RAID set $SELECTED_UUID"
+    dev=$(raid_uuid_to_device "$SELECTED_UUID")
+    [ -n "$dev" ] || die "Could not find virtual device for this RAID set."
+
+    explain "Tests to run:"
+    explain "  T1: RAID status must be 'Online'"
+    explain "  T2: all members must be 'Online'"
+    explain "  T3: virtual device /dev/$dev must exist"
+    explain "  T4: APFS container on the RAID must be mounted"
+    explain "  T5: write a small probe file and read it back (non-destructive)"
+    echo
+
+    fails=0
+
+    # T1
+    step "T1: overall RAID status"
+    st=$(raid_status "$SELECTED_UUID")
+    if [ "$st" = "Online" ]; then
+        ok "Status: $st"
+    else
+        err "Status: $st (expected Online)"
+        fails=$((fails + 1))
+    fi
+
+    # T2
+    step "T2: member statuses"
+    bad_members=$(diskutil appleRAID list "$SELECTED_UUID" 2>/dev/null \
+        | awk '/^#/{seen=1;next} seen && NF>=4 && $4 != "Online" {print $2" ("$4")"}')
+    if [ -z "$bad_members" ]; then
+        ok "All members are Online."
+    else
+        err "Non-Online members found:"
+        echo "$bad_members" | sed 's/^/    /'
+        fails=$((fails + 1))
+    fi
+
+    # T3
+    step "T3: virtual device /dev/$dev exists"
+    if [ -b "/dev/$dev" ] || diskutil info "/dev/$dev" >/dev/null 2>&1; then
+        ok "/dev/$dev is present."
+    else
+        err "/dev/$dev not found."
+        fails=$((fails + 1))
+    fi
+
+    # T4
+    step "T4: find and check mount point"
+    # The virtual disk itself isn't directly mounted (it holds an APFS container);
+    # the APFS volume inside it is. Walk diskutil list to find the synthesized
+    # APFS container whose Physical Store is our RAID virtual device, then find
+    # the APFS Volume(s) inside that container.
+    #
+    # diskutil list layout (relevant portion):
+    #   /dev/disk14 (synthesized):
+    #      #:                  TYPE NAME              SIZE     IDENTIFIER
+    #      0:  APFS Container Scheme -               +26.0 TB  disk14
+    #                          Physical Store disk4
+    #      1:      APFS Volume BackupGold             872 KB   disk14s1
+    #
+    # The identifier is always the LAST field on the line.
+    apfs_vol=$(diskutil list | awk -v phys="$dev" '
+        /^\/dev\/disk[0-9]+ \(synthesized\)/ { in_synth=1; found=0; next }
+        /^\/dev\//                           { in_synth=0; found=0; next }
+        in_synth && /Physical Store/ {
+            for (i=1; i<=NF; i++) if ($i == phys) { found=1 }
+            next
+        }
+        in_synth && found && /APFS Volume/ { print $NF; exit }
+    ')
+    mp=""
+    if [ -n "$apfs_vol" ]; then
+        mp=$(diskutil info "/dev/$apfs_vol" 2>/dev/null \
+             | awk -F': *' '/Mount Point:/ {print $2; exit}')
+    fi
+    if [ -n "$mp" ] && [ -d "$mp" ]; then
+        ok "APFS volume /dev/$apfs_vol is mounted at: $mp"
+    else
+        warn "No mounted APFS volume found on RAID set; skipping T5."
+        [ -n "$apfs_vol" ] && warn "  (Found APFS volume /dev/$apfs_vol but no mount point.)"
+        mp=""
+    fi
+
+    # T5
+    if [ -n "$mp" ]; then
+        step "T5: write/read probe"
+        probe="$mp/.appleRAID-test-$$-$(date +%s)"
+        payload="appleRAID self-test $(date) $$"
+        explain "Writing probe file: $probe"
+        if printf '%s\n' "$payload" > "$probe" 2>/dev/null; then
+            readback=$(cat "$probe" 2>/dev/null)
+            if [ "$readback" = "$payload" ]; then
+                ok "Write-then-read succeeded and content matches."
+            else
+                err "Readback mismatch!"
+                fails=$((fails + 1))
+            fi
+            rm -f "$probe"
+        else
+            err "Could not write probe file to $probe (permissions? disk full?)"
+            fails=$((fails + 1))
+        fi
+    fi
+
+    echo
+    if [ $fails -eq 0 ]; then
+        ok "All tests passed."
+    else
+        err "$fails test(s) failed."
+        exit 1
+    fi
+}
+
+# ----------------------------------------------------------------------
+# Subcommand: destroy
+# ----------------------------------------------------------------------
+cmd_destroy() {
+    if [ $# -ge 1 ]; then
+        arg="$1"
+        uuid=""
+        for u in $(raid_list_uuids); do
+            [ "$u" = "$arg" ] && uuid="$u" && break
+        done
+        [ -z "$uuid" ] && uuid=$(raid_name_to_uuid "$arg")
+        [ -z "$uuid" ] && die "No RAID set matches '$arg'."
+        SELECTED_UUID="$uuid"
+    else
+        pick_raid_set
+    fi
+
+    step "DESTROY RAID set $SELECTED_UUID"
+    run diskutil appleRAID list "$SELECTED_UUID"
+    echo
+    warn "This will delete the RAID set and make the data inaccessible."
+    warn "The member disks will become plain disks again (you can reformat/reuse them)."
+    echo
+
+    confirm "First confirmation: destroy this RAID set?" || die "Aborted."
+    confirm "SECOND confirmation: are you ABSOLUTELY sure?" || die "Aborted."
+
+    step "Deleting RAID set"
+    run sudo diskutil appleRAID delete "$SELECTED_UUID" \
+        || die "RAID deletion failed"
+
+    step "Post-destroy state"
+    run diskutil appleRAID list || true
+    run diskutil list
+
+    ok "RAID set $SELECTED_UUID destroyed."
+}
+
+# ----------------------------------------------------------------------
+# Main dispatch
+# ----------------------------------------------------------------------
+main() {
+    preflight
+
+    if [ $# -lt 1 ]; then
+        cmd_help
+        exit 0
+    fi
+
+    cmd="$1"
+    shift
+
+    case "$cmd" in
+        help|--help|-h|-\?) cmd_help ;;
+        list)               cmd_list "$@" ;;
+        disks)              cmd_disks "$@" ;;
+        info)               cmd_info "$@" ;;
+        status)             cmd_status "$@" ;;
+        watch)              cmd_watch "$@" ;;
+        wipe)               cmd_wipe "$@" ;;
+        verify-wipe)        cmd_verify_wipe "$@" ;;
+        create)             cmd_create "$@" ;;
+        repair)             cmd_repair "$@" ;;
+        test)               cmd_test "$@" ;;
+        destroy)            cmd_destroy "$@" ;;
+        *)
+            err "Unknown command: $cmd"
+            echo
+            cmd_help
+            exit 2
+            ;;
+    esac
+}
+
+main "$@"
