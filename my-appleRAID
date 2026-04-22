@@ -293,6 +293,32 @@ raid_device_to_uuid() {
     '
 }
 
+# Given a RAID virtual device (e.g. "disk10"), emit one line per mounted
+# volume backed by that RAID: <diskNsN>|<volume-name>|<mount-point>
+# Matches both direct HFS+/exFAT on RAID (Part of Whole == raid_dev) and
+# APFS-on-RAID (APFS Physical Store == raid_dev).
+list_volumes_on_raid() {
+    raid_dev="$1"
+    [ -n "$raid_dev" ] || return 0
+    mount | awk '{print $1}' | while IFS= read -r vol; do
+        case "$vol" in
+            /dev/disk*) ;;
+            *) continue ;;
+        esac
+        vol_short="${vol#/dev/}"
+        dinfo=$(diskutil info "$vol" 2>/dev/null) || continue
+        ps=$(printf '%s\n' "$dinfo" | awk -F': *' '/^ *APFS Physical Store/ {print $2; exit}' | awk '{print $1}')
+        pow=$(printf '%s\n' "$dinfo" | awk -F': *' '/^ *Part of Whole:/ {print $2; exit}')
+        match=no
+        [ "$ps" = "$raid_dev" ] && match=yes
+        [ "$pow" = "$raid_dev" ] && match=yes
+        [ "$match" = "yes" ] || continue
+        vname=$(printf '%s\n' "$dinfo" | awk -F': *' '/^ *Volume Name:/ {print $2; exit}')
+        mp=$(printf '%s\n' "$dinfo" | awk -F': *' '/^ *Mount Point:/ {print $2; exit}')
+        printf '%s|%s|%s\n' "$vol_short" "$vname" "$mp"
+    done
+}
+
 # Get status of a RAID set by UUID.
 raid_status() {
     uuid="$1"
@@ -4380,23 +4406,43 @@ cmd_rename() {
         case "$a" in
             -h|--help)
                 cat <<EOF
-Usage: $SCRIPT_NAME rename [name|uuid] <new-name>
+Usage: $SCRIPT_NAME rename [name|uuid] <new-name> [--raid-only]
        $SCRIPT_NAME rename <new-name>              # picks the set interactively
 
 Renames a RAID set's "Name:" field (as shown in 'diskutil appleRAID list').
 Non-destructive; no sudo required.
 
-Does NOT rename the file system volume inside the set. If you want
-those to match, rename the volume separately:
-   diskutil rename /Volumes/<old-volume> <new-volume>
+By default also renames mounted volume(s) backed by this RAID:
+   - if volume name == old RAID name (in sync) -> renamed automatically
+   - if volume name == new RAID name           -> already done; skipped
+   - if volume name diverges from both         -> asks interactively
+                                                  (yes/no per volume)
+
+Options:
+   --raid-only     Rename only the RAID set; never touch volume names.
+
+Rationale: 'diskutil appleRAID create mirror <name> APFS ...' sets BOTH
+the RAID set name and the created volume name to <name>, so the symmetric
+operation for rename is to update both when they still agree.
 EOF
                 return 0
                 ;;
         esac
     done
 
+    # Parse --raid-only flag out of positional args (preserve spaces in others).
+    raid_only=no
+    new_args=""
+    for a in "$@"; do
+        case "$a" in
+            --raid-only) raid_only=yes ;;
+            *) new_args="$new_args${new_args:+ }$(printf '%s' "$a" | sed "s/'/'\\\\''/g; s/^/'/; s/$/'/")" ;;
+        esac
+    done
+    eval "set -- $new_args"
+
     if [ $# -lt 1 ]; then
-        die "Usage: $SCRIPT_NAME rename [name|uuid] <new-name>"
+        die "Usage: $SCRIPT_NAME rename [name|uuid] <new-name> [--raid-only]"
     fi
 
     if [ $# -ge 2 ]; then
@@ -4441,16 +4487,76 @@ EOF
     fi
 
     step "RENAME RAID set $SELECTED_UUID: '$old_name' -> '$new_name'"
-    info "Note: this renames only the RAID set's Name field (diskutil appleRAID list),"
-    info "      not the file system volume inside the set."
+    if [ "$raid_only" = "yes" ]; then
+        info "Mode: --raid-only (volume names will not be touched)."
+    else
+        info "Mode: dual rename (RAID set + matching mounted volume(s))."
+    fi
 
     run diskutil appleRAID update SetName "$new_name" "$SELECTED_UUID" \
         || die "RAID rename failed"
 
+    ok "RAID set $SELECTED_UUID renamed: '$old_name' -> '$new_name'."
+
+    # ------------------------------------------------------------------
+    # Volume rename pass.
+    # The RAID's Name field and the file-system volume name(s) are
+    # independent: 'diskutil appleRAID create mirror <n> APFS ...' sets
+    # both, but later 'diskutil rename' may touch only one. So:
+    #   - volume name == old_name  -> they were in sync; rename automatically
+    #   - volume name == new_name  -> already in sync with the new name; skip
+    #   - anything else (diverged) -> ask interactively
+    # ------------------------------------------------------------------
+    if [ "$raid_only" != "yes" ]; then
+        raid_dev=$(raid_uuid_to_device "$SELECTED_UUID")
+        if [ -z "$raid_dev" ]; then
+            warn "Could not resolve device node for RAID $SELECTED_UUID; skipping volume scan."
+        else
+            step "Scanning volumes backed by /dev/$raid_dev"
+            vols=$(list_volumes_on_raid "$raid_dev")
+            if [ -z "$vols" ]; then
+                info "No mounted volumes found on /dev/$raid_dev — nothing to rename."
+            else
+                printf '%s\n' "$vols" | while IFS='|' read -r vdev vname vmp; do
+                    [ -n "$vdev" ] || continue
+                    info "Volume: /dev/$vdev  name='$vname'  mount='$vmp'"
+                    if [ "$vname" = "$new_name" ]; then
+                        info "  -> already named '$new_name'; nothing to do."
+                        continue
+                    fi
+                    if [ "$vname" = "$old_name" ]; then
+                        info "  -> in sync with old RAID name; renaming volume to '$new_name'."
+                        run diskutil rename "/dev/$vdev" "$new_name" \
+                            || warn "  Volume rename failed for /dev/$vdev (continuing)."
+                        continue
+                    fi
+                    warn "  -> name diverges from RAID (volume='$vname', old RAID='$old_name')."
+                    # while-loop is fed by a pipe, so use /dev/tty for the
+                    # interactive prompt (otherwise confirm's read would
+                    # consume the next volume line from the pipe).
+                    # If no tty is available (e.g. ssh without -t), default
+                    # to safe-skip and tell the user how to control behavior.
+                    # Note: '[ -r /dev/tty ]' lies under ssh-without-tty
+                    # (file exists but open() fails), so actually attempt
+                    # the open in a subshell.
+                    if ! ( : < /dev/tty ) 2>/dev/null; then
+                        info "  -> non-interactive (no /dev/tty); leaving volume unchanged."
+                        info "     Use 'ssh -t' to enable the prompt, --raid-only to suppress it,"
+                        info "     or rename manually: diskutil rename /dev/$vdev <new-name>"
+                    elif confirm "  Rename this volume to '$new_name' as well?" < /dev/tty; then
+                        run diskutil rename "/dev/$vdev" "$new_name" \
+                            || warn "  Volume rename failed for /dev/$vdev (continuing)."
+                    else
+                        info "  -> leaving volume name '$vname' unchanged."
+                        info "     (Manual: diskutil rename /dev/$vdev <new-name>)"
+                    fi
+                done
+            fi
+        fi
+    fi
+
     step "Post-rename state"
     run diskutil appleRAID list "$SELECTED_UUID"
-
-    ok "RAID set $SELECTED_UUID renamed: '$old_name' -> '$new_name'."
 
     # Keep baseline in sync if REQUIRED_SETS=all / auto-baseline is on.
     # Without this, the health daemon would alert for a missing set
