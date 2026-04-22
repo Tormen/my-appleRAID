@@ -3165,6 +3165,10 @@ ${C_BOLD}COMMANDS${C_RESET}
   ${C_CYAN}test${C_RESET} [name|uuid]            Run non-destructive tests: mount status,
                               write/read probe, RAID consistency.
   ${C_CYAN}destroy${C_RESET} [name|uuid]         Delete a RAID set (data loss - confirms twice).
+  ${C_CYAN}rename${C_RESET} [name|uuid] <new>     Rename a RAID set's Name field (non-destructive,
+                              no sudo required). Updates only the RAID set
+                              name shown in 'diskutil appleRAID list' - not
+                              the file system volume inside.
 
   ${C_BOLD}-- SoftRAID migration --${C_RESET}
   ${C_CYAN}migrate-softraid${C_RESET}            Interactive per-mirror guide: detect SoftRAID
@@ -3252,6 +3256,7 @@ ${C_BOLD}EXAMPLES${C_RESET}
   ${SCRIPT_NAME} repair BackupGold
   ${SCRIPT_NAME} status
   ${SCRIPT_NAME} test BackupGold
+  ${SCRIPT_NAME} rename BackupGold BackupPlatinum
 
   ${C_BOLD}-- Health monitoring setup --${C_RESET}
   # 1. Create and edit a config file
@@ -4027,6 +4032,119 @@ cmd_test() {
 }
 
 # ----------------------------------------------------------------------
+# Subcommand: rename
+# ----------------------------------------------------------------------
+# Renames a RAID set's "Name:" field (as shown in `diskutil appleRAID list`).
+#
+# Uses the undocumented `diskutil appleRAID update SetName <new> <uuid>` key.
+# The documented update keys are only AutoRebuild and SetTimeout, but SetName
+# is accepted by macOS (verified on Darwin 25.x). No sudo required; ownership
+# of the RAID set is sufficient.
+#
+# Does NOT rename the file system volume inside the RAID (e.g. the APFS
+# volume at /Volumes/<name>). Those are independent names; rename the
+# mounted volume separately with `diskutil rename <mountpoint> <new>`
+# if you want them to match.
+cmd_rename() {
+    # Strip global flags that may appear after the subcommand.
+    eval "$(parse_global_flags "$@")"
+
+    # Handle per-command help explicitly, BEFORE positional parsing -
+    # otherwise `rename --help` would be interpreted as a new name
+    # and rename the auto-selected set to the literal string "--help".
+    for a in "$@"; do
+        case "$a" in
+            -h|--help)
+                cat <<EOF
+Usage: $SCRIPT_NAME rename [name|uuid] <new-name>
+       $SCRIPT_NAME rename <new-name>              # picks the set interactively
+
+Renames a RAID set's "Name:" field (as shown in 'diskutil appleRAID list').
+Non-destructive; no sudo required.
+
+Does NOT rename the file system volume inside the set. If you want
+those to match, rename the volume separately:
+   diskutil rename /Volumes/<old-volume> <new-volume>
+EOF
+                return 0
+                ;;
+        esac
+    done
+
+    if [ $# -lt 1 ]; then
+        die "Usage: $SCRIPT_NAME rename [name|uuid] <new-name>"
+    fi
+
+    if [ $# -ge 2 ]; then
+        arg="$1"
+        new_name="$2"
+        uuid=""
+        for u in $(raid_list_uuids); do
+            [ "$u" = "$arg" ] && uuid="$u" && break
+        done
+        [ -z "$uuid" ] && uuid=$(raid_name_to_uuid "$arg")
+        [ -z "$uuid" ] && die "No RAID set matches '$arg'."
+        SELECTED_UUID="$uuid"
+    else
+        new_name="$1"
+        pick_raid_set
+    fi
+
+    # Validate new name: non-empty, not a flag, no leading/trailing space.
+    if [ -z "$new_name" ]; then
+        die "New name must not be empty."
+    fi
+    case "$new_name" in
+        -*) die "New name must not start with '-' (looks like a flag): '$new_name'. Use -- to separate if intentional, or quote the name." ;;
+        ' '*|*' ') die "New name must not start or end with whitespace: '$new_name'" ;;
+    esac
+
+    # Get current name for the log.
+    old_name=$(diskutil appleRAID list 2>/dev/null | awk -F': +' -v u="$SELECTED_UUID" '
+        /^Name:/      { cur = $2; sub(/ +$/, "", cur) }
+        /^Unique ID:/ { uuid = $2; sub(/ +$/, "", uuid); if (uuid == u) { print cur; exit } }
+    ')
+
+    if [ "$old_name" = "$new_name" ]; then
+        info "RAID set $SELECTED_UUID is already named '$new_name'; nothing to do."
+        return 0
+    fi
+
+    # Reject collision with an existing set.
+    collision=$(raid_name_to_uuid "$new_name")
+    if [ -n "$collision" ] && [ "$collision" != "$SELECTED_UUID" ]; then
+        die "Another RAID set is already named '$new_name' (uuid=$collision)."
+    fi
+
+    step "RENAME RAID set $SELECTED_UUID: '$old_name' -> '$new_name'"
+    info "Note: this renames only the RAID set's Name field (diskutil appleRAID list),"
+    info "      not the file system volume inside the set."
+
+    run diskutil appleRAID update SetName "$new_name" "$SELECTED_UUID" \
+        || die "RAID rename failed"
+
+    step "Post-rename state"
+    run diskutil appleRAID list "$SELECTED_UUID"
+
+    ok "RAID set $SELECTED_UUID renamed: '$old_name' -> '$new_name'."
+
+    # Keep baseline in sync if REQUIRED_SETS=all / auto-baseline is on.
+    # Without this, the health daemon would alert for a missing set
+    # (the old name disappeared) and an unexpected set (the new name appeared).
+    cfg_load 2>/dev/null || true
+    if [ "${AUTO_BASELINE_FOR_SETS_ON_CREATE:-no}" = "yes" ] \
+       || [ "${AUTO_BASELINE_FOR_SETS_ON_DESTROY:-no}" = "yes" ]; then
+        state_init 2>/dev/null || true
+        baseline_write_sets
+        info "auto-baseline: $(baseline_sets_file) updated (name changed)"
+    else
+        info "tip: if you're using the health daemon with REQUIRED_SETS=all, run:"
+        info "       $SCRIPT_NAME baseline --sets"
+        info "     so the daemon picks up the new name."
+    fi
+}
+
+# ----------------------------------------------------------------------
 # Subcommand: destroy
 # ----------------------------------------------------------------------
 cmd_destroy() {
@@ -4116,6 +4234,7 @@ main() {
         repair)             cmd_repair "$@" ;;
         test)               cmd_test "$@" ;;
         destroy)            cmd_destroy "$@" ;;
+        rename)             cmd_rename "$@" ;;
         health)             cmd_health "$@" ;;
         show-config)        cmd_show_config "$@" ;;
         create-config)      cmd_create_config "$@" ;;
