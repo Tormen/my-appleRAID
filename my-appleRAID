@@ -2528,6 +2528,158 @@ list_softraid_disks() {
     done | awk '!seen[$0]++'
 }
 
+# Enumerate SoftRAID VIRTUAL mirror devices - the whole-disks that the
+# SoftRAID driver synthesizes from its physical members and that carry
+# the user-visible volume name shown in SoftRAID.app (e.g. "2.OLD",
+# "backup"). Identified by "SoftRAID_Media" in the Device/Media Name
+# field of `diskutil info`. Note: `diskutil list` reports them as
+# `(external, physical)`, not as virtual/synthesized - the SoftRAID
+# kext makes them appear as regular whole-disks.
+#
+# Output: pipe-separated lines, one per mirror:
+#   <diskN>|<volume-name>|<size-string>|<fs>|<mount-point-or-dash>|<size-bytes>
+list_softraid_virtual_mirrors() {
+    diskutil list 2>/dev/null \
+        | awk '/^\/dev\/disk[0-9]+ / { sub(/^\/dev\//, "", $1); print $1 }' \
+        | while read -r d; do
+            [ -n "$d" ] || continue
+            info=$(diskutil info "/dev/$d" 2>/dev/null) || continue
+            case "$info" in
+                *"SoftRAID_Media"*) ;;
+                *) continue ;;
+            esac
+            whole=$(printf '%s\n' "$info" | awk -F': *' '/^ *Whole:/ {print $2; exit}')
+            [ "$whole" = "Yes" ] || continue
+            vol=$(printf '%s\n' "$info"  | awk -F': *' '/^ *Volume Name:/ {print $2; exit}')
+            # Disk Size line: "  Disk Size:   16.0 TB (16000756740096 Bytes) ..."
+            size_str=$(printf '%s\n' "$info" | awk -F': *' '/^ *Disk Size:/ {print $2; exit}' | awk -F'(' '{print $1}' | sed 's/ *$//')
+            size_bytes=$(printf '%s\n' "$info" | awk -F'[()]' '/^ *Disk Size:/ {print $2; exit}' | awk '{print $1}')
+            fs=$(printf '%s\n' "$info" | awk -F': *' '/^ *File System Personality:/ {print $2; exit}')
+            [ -z "$fs" ] && fs=$(printf '%s\n' "$info" | awk -F': *' '/^ *Name \(User Visible\):/ {print $2; exit}')
+            mp=$(printf '%s\n' "$info" | awk -F': *' '/^ *Mount Point:/ {print $2; exit}')
+
+            # Some SoftRAID mirrors expose a GPT with a single data
+            # partition (e.g. Apple_HFS on diskNs1) rather than a raw
+            # filesystem directly on the whole disk. In that case the
+            # whole-disk `Volume Name` reads "Not applicable..." - fall
+            # through to the first data partition for the real name.
+            case "$vol" in
+                ""|"Not applicable"*)
+                    part=$(diskutil list "/dev/$d" 2>/dev/null \
+                        | awk '/^ *[1-9][0-9]*:/ {print $NF; exit}')
+                    if [ -n "$part" ]; then
+                        pinfo=$(diskutil info "/dev/$part" 2>/dev/null)
+                        pvol=$(printf '%s\n' "$pinfo" | awk -F': *' '/^ *Volume Name:/ {print $2; exit}')
+                        pfs=$(printf '%s\n'  "$pinfo" | awk -F': *' '/^ *File System Personality:/ {print $2; exit}')
+                        pmp=$(printf '%s\n'  "$pinfo" | awk -F': *' '/^ *Mount Point:/ {print $2; exit}')
+                        case "$pvol" in
+                            ""|"Not applicable"*) ;;
+                            *) vol="$pvol" ;;
+                        esac
+                        [ -n "$pfs" ] && fs="$pfs"
+                        case "$pmp" in
+                            ""|"Not applicable"*) ;;
+                            *) mp="$pmp" ;;
+                        esac
+                    fi
+                    ;;
+            esac
+
+            case "$mp"  in ""|"Not applicable"*) mp="-" ;; esac
+            case "$vol" in ""|"Not applicable"*) vol="(unnamed)" ;; esac
+            printf '%s|%s|%s|%s|%s|%s\n' "$d" "$vol" "${size_str:-?}" "${fs:-?}" "$mp" "${size_bytes:-0}"
+        done
+}
+
+# Enumerate PHYSICAL SoftRAID member disks - the actual drives that back
+# the virtual mirrors above. Detected by either:
+#   (a) `diskutil info` mentioning "SoftRAID" (true when SoftRAID
+#       metadata / secrets have NOT been removed), OR
+#   (b) the presence of the distinctive SoftRAID data partition UUID
+#       FA709C7E-65B1-4593-BFD5-E71D61DE9B02 in the disk's GPT (this
+#       partition survives "Delete Secrets" and is the fingerprint
+#       that remains on disks that were once SoftRAID members).
+# Excludes virtual SoftRAID_Media mirror devices (which are also marked
+# "physical" in `diskutil list`).
+#
+# The constant SOFTRAID_DATA_PARTITION_UUID below is the public GPT
+# type UUID that SoftRAID assigns to member data partitions. It is
+# stable across SoftRAID versions.
+SOFTRAID_DATA_PARTITION_UUID="FA709C7E-65B1-4593-BFD5-E71D61DE9B02"
+
+list_softraid_physical_members() {
+    list_all_physical_disks | while read -r d; do
+        [ -n "$d" ] || continue
+        info=$(diskutil info "/dev/$d" 2>/dev/null) || continue
+        # Skip virtual SoftRAID mirror devices.
+        case "$info" in *"SoftRAID_Media"*) continue ;; esac
+
+        # (a) SoftRAID header/metadata still present on whole disk.
+        if printf '%s\n' "$info" | grep -qiE 'SoftRAID'; then
+            echo "$d"; continue
+        fi
+        # (a') ... or on one of its partitions.
+        found=""
+        parts=$(diskutil list "/dev/$d" 2>/dev/null | awk '/^ *[0-9]+:/ {print $NF}')
+        for part in $parts; do
+            [ -n "$part" ] || continue
+            if diskutil info "/dev/$part" 2>/dev/null | grep -qiE 'SoftRAID'; then
+                found=1; break
+            fi
+        done
+        if [ -n "$found" ]; then echo "$d"; continue; fi
+
+        # (b) SoftRAID data partition UUID in the GPT layout.
+        if diskutil list "/dev/$d" 2>/dev/null | grep -q "$SOFTRAID_DATA_PARTITION_UUID"; then
+            echo "$d"; continue
+        fi
+    done | awk '!seen[$0]++'
+}
+
+# Given a physical SoftRAID member disk (diskN), return the volume name
+# of the virtual mirror it most likely belongs to, by size-matching its
+# data partition against the known virtual mirror sizes.
+#
+# Args:  $1=diskN  $2=output of list_softraid_virtual_mirrors
+# Output: volume name, or "?" if no match, or "? (ambiguous: A, B)" if
+#         multiple mirrors share the same size.
+softraid_member_guess_volume() {
+    d="$1"
+    mirrors="$2"
+    # Data-partition size in bytes (the FA709C7E partition).
+    data_bytes=$(diskutil list -plist "/dev/$d" 2>/dev/null \
+        | awk -v uuid="$SOFTRAID_DATA_PARTITION_UUID" '
+            /<key>Content<\/key>/ {getline; if (index($0, uuid)) incontent=1}
+            incontent && /<key>Size<\/key>/ {getline;
+                gsub(/.*<integer>/, ""); gsub(/<\/integer>.*/, "");
+                print; exit}
+          ')
+    if [ -z "$data_bytes" ] || [ "$data_bytes" = "0" ]; then
+        # Fallback: whole-disk size (for disks without a visible data
+        # partition, e.g. SoftRAID header intact, or GPT not exposing
+        # the sizes via plist).
+        data_bytes=$(disk_size_bytes "/dev/$d")
+    fi
+    [ -z "$data_bytes" ] && { echo "?"; return; }
+
+    # Find mirrors whose size is within 1 GB of data_bytes (the data
+    # partition is always slightly larger than the mirror due to
+    # SoftRAID's reserved header).
+    matches=$(printf '%s\n' "$mirrors" | awk -F'|' -v bytes="$data_bytes" '
+        {
+            # $6 = mirror size in bytes
+            diff = bytes - $6
+            if (diff < 0) diff = -diff
+            if (diff < 1073741824) print $2   # 1 GiB tolerance
+        }
+    ')
+    case "$(echo "$matches" | awk 'NF' | wc -l | tr -d ' ')" in
+        0) echo "?" ;;
+        1) echo "$matches" | awk 'NF {print; exit}' ;;
+        *) printf '? (ambiguous: %s)' "$(echo "$matches" | awk 'NF' | paste -sd ',' - | sed 's/,/, /g')" ;;
+    esac
+}
+
 # True if SoftRAID app or background daemon is currently running.
 softraid_is_running() {
     pgrep -i -f "SoftRAID\\|softraidd" >/dev/null 2>&1
@@ -2633,21 +2785,50 @@ cmd_migrate_softraid() {
     explain "SoftRAID mirrors keep working throughout - you migrate one at a time."
     echo
 
-    step "Step 1: Detect SoftRAID disks"
-    sr_disks=$(list_softraid_disks)
-    if [ -z "$sr_disks" ]; then
-        warn "No SoftRAID member disks detected. Nothing to migrate."
-        info "If you believe SoftRAID disks are present, verify manually with:"
-        info "  diskutil info /dev/diskN | grep -i softraid"
+    step "Step 1: Detect SoftRAID volumes and member disks"
+
+    # (a) Virtual mirrors: the volumes a user sees in SoftRAID.app
+    #     (e.g. "2.OLD", "backup"). Each is a whole virtual disk
+    #     synthesized by the SoftRAID driver from two member disks.
+    sr_mirrors=$(list_softraid_virtual_mirrors)
+    if [ -n "$sr_mirrors" ]; then
+        info "SoftRAID volumes exposed by the SoftRAID driver:"
+        printf '%s\n' "$sr_mirrors" | while IFS='|' read -r vd vname vsize vfs vmp _vbytes; do
+            printf '  /dev/%-7s  volume="%s"  size=%s  fs=%s  mount=%s\n' \
+                "$vd" "$vname" "$vsize" "$vfs" "$vmp"
+        done
+        echo
+    fi
+
+    # (b) Physical member disks: the actual drives backing the mirrors.
+    sr_disks=$(list_softraid_physical_members)
+    if [ -z "$sr_disks" ] && [ -z "$sr_mirrors" ]; then
+        warn "No SoftRAID volumes or member disks detected. Nothing to migrate."
+        info "If you believe SoftRAID is present, verify manually with:"
+        info "  diskutil info -all | grep -i softraid"
+        info "  /Applications/SoftRAID.app/Contents/MacOS/SoftRAIDTool volume all info"
         return 0
     fi
-    info "Disks that appear to be SoftRAID members:"
-    echo "$sr_disks" | while read -r d; do
-        [ -n "$d" ] || continue
-        describe_disk "/dev/$d"
-    done
-    echo
+    if [ -z "$sr_disks" ]; then
+        warn "Virtual mirrors found but no physical members detected."
+        warn "This usually means SoftRAID metadata has been fully removed while"
+        warn "the mirrors are still mounted. Unmount them in SoftRAID.app first."
+        echo
+    else
+        info "Physical disks that appear to be SoftRAID members:"
+        echo "$sr_disks" | while read -r d; do
+            [ -n "$d" ] || continue
+            size=$(diskutil info "/dev/$d" 2>/dev/null | awk -F': *' '/Disk Size:/ {print $2; exit}' | awk -F'(' '{print $1}' | sed 's/ *$//')
+            model=$(diskutil info "/dev/$d" 2>/dev/null | awk -F': *' '/Device \/ Media Name:/ {print $2; exit}')
+            vol=$(softraid_member_guess_volume "$d" "$sr_mirrors")
+            printf '  /dev/%-7s  size=%-10s  belongs_to=%-24s  model=%s\n' \
+                "$d" "${size:-?}" "\"$vol\"" "${model:-?}"
+        done
+        echo
+    fi
     warn "Detection is heuristic - verify with SoftRAID.app if in doubt."
+    warn "belongs_to= is a size-match guess; ambiguous when multiple mirrors"
+    warn "share the same size. Confirm in SoftRAID.app."
     echo
 
     step "Step 2: Pre-flight checklist"
