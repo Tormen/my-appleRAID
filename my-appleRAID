@@ -3587,8 +3587,36 @@ cmd_list() {
     step "Listing AppleRAID sets"
     explain "Command: diskutil appleRAID list"
     explain "Shows all AppleRAID sets (mirrors, stripes, concats) and each member's status."
+    explain "An extra 'File System:' line is injected per set, derived from"
+    explain "diskutil info on the set's virtual device node."
     echo
-    run diskutil appleRAID list
+    printf '%s$ diskutil appleRAID list%s\n' "${C_BOLD}" "${C_RESET}"
+    diskutil appleRAID list 2>&1 | while IFS= read -r line; do
+        printf '%s\n' "$line"
+        case "$line" in
+            "Device Node:"*)
+                dev=$(printf '%s\n' "$line" | awk '{print $NF}')
+                [ -n "$dev" ] || continue
+                dinfo=$(diskutil info "/dev/$dev" 2>/dev/null) || continue
+                fs=$(printf '%s\n' "$dinfo" | awk -F': *' '/^ *File System Personality:/ {print $2; exit}')
+                # APFS-as-RAID has no FS Personality but Type (Bundle)=apfs.
+                if [ -z "$fs" ]; then
+                    bundle=$(printf '%s\n' "$dinfo" | awk -F': *' '/^ *Type \(Bundle\):/ {print $2; exit}')
+                    case "$bundle" in
+                        apfs) fs="APFS Container" ;;
+                        "")   ;;
+                        *)    fs="$bundle" ;;
+                    esac
+                fi
+                # Fall through to the "Name (User Visible)" friendly name.
+                if [ -z "$fs" ]; then
+                    fs=$(printf '%s\n' "$dinfo" | awk -F': *' '/^ *Name \(User Visible\):/ {print $2; exit}')
+                fi
+                [ -z "$fs" ] && fs="(none / unformatted)"
+                printf 'File System:          %s\n' "$fs"
+                ;;
+        esac
+    done
 }
 
 # ----------------------------------------------------------------------
