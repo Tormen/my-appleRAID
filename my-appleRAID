@@ -2779,6 +2779,37 @@ EOF
 # the user's responsibility.
 # ----------------------------------------------------------------------
 cmd_migrate_softraid() {
+    # Strip global flags that may appear after the subcommand.
+    eval "$(parse_global_flags "$@")"
+
+    # Per-command help.
+    for a in "$@"; do
+        case "$a" in
+            -h|--help)
+                cat <<EOF
+Usage: $SCRIPT_NAME migrate-softraid [volume]
+
+Guided migration of ONE SoftRAID mirror to AppleRAID. The other mirrors
+on this Mac keep working; run the command once per mirror.
+
+Positional argument (optional):
+  volume    Name of the SoftRAID volume (as shown in SoftRAID.app, e.g.
+            "2.OLD"), or the BSD disk of its virtual mirror (e.g. disk10).
+            When given, the two member disks and the new AppleRAID name
+            are pre-filled from the size-matched physical members.
+            When omitted: if only one SoftRAID volume is present it is
+            auto-selected, otherwise you are prompted to pick one.
+EOF
+                return 0
+                ;;
+        esac
+    done
+
+    vol_arg=""
+    if [ $# -ge 1 ]; then
+        vol_arg="$1"
+    fi
+
     step "Guided SoftRAID-to-AppleRAID migration (one mirror)"
     explain "This command walks you through migrating ONE SoftRAID mirror to"
     explain "AppleRAID. Run it once per mirror you want to convert. The other"
@@ -2831,6 +2862,73 @@ cmd_migrate_softraid() {
     warn "share the same size. Confirm in SoftRAID.app."
     echo
 
+    # ------------------------------------------------------------------
+    # Select a single SoftRAID volume to migrate. Matches by volume name
+    # (e.g. "2.OLD") or by virtual-mirror BSD disk (e.g. disk10 / 10).
+    # If no argument was given and multiple volumes exist, prompt.
+    # If only one volume exists, auto-select.
+    # The selected volume drives auto-detection of its two physical
+    # members (by size match) and a default name for the new AppleRAID
+    # mirror in Step 3.
+    # ------------------------------------------------------------------
+    selected_vol_name=""
+    selected_mirror_line=""
+    if [ -n "$sr_mirrors" ]; then
+        if [ -n "$vol_arg" ]; then
+            selected_mirror_line=$(printf '%s\n' "$sr_mirrors" | awk -F'|' -v v="$vol_arg" '
+                $2 == v || $1 == v || ("disk" $1) == v || ("/dev/disk" $1) == v || ("/dev/" $1) == v {print; exit}
+            ')
+            [ -z "$selected_mirror_line" ] \
+                && die "No SoftRAID volume matches '$vol_arg'. Use one of the names or disks listed above."
+        else
+            n_mirrors=$(printf '%s\n' "$sr_mirrors" | awk 'NF' | wc -l | tr -d ' ')
+            if [ "$n_mirrors" -eq 1 ]; then
+                selected_mirror_line="$sr_mirrors"
+            elif [ "$n_mirrors" -gt 1 ]; then
+                step "Select which SoftRAID volume to migrate"
+                printf 'Enter volume name or disk (e.g. 2.OLD, disk10, 10): '
+                read -r choice
+                [ -z "$choice" ] && die "No selection made."
+                selected_mirror_line=$(printf '%s\n' "$sr_mirrors" | awk -F'|' -v v="$choice" '
+                    $2 == v || $1 == v || ("disk" $1) == v || ("/dev/disk" $1) == v || ("/dev/" $1) == v {print; exit}
+                ')
+                [ -z "$selected_mirror_line" ] \
+                    && die "No SoftRAID volume matches '$choice'."
+            fi
+        fi
+    fi
+
+    auto_n1=""
+    auto_n2=""
+    if [ -n "$selected_mirror_line" ]; then
+        selected_vol_name=$(echo "$selected_mirror_line" | awk -F'|' '{print $2}')
+        selected_vol_disk=$(echo "$selected_mirror_line" | awk -F'|' '{print $1}')
+        info "Selected SoftRAID volume: \"$selected_vol_name\" (/dev/$selected_vol_disk)"
+
+        # Find physical members whose size-guessed volume matches.
+        matching=$(echo "$sr_disks" | while read -r d; do
+            [ -n "$d" ] || continue
+            guessed=$(softraid_member_guess_volume "$d" "$sr_mirrors")
+            if [ "$guessed" = "$selected_vol_name" ]; then
+                echo "$d"
+            fi
+        done)
+        n_match=$(echo "$matching" | awk 'NF' | wc -l | tr -d ' ')
+        if [ "$n_match" -eq 2 ]; then
+            auto_n1=$(echo "$matching" | awk 'NF {print; exit}' | sed 's/^disk//')
+            auto_n2=$(echo "$matching" | awk 'NF' | sed -n '2p' | sed 's/^disk//')
+            info "Auto-detected members: /dev/disk$auto_n1 + /dev/disk$auto_n2"
+        elif [ "$n_match" -gt 2 ]; then
+            warn "Size-match found $n_match possible members for \"$selected_vol_name\":"
+            echo "$matching" | awk 'NF' | sed 's|^|    /dev/|'
+            warn "You'll be asked to pick two manually in Step 3."
+        else
+            warn "Could not auto-detect physical members for \"$selected_vol_name\"."
+            warn "You'll be asked to enter them manually in Step 3."
+        fi
+        echo
+    fi
+
     step "Step 2: Pre-flight checklist"
     cat <<EOF
 Before proceeding, confirm:
@@ -2850,10 +2948,19 @@ EOF
     echo
 
     step "Step 3: Select the two disks"
-    printf 'Enter disk NUMBER of first member (e.g. 2): '
-    read -r n1
-    printf 'Enter disk NUMBER of second member (e.g. 3): '
-    read -r n2
+    if [ -n "$auto_n1" ] && [ -n "$auto_n2" ]; then
+        printf 'Disk NUMBER of first member [%s]: ' "$auto_n1"
+        read -r n1
+        [ -z "$n1" ] && n1="$auto_n1"
+        printf 'Disk NUMBER of second member [%s]: ' "$auto_n2"
+        read -r n2
+        [ -z "$n2" ] && n2="$auto_n2"
+    else
+        printf 'Enter disk NUMBER of first member (e.g. 2): '
+        read -r n1
+        printf 'Enter disk NUMBER of second member (e.g. 3): '
+        read -r n2
+    fi
     if [ -z "$n1" ] || [ -z "$n2" ]; then
         die "Both disk numbers are required."
     fi
@@ -2862,8 +2969,14 @@ EOF
     dev1=$(resolve_disk "$n1") || die "Invalid: $n1"
     dev2=$(resolve_disk "$n2") || die "Invalid: $n2"
 
-    printf 'Enter a name for the new AppleRAID mirror (e.g. Mirror2): '
-    read -r new_name
+    if [ -n "$selected_vol_name" ] && [ "$selected_vol_name" != "(unnamed)" ]; then
+        printf 'Name for the new AppleRAID mirror [%s]: ' "$selected_vol_name"
+        read -r new_name
+        [ -z "$new_name" ] && new_name="$selected_vol_name"
+    else
+        printf 'Enter a name for the new AppleRAID mirror (e.g. Mirror2): '
+        read -r new_name
+    fi
     [ -n "$new_name" ] || die "Name is required."
     echo
 
@@ -3352,10 +3465,12 @@ ${C_BOLD}COMMANDS${C_RESET}
                               the file system volume inside.
 
   ${C_BOLD}-- SoftRAID migration --${C_RESET}
-  ${C_CYAN}migrate-softraid${C_RESET}            Interactive per-mirror guide: detect SoftRAID
+  ${C_CYAN}migrate-softraid${C_RESET} [volume]    Interactive per-mirror guide: detect SoftRAID
                               members, wipe them, and create an AppleRAID
                               mirror in their place. Run once per mirror.
-                              Wraps the existing wipe+create flow with
+                              With [volume] (e.g. "2.OLD"), pre-selects
+                              that SoftRAID volume and auto-fills its
+                              member disks. Wraps wipe+create with
                               SoftRAID-specific pre-flight checks.
   ${C_CYAN}uninstall-softraid${C_RESET}          Pre/post-flight verification for removing
                               SoftRAID. Does NOT delete anything itself -
