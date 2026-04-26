@@ -3921,7 +3921,11 @@ ${C_BOLD}GLOBAL OPTIONS${C_RESET} (accepted before OR after the command name)
                               tracing (set -x) and raw internal dumps.
 
 ${C_BOLD}COMMANDS${C_RESET}
-  ${C_CYAN}list${C_RESET}                        List all AppleRAID sets and their members.
+  ${C_CYAN}list${C_RESET}                        Compact one-line-per-RAID summary covering both
+                              AppleRAID sets AND SoftRAID volumes (level,
+                              state, FS, size+free, mount, members).
+                                -V    Show full 'diskutil appleRAID list'
+                                      dump first, then the compact summary.
   ${C_CYAN}disks${C_RESET}                       One line per disk.
                                 (default)  compact: DEV LOC KIND SIZE MODEL ROLE
                                 -V         extended: adds SERIAL TEMP SMART
@@ -4074,12 +4078,299 @@ EOF
 # ----------------------------------------------------------------------
 # Subcommand: list
 # ----------------------------------------------------------------------
-cmd_list() {
-    step "Listing AppleRAID sets"
-    explain "Command: diskutil appleRAID list"
-    explain "Shows all AppleRAID sets (mirrors, stripes, concats) and each member's status."
-    explain "An extra 'File System:' line is injected per set, derived from"
-    explain "diskutil info on the set's virtual device node."
+# ----------------------------------------------------------------------
+# Row gatherers + formatters used by the compact 'list' summary.
+#
+# Pipe-delimited row schema (11 fields):
+#   source | level_raw | state_raw | devnode | size_bytes | free_bytes
+#          | mount     | fs        | name    | members    | flags
+#
+# - source = "Apple" or "Soft"
+# - members = space-separated "diskN:CODE" pairs (CODE is one letter,
+#   see member_state_legend below)
+# - flags  = additional inline annotations (e.g. "SG" if SoftRAID
+#   Safeguard is enabled). Empty when no flags apply.
+#
+# Apple rows are emitted with FS/free/mount empty - they need a follow-up
+# diskutil lookup on the devnode (handled by appleraid_volume_info).
+# Soft rows already carry every field from softraidtool.
+# ----------------------------------------------------------------------
+
+# Format raw bytes as "10.9 TB" / "5.18 GB" / "-".
+fmt_bytes() {
+    awk -v b="$1" 'BEGIN {
+        if (b == "" || b+0 == 0) { print "-"; exit }
+        if (b >= 1e12) { printf "%.1f TB\n", b/1e12; exit }
+        if (b >= 1e9 ) { printf "%.1f GB\n", b/1e9 ; exit }
+        if (b >= 1e6 ) { printf "%.1f MB\n", b/1e6 ; exit }
+        printf "%d B\n", b
+    }'
+}
+
+# AppleRAID Type -> short level
+ar_level_short() {
+    case "$1" in
+        Mirror)              echo "R1" ;;
+        Stripe|RAID0)        echo "R0" ;;
+        Concat|Concatenated) echo "Cat" ;;
+        *)                   echo "${1:-?}" ;;
+    esac
+}
+
+# SoftRAID raid level (already lowercased+stripped) -> short
+sr_level_short() {
+    case "$1" in
+        raid0)   echo "R0" ;;
+        raid1)   echo "R1" ;;
+        raid4)   echo "R4" ;;
+        raid5)   echo "R5" ;;
+        raid10)  echo "R10" ;;
+        nonraid) echo "1x" ;;
+        "")      echo "?" ;;
+        *)       echo "$1" ;;
+    esac
+}
+
+# AppleRAID member status -> single-letter code
+ar_member_state_short() {
+    case "$1" in
+        Online)     echo "O" ;;
+        Missing)    echo "M" ;;
+        Spare)      echo "P" ;;
+        Rebuilding) echo "R" ;;
+        Offline)    echo "F" ;;
+        *)          echo "?" ;;
+    esac
+}
+
+# Look up FS / mount / free for a synthesized AppleRAID device node.
+# AppleRAID-as-APFS exposes the FS/mount/free on the inner APFS volume,
+# not on the synthesized container. Output: <fs>|<mount>|<free_bytes>
+appleraid_volume_info() {
+    raidnode="$1"
+    [ -n "$raidnode" ] || { echo "-|-|"; return; }
+    dinfo=$(diskutil info "/dev/$raidnode" 2>/dev/null) || { echo "-|-|"; return; }
+    bundle=$(printf '%s\n' "$dinfo" | awk -F': *' '/^[[:space:]]*Type \(Bundle\):/ {print $2; exit}')
+    case "$bundle" in
+        apfs)
+            innervol=$(diskutil list "/dev/$raidnode" 2>/dev/null \
+                | awk '/APFS Volume/ {print $NF; exit}')
+            if [ -n "$innervol" ]; then
+                vinfo=$(diskutil info "/dev/$innervol" 2>/dev/null)
+                mp=$(printf '%s\n' "$vinfo" | awk -F': *' '/^[[:space:]]*Mount Point:/ {print $2; exit}')
+                free=$(printf '%s\n' "$vinfo" \
+                    | awk '/^[[:space:]]*Volume Free Space:/ {
+                        sub(/.*\(/,""); gsub(/[^0-9].*/,""); print; exit
+                    }')
+                printf 'APFS|%s|%s\n' "${mp:--}" "${free:-}"
+                return
+            fi
+            echo "APFS|-|"
+            return
+            ;;
+    esac
+    fs=$(printf '%s\n' "$dinfo" | awk -F': *' '/^[[:space:]]*File System Personality:/ {print $2; exit}')
+    mp=$(printf '%s\n' "$dinfo" | awk -F': *' '/^[[:space:]]*Mount Point:/ {print $2; exit}')
+    free=$(printf '%s\n' "$dinfo" \
+        | awk '/^[[:space:]]*Volume Free Space:/ {
+            sub(/.*\(/,""); gsub(/[^0-9].*/,""); print; exit
+          }')
+    printf '%s|%s|%s\n' "${fs:-?}" "${mp:--}" "${free:-}"
+}
+
+# Gather AppleRAID rows. Outputs partial rows; fs/mount/free are
+# resolved later in print_raid_summary via appleraid_volume_info.
+gather_appleraid_rows() {
+    command -v diskutil >/dev/null 2>&1 || return 0
+    diskutil appleRAID list 2>/dev/null | awk '
+        function flush() {
+            if (have) {
+                printf "Apple|%s|%s|%s|%s|||||%s|%s|\n",
+                       type, status, devnode, size, name, members
+            }
+            have=0; type=""; name=""; status=""; size=""; devnode=""; members=""
+            dash_count=0; in_members=0
+        }
+        /^=+$/ { flush(); next }
+        /^Name:[[:space:]]/         { sub(/^Name:[[:space:]]*/,""); name=$0; have=1; next }
+        /^Type:[[:space:]]/         { sub(/^Type:[[:space:]]*/,""); type=$0; next }
+        /^Status:[[:space:]]/       { sub(/^Status:[[:space:]]*/,""); status=$0; next }
+        /^Size:[[:space:]]/         {
+            n=split($0,p,"(")
+            if (n>=2) { gsub(/[^0-9]/,"",p[2]); size=p[2] }
+            next
+        }
+        /^Device Node:[[:space:]]/  { sub(/^Device Node:[[:space:]]*/,""); devnode=$0; next }
+        /^-+$/                      { dash_count++; if (have && dash_count==2) in_members=1; next }
+        in_members && /^# +DevNode/ { next }
+        in_members && /^[0-9]+[[:space:]]+disk/ {
+            # Columns: # DevNode UUID Status Size
+            members = (members ? members " " : "") $2 ":" $4
+            next
+        }
+        END { flush() }
+    '
+}
+
+# Gather SoftRAID rows. softraidtool reports ALL volumes on the host
+# including non-SoftRAID ones (boot disk, plain HFS volumes); we only
+# emit rows where "Volume is SoftRAID" was seen in the block.
+gather_softraid_rows() {
+    softraid_tool_available || return 0
+    softraid_tool volume all info 2>/dev/null | awk '
+        function flush() {
+            if (in_block && is_sr) {
+                printf "Soft|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s\n",
+                       level, state, devnode, total, free, mp, fmt, name, members,
+                       (sg ? "SG" : "")
+            }
+            in_block=0; is_sr=0
+            level=""; state=""; fmt=""; total=""; free=""; mp=""; name=""
+            devnode=""; members=""; sg=""; in_disks=0
+        }
+        /^Info for "/ {
+            flush()
+            line=$0
+            sub(/^Info for "/,"",line); sub(/":$/,"",line); sub(/"$/,"",line)
+            name=line
+            in_block=1
+            next
+        }
+        /Volume is SoftRAID/                  { is_sr=1; next }
+        /^[[:space:]]*Mountpoint:/            { sub(/^[[:space:]]*Mountpoint:[[:space:]]*/,""); mp=$0; next }
+        /^[[:space:]]*BSD disk:/              { sub(/^[[:space:]]*BSD disk:[[:space:]]*/,""); devnode=$0; next }
+        /^[[:space:]]*Total Bytes:/           {
+            n=split($0,p,"("); if (n>=2) { gsub(/[^0-9]/,"",p[2]); total=p[2] }
+            next
+        }
+        /^[[:space:]]*Free Bytes:/            {
+            n=split($0,p,"("); if (n>=2) { gsub(/[^0-9]/,"",p[2]); free=p[2] }
+            next
+        }
+        /^[[:space:]]*Volume format:/         { sub(/^[[:space:]]*Volume format:[[:space:]]*/,""); fmt=$0; next }
+        /^[[:space:]]*RAID level:/            {
+            sub(/^[[:space:]]*RAID level:[[:space:]]*/,"")
+            l=tolower($0); gsub(/[[:space:]]+/,"",l); sub(/,.*$/,"",l)
+            level=l; next
+        }
+        /^[[:space:]]*Volume Safeguard:/      {
+            sub(/^[[:space:]]*Volume Safeguard:[[:space:]]*/,"")
+            if (tolower($0) ~ /^enabled/) sg=1
+            next
+        }
+        /^[[:space:]]*Volume state:/          {
+            sub(/^[[:space:]]*Volume state:[[:space:]]*/,"")
+            sub(/,.*$/,"")
+            state=$0; next
+        }
+        /^Disks used for this volume:/        { in_disks=1; next }
+        in_disks && /^bsd disk:/              { next }
+        in_disks && /^disk[0-9]+/             {
+            mn=$1
+            role="?"
+            if ($0 ~ /primary disk/)        role="P"
+            else if ($0 ~ /secondary disk/)  role="S"
+            else if ($0 ~ /missing/)         role="M"
+            else if ($0 ~ /offline/)         role="F"
+            members = (members ? members " " : "") mn ":" role
+            next
+        }
+        in_disks && NF==0                     { in_disks=0 }
+        END { flush() }
+    '
+}
+
+# Render one Apple row's level + member states from the raw schema row.
+# Receives the row on stdin (single line). Outputs the rendered row.
+_render_apple_row() {
+    IFS='|' read -r src level state devnode size_b free_b mount fs name members flags _rest
+    short_level=$(ar_level_short "$level")
+    # Resolve fs/mount/free from the synthesized RAID device node.
+    info_line=$(appleraid_volume_info "$devnode")
+    fs=$(printf '%s\n' "$info_line" | awk -F'|' '{print $1}')
+    mount=$(printf '%s\n' "$info_line" | awk -F'|' '{print $2}')
+    free_b=$(printf '%s\n' "$info_line" | awk -F'|' '{print $3}')
+    # Shorten member statuses (Online -> O, etc.)
+    short_members=""
+    for m in $members; do
+        mn=${m%%:*}; ms=${m#*:}
+        sc=$(ar_member_state_short "$ms")
+        short_members="${short_members:+$short_members }${mn}:${sc}"
+    done
+    size_str=$(fmt_bytes "$size_b")
+    free_str=$(fmt_bytes "$free_b")
+    [ -n "$mount" ] || mount="-"
+    [ -n "$fs" ]    || fs="?"
+    flags_str=""
+    [ -n "$flags" ] && flags_str=" $flags"
+    printf 'AppleRAID  %-4s %-9s %-5s %-9s %-9s %-22s %s [%s]%s\n' \
+        "$short_level" "${state:--}" "$fs" "$size_str" "$free_str" "$mount" \
+        "$name" "$short_members" "$flags_str"
+}
+
+_render_soft_row() {
+    IFS='|' read -r src level state devnode size_b free_b mount fs name members flags _rest
+    short_level=$(sr_level_short "$level")
+    [ -n "$mount" ]  || mount="-"
+    [ -n "$fs" ]     || fs="?"
+    [ -n "$state" ]  || state="-"
+    size_str=$(fmt_bytes "$size_b")
+    free_str=$(fmt_bytes "$free_b")
+    flags_str=""
+    [ -n "$flags" ] && flags_str=" $flags"
+    printf 'SoftRAID   %-4s %-9s %-5s %-9s %-9s %-22s %s [%s]%s\n' \
+        "$short_level" "$state" "$fs" "$size_str" "$free_str" "$mount" \
+        "$name" "$members" "$flags_str"
+}
+
+# Print the unified compact summary (the new default 'list' output).
+print_raid_summary() {
+    apple_rows=$(gather_appleraid_rows)
+    soft_rows=$(gather_softraid_rows)
+
+    if [ -z "$apple_rows" ] && [ -z "$soft_rows" ]; then
+        info "No AppleRAID sets and no SoftRAID volumes found on this host."
+        return
+    fi
+
+    printf '%s%-10s %-4s %-9s %-5s %-9s %-9s %-22s %s%s\n' \
+        "${C_BOLD}" "SOURCE" "LVL" "STATE" "FS" "SIZE" "FREE" "MOUNT" "NAME [MEMBERS]" "${C_RESET}"
+
+    if [ -n "$apple_rows" ]; then
+        printf '%s\n' "$apple_rows" | while IFS= read -r row; do
+            [ -n "$row" ] || continue
+            printf '%s\n' "$row" | _render_apple_row
+        done
+    fi
+    if [ -n "$soft_rows" ]; then
+        printf '%s\n' "$soft_rows" | while IFS= read -r row; do
+            [ -n "$row" ] || continue
+            printf '%s\n' "$row" | _render_soft_row
+        done
+    fi
+
+    n_apple=$(printf '%s\n' "$apple_rows" | awk 'NF' | wc -l | tr -d ' ')
+    n_soft=$(printf '%s\n' "$soft_rows" | awk 'NF' | wc -l | tr -d ' ')
+    n_apple_degraded=$(printf '%s\n' "$apple_rows" | awk -F'|' 'NF && $3 != "Online" {n++} END {print n+0}')
+    n_soft_degraded=$(printf '%s\n' "$soft_rows" | awk -F'|' 'NF && $3 != "normal" {n++} END {print n+0}')
+
+    echo
+    explain "Member states: O=Online M=Missing P=Spare/Primary S=Secondary R=Rebuilding F=Offline ?=Unknown"
+    explain "Flags: SG=Safeguard enabled (SoftRAID)"
+    if softraid_tool_available; then
+        printf 'Totals: %s AppleRAID set(s) (%s degraded), %s SoftRAID volume(s) (%s degraded).\n' \
+            "${n_apple:-0}" "$n_apple_degraded" "${n_soft:-0}" "$n_soft_degraded"
+    else
+        printf 'Totals: %s AppleRAID set(s) (%s degraded). SoftRAID: not installed on this host.\n' \
+            "${n_apple:-0}" "$n_apple_degraded"
+    fi
+}
+
+# Verbose dump (the legacy 'list' output): full diskutil appleRAID list
+# with a synthetic 'File System:' line injected per set.
+cmd_list_verbose_dump() {
+    step "AppleRAID sets - full diskutil output"
+    explain "Command: diskutil appleRAID list (with 'File System:' line injected per set)."
     echo
     printf '%s$ diskutil appleRAID list%s\n' "${C_BOLD}" "${C_RESET}"
     diskutil appleRAID list 2>&1 | while IFS= read -r line; do
@@ -4090,7 +4381,6 @@ cmd_list() {
                 [ -n "$dev" ] || continue
                 dinfo=$(diskutil info "/dev/$dev" 2>/dev/null) || continue
                 fs=$(printf '%s\n' "$dinfo" | awk -F': *' '/^ *File System Personality:/ {print $2; exit}')
-                # APFS-as-RAID has no FS Personality but Type (Bundle)=apfs.
                 if [ -z "$fs" ]; then
                     bundle=$(printf '%s\n' "$dinfo" | awk -F': *' '/^ *Type \(Bundle\):/ {print $2; exit}')
                     case "$bundle" in
@@ -4099,7 +4389,6 @@ cmd_list() {
                         *)    fs="$bundle" ;;
                     esac
                 fi
-                # Fall through to the "Name (User Visible)" friendly name.
                 if [ -z "$fs" ]; then
                     fs=$(printf '%s\n' "$dinfo" | awk -F': *' '/^ *Name \(User Visible\):/ {print $2; exit}')
                 fi
@@ -4108,6 +4397,38 @@ cmd_list() {
                 ;;
         esac
     done
+}
+
+cmd_list() {
+    eval "$(parse_global_flags "$@")"
+
+    for a in "$@"; do
+        case "$a" in
+            -h|--help)
+                cat <<EOF
+Usage: $SCRIPT_NAME list [-V]
+
+Print a compact one-line-per-RAID summary covering both AppleRAID sets
+and SoftRAID volumes. Each row shows the source (AppleRAID/SoftRAID),
+RAID level, state, filesystem, size + free, mount point, the volume
+name, and inline member status codes.
+
+  -V, --verbose    Also print the full 'diskutil appleRAID list' dump
+                   FIRST (the legacy 'list' output), followed by the
+                   compact summary.
+EOF
+                return 0
+                ;;
+        esac
+    done
+
+    if [ "$VERBOSE" = "1" ] || [ "$DEBUG" = "1" ]; then
+        cmd_list_verbose_dump
+        echo
+    fi
+
+    step "RAID summary"
+    print_raid_summary
 }
 
 # ----------------------------------------------------------------------
