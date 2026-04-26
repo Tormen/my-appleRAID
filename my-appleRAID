@@ -4314,7 +4314,6 @@ _render_apple_row() {
     fs=$(printf '%s\n' "$info_line" | awk -F'|' '{print $1}')
     mount=$(printf '%s\n' "$info_line" | awk -F'|' '{print $2}')
     free_b=$(printf '%s\n' "$info_line" | awk -F'|' '{print $3}')
-    # Shorten member statuses (Online -> O, etc.)
     short_members=""
     for m in $members; do
         mn=${m%%:*}; ms=${m#*:}
@@ -4322,9 +4321,13 @@ _render_apple_row() {
         short_members="${short_members:+$short_members }${mn}:${sc}"
     done
     size_str=$(fmt_bytes "$size_b")
-    free_str=$(fmt_bytes "$free_b")
-    [ -n "$mount" ] || mount="-"
-    [ -n "$fs" ]    || fs="?"
+    if [ -z "$mount" ] || [ "$mount" = "-" ]; then
+        mount="-"
+        free_str="n/a"
+    else
+        free_str=$(fmt_bytes "$free_b")
+    fi
+    [ -n "$fs" ] || fs="?"
     flags_str=""
     [ -n "$flags" ] && flags_str=" $flags"
     printf 'AppleRAID  %-4s %-9s %-5s %-9s %-9s %-22s %s [%s]%s\n' \
@@ -4335,11 +4338,15 @@ _render_apple_row() {
 _render_soft_row() {
     IFS='|' read -r src level state devnode size_b free_b mount fs name members flags _rest
     short_level=$(sr_level_short "$level")
-    [ -n "$mount" ]  || mount="-"
-    [ -n "$fs" ]     || fs="?"
-    [ -n "$state" ]  || state="-"
+    [ -n "$fs" ]    || fs="?"
+    [ -n "$state" ] || state="-"
     size_str=$(fmt_bytes "$size_b")
-    free_str=$(fmt_bytes "$free_b")
+    if [ -z "$mount" ] || [ "$mount" = "-" ]; then
+        mount="-"
+        free_str="n/a"
+    else
+        free_str=$(fmt_bytes "$free_b")
+    fi
     flags_str=""
     [ -n "$flags" ] && flags_str=" $flags"
     printf 'SoftRAID   %-4s %-9s %-5s %-9s %-9s %-22s %s [%s]%s\n' \
