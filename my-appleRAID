@@ -5451,9 +5451,13 @@ cmd_destroy() {
 install_zsh_completions() {
     # Best-effort - never let this fail the run.
     [ -n "${HOME:-}" ] || return 0
-    # Skip when running as root (sudo) - HOME is root's home, not the
-    # user's. The next non-sudo invocation will install for the user.
-    [ "$(id -u 2>/dev/null)" = "0" ] && return 0
+    # We install into $HOME/.zsh/completions regardless of EUID. On
+    # hosts where the tool is genuinely used as root (e.g. ada), root's
+    # interactive shell IS the shell that needs the completion, and
+    # /var/root is the right place. On a normal sudo-from-user setup
+    # the file lands in /var/root only for that invocation, then a
+    # subsequent non-sudo run installs the user's own copy too -
+    # that's fine, they're independent files.
 
     _comp_dir="$HOME/.zsh/completions"
     _comp_file="$_comp_dir/_my-appleRAID"
