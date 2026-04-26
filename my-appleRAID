@@ -1590,6 +1590,33 @@ cmd_health() {
     # Accept global -V/-D after the subcommand name.
     eval "$(parse_global_flags "$@")"
 
+    # --disk drill-down mode: short-circuit the daemon pipeline and
+    # call _smart_drilldown_one for one specific physical disk. This
+    # is the on-demand counterpart to the recurring monitoring pass,
+    # and is also exposed as the standalone `smart` subcommand.
+    drill_disk=""
+    drill_mode=0
+    _hpos=""
+    for a in "$@"; do
+        if [ "$_hpos" = "--disk" ]; then
+            drill_disk="$a"; _hpos=""
+            continue
+        fi
+        case "$a" in
+            --disk)   drill_mode=1; _hpos="--disk" ;;
+            --disk=*) drill_mode=1; drill_disk="${a#--disk=}" ;;
+        esac
+    done
+    if [ "$drill_mode" = "1" ]; then
+        if [ -z "$drill_disk" ]; then
+            drill_disk=$(pick_physical_disk_interactively "inspect (SMART)") || return 1
+        fi
+        ddev=$(resolve_disk "$drill_disk") || die "Invalid disk spec: $drill_disk"
+        assert_whole_disk "$ddev"
+        _smart_drilldown_one "${ddev#/dev/}"
+        return 0
+    fi
+
     cfg_load
     state_init
     seen_init
@@ -3919,6 +3946,161 @@ smart_cmd() {
 }
 
 # ----------------------------------------------------------------------
+# SMART drill-down: print a comprehensive per-disk health readout.
+# Used by `cmd_smart` (interactive standalone) and `cmd_health --disk`
+# (drill-down mode of the daemon command). Read-only.
+#
+# Sections:
+#   1. Overall health        (smartctl -H)
+#   2. Pre-failure attrs     (smartctl -A) + non-zero "killer" highlight
+#   3. Self-test log         (smartctl -l selftest)
+#   4. Error log             (smartctl -l error)
+#
+# Argument: short disk name (e.g. "disk3"), no /dev/ prefix.
+# Returns 0 on clean run, 1 if smartctl/diskutil cannot inspect the disk.
+# ----------------------------------------------------------------------
+_smart_drilldown_one() {
+    d="$1"
+    dev="/dev/$d"
+
+    if ! command -v smartctl >/dev/null 2>&1; then
+        die "smartctl not installed.  Fix:  brew install smartmontools"
+    fi
+    if ! diskutil info "$dev" >/dev/null 2>&1; then
+        die "Device not found: $dev"
+    fi
+
+    virt=$(diskutil info "$dev" 2>/dev/null | awk -F': *' '/Virtual:/ {print $2; exit}')
+    if [ "$virt" = "Yes" ]; then
+        die "$dev is a VIRTUAL device (RAID/APFS container) - has no SMART data of its own."
+    fi
+
+    # Resolve / cache the right -d type for this enclosure.
+    dtype=$(smart_dtype_for "$d")
+    if [ -z "$dtype" ] || [ "$dtype" = "none" ]; then
+        die "$dev does not respond to SMART (no working -d type for this enclosure)."
+    fi
+    sc=$(smart_cmd "$d")
+
+    # Header
+    model=$(diskutil info "$dev" 2>/dev/null | awk -F': +' '/Device \/ Media Name:/ {print $2; exit}')
+    [ -z "$model" ] && model=$(diskutil info "$dev" 2>/dev/null | awk -F': +' '/Media Name:/ {print $2; exit}')
+    serial=$(disk_serial "$d")
+    size=$(diskutil info "$dev" 2>/dev/null | awk -F': +' '
+        /Disk Size:/  {print $2; exit}
+        /Total Size:/ {print $2; exit}' | sed 's/ *(.*)//; s/[[:space:]]*$//')
+    proto=$(diskutil info "$dev" 2>/dev/null | awk -F': +' '/Protocol:/ {print $2; exit}')
+
+    step "SMART drill-down: $dev"
+    printf '  %-10s %s\n' "Model:"    "${model:-?}"
+    printf '  %-10s %s\n' "Serial:"   "${serial:-?}"
+    printf '  %-10s %s\n' "Size:"     "${size:-?}"
+    printf '  %-10s %s\n' "Protocol:" "${proto:-?}"
+    printf '  %-10s %s\n' "Probe:"    "$sc"
+    echo
+
+    # 1. Overall health
+    step "1/4: Overall health  (smartctl -H)"
+    health_raw=$($sc -H "$dev" 2>/dev/null | awk -F': *' '
+        /SMART overall-health/ {print $2; exit}
+        /SMART Health Status/   {print $2; exit}')
+    health_raw=$(echo "$health_raw" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+    case "$health_raw" in
+        PASSED|OK)  ok "Overall health: $health_raw" ;;
+        '')         warn "Overall health: not reported by drive" ;;
+        *)          err "Overall health: $health_raw" ;;
+    esac
+    echo
+
+    # 2. Pre-failure attributes (full table + non-zero killer summary)
+    step "2/4: Pre-failure attributes  (smartctl -A)"
+    explain "Watch the RAW_VALUE column. Non-zero on these IDs is a red flag:"
+    explain "  5 Reallocated  187 Reported_Uncorrect  197 Pending  198 Offline_Uncorrectable  199 UDMA_CRC"
+    echo
+    attrs=$($sc -A "$dev" 2>/dev/null)
+    if [ -z "$attrs" ]; then
+        warn "Could not read SMART attributes."
+    else
+        echo "$attrs" | sed 's/^/  /'
+        echo
+
+        # ATA killers: numeric IDs 5/187/197/198/199 with non-zero RAW.
+        ata_nonzero=$(echo "$attrs" | awk '
+            /^[[:space:]]*(5|187|197|198|199)[[:space:]]+[A-Za-z]/ {
+                if ($10+0 > 0) printf "    %3d %-26s RAW=%s\n", $1, $2, $10
+            }')
+
+        # NVMe critical fields.
+        nvme_warn=$(echo "$attrs" | awk -F': *' '
+            /Critical Warning/         { v=$2; gsub(/^ +| +$/,"",v); if (v != "" && v != "0x00") printf "    %s = %s\n", $1, v }
+            /Media and Data Integrity/ { v=$2; gsub(/^ +| +$/,"",v); if (v+0 > 0) printf "    %s = %s\n", $1, v }
+            /Unsafe Shutdowns/         { v=$2; gsub(/^ +| +$/,"",v); if (v+0 > 0) printf "    %s = %s\n", $1, v }
+            /Available Spare:/         { v=$2; gsub(/^ +| +$/,"",v); n=v; gsub(/%/,"",n); if (n+0 < 100 && n != "") printf "    %s = %s\n", $1, v }')
+
+        if [ -n "$ata_nonzero" ] || [ -n "$nvme_warn" ]; then
+            err "Pre-failure indicator(s) found:"
+            [ -n "$ata_nonzero" ] && printf '%s\n' "$ata_nonzero"
+            [ -n "$nvme_warn"   ] && printf '%s\n' "$nvme_warn"
+        else
+            ok "No pre-failure indicators (ATA killers / NVMe critical fields all clean)."
+        fi
+    fi
+    echo
+
+    # 3. Self-test log
+    step "3/4: Self-test log  (smartctl -l selftest)"
+    selftest=$($sc -l selftest "$dev" 2>/dev/null)
+    if [ -z "$selftest" ]; then
+        warn "Self-test log unreadable (some USB bridges hide it)."
+    elif echo "$selftest" | grep -qE 'No self-tests have been logged|No Self-tests Logged'; then
+        info "No self-tests have been logged on this drive yet."
+        explain "Run one with:  sudo $sc -t short $dev    (~2 min)"
+        explain "             or sudo $sc -t long  $dev    (hours, full surface)"
+    else
+        echo "$selftest" | sed -n '/Num.*Test_Description/,/^$/p; /^# *[0-9]/p' \
+            | sed 's/^/  /'
+        if echo "$selftest" | grep -qE 'Failed|Aborted_by_host|Interrupted|Completed: read failure'; then
+            warn "Past self-test failure(s) above. LBA_of_first_error points to the bad sector."
+        else
+            ok "All logged self-tests completed without error."
+        fi
+    fi
+    echo
+
+    # 4. Error log (firmware-recorded uncorrectable errors)
+    step "4/4: SMART error log  (smartctl -l error)"
+    elog=$($sc -l error "$dev" 2>/dev/null)
+    if [ -z "$elog" ]; then
+        warn "Error log unreadable (some USB bridges hide it)."
+    elif echo "$elog" | grep -qE 'No Errors Logged|No errors logged'; then
+        ok "Error count: 0  (firmware has logged no errors)"
+    else
+        ec=$(echo "$elog" | awk -F': *' '
+            /Error [Cc]ount:/         { print $2; exit }
+            /Device Error Count:/     { print $2; exit }')
+        ec=$(echo "$ec" | awk '{print $1}')
+        if [ -n "$ec" ] && [ "$ec" = "0" ]; then
+            ok "Error count: 0"
+        elif [ -n "$ec" ]; then
+            err "Error count: $ec  (firmware-recorded errors - inspect below)"
+            echo
+            echo "$elog" | awk '/^Error [0-9]+/,/^$/' | sed 's/^/  /' | head -80
+        else
+            warn "Could not parse error count - raw output:"
+            echo "$elog" | sed 's/^/  /' | head -40
+        fi
+    fi
+    echo
+
+    step "Further commands"
+    explain "Full report:        $sc -x $dev"
+    explain "Just the error log: $sc -l error $dev"
+    explain "Just self-tests:    $sc -l selftest $dev"
+    explain "Run a short test:   sudo $sc -t short $dev   (~2 min, online)"
+    explain "Run a long test:    sudo $sc -t long  $dev   (hours, full surface)"
+}
+
+# ----------------------------------------------------------------------
 # `test-alerts` - exercise every alerting channel.
 # ----------------------------------------------------------------------
 cmd_test_alerts() {
@@ -3991,6 +4173,26 @@ ${C_BOLD}COMMANDS${C_RESET}
   ${C_CYAN}create${C_RESET} <name> <N1> <N2>     Create a new mirror from two disk NUMBERS
                               (e.g. '${SCRIPT_NAME} create BackupGold 2 3').
                               APFS format. Wipes both disks first.
+  ${C_CYAN}blink${C_RESET} [<disk>]                Pulse a disk's activity LED so you can
+                              identify which physical drive (or enclosure
+                              slot) maps to a /dev/diskN before yanking it.
+                              Generates read-only I/O - same trick SoftRAID's
+                              "Identify" button uses. Without an argument,
+                              shows an interactive picker. Ctrl-C to stop.
+  ${C_CYAN}eject${C_RESET} [<disk>]                Spin down + power off a physical disk so
+                              it can be safely disconnected. Natural
+                              follow-up to 'blink'. Without an argument,
+                              shows an interactive picker. Warns + confirms
+                              if the disk is an active RAID member.
+  ${C_CYAN}smart${C_RESET} [<disk>]                Detailed SMART drill-down for one disk:
+                              overall health, pre-failure attributes (with
+                              non-zero "killer" highlight), self-test log,
+                              and the firmware error log. The error log
+                              and self-test log answer 'was this drive
+                              ever in trouble in the past' - the daemon's
+                              'health' command never reads those.
+                              Auto-detects '-d <type>' for USB/TB
+                              enclosures. Same as 'health --disk <N>'.
   ${C_CYAN}wipe${C_RESET} <N>                    Zero the first and last 100 MB of /dev/diskN
                               to remove stale RAID metadata (SoftRAID, etc).
   ${C_CYAN}verify-wipe${C_RESET} <N>             Check that first and last 100 MB are zeros.
@@ -3998,8 +4200,11 @@ ${C_BOLD}COMMANDS${C_RESET}
                               Handles both 'old disk returned' and 'new replacement'.
   ${C_CYAN}status${C_RESET} [name|uuid]          Short status summary (Online / Degraded / ...).
   ${C_CYAN}watch${C_RESET} [name|uuid]           Live-refreshing status (refreshes every 10 s).
-  ${C_CYAN}test${C_RESET} [name|uuid]            Run non-destructive tests: mount status,
+  ${C_CYAN}test${C_RESET} [--all | name|uuid]    Run non-destructive tests: mount status,
                               write/read probe, RAID consistency.
+                              --all tests every AppleRAID set on the system
+                              (continues past per-set failures, exits
+                              non-zero if any set fails).
   ${C_CYAN}destroy${C_RESET} [name|uuid]         Delete a RAID set (data loss - confirms twice).
   ${C_CYAN}rename${C_RESET} [name|uuid] <new>     Rename a RAID set's Name field (non-destructive,
                               no sudo required). Updates only the RAID set
@@ -4032,7 +4237,7 @@ ${C_BOLD}COMMANDS${C_RESET}
                               verify clean removal.
 
   ${C_BOLD}-- Health monitoring (designed for launchd) --${C_RESET}
-  ${C_CYAN}health${C_RESET} [--dry-run|--once|-v]
+  ${C_CYAN}health${C_RESET} [--dry-run|--once|-v|--disk <N>]
                               Run one monitoring pass. Checks RAID set
                               state on every call. Runs SMART checks
                               once per SMART_POLL_INTERVAL (default:
@@ -4040,9 +4245,12 @@ ${C_BOLD}COMMANDS${C_RESET}
                               alarm (rate-limited by ALARM_INTERVAL),
                               sends email (rate-limited by
                               EMAIL_INTERVAL), and logs.
-                                --dry-run  perform checks, no alerts
-                                --once     bypass rate limits (testing)
-                                -v         debug logging for this run
+                                --dry-run    perform checks, no alerts
+                                --once       bypass rate limits (testing)
+                                -v           debug logging for this run
+                                --disk <N>   skip the daemon pass; instead
+                                             print the SMART drill-down for
+                                             one disk (same as 'smart' cmd).
                               Exit: 0=ok, 1=warn, 2=crit.
   ${C_CYAN}show-config${C_RESET}                 Print effective config values and which
                               config file (if any) was loaded.
@@ -4100,11 +4308,17 @@ ${C_BOLD}EXAMPLES${C_RESET}
   ${C_BOLD}-- Management --${C_RESET}
   ${SCRIPT_NAME} list
   ${SCRIPT_NAME} disks
+  ${SCRIPT_NAME} blink                       # interactive picker
+  ${SCRIPT_NAME} blink 3                     # pulse /dev/disk3's LED
+  ${SCRIPT_NAME} eject 3                     # spin down + power off /dev/disk3
+  ${SCRIPT_NAME} smart 3                     # full SMART drill-down on /dev/disk3
+  ${SCRIPT_NAME} health --disk 3             # same drill-down via the daemon command
   ${SCRIPT_NAME} wipe 3
   ${SCRIPT_NAME} create BackupGold 2 3
   ${SCRIPT_NAME} repair BackupGold
   ${SCRIPT_NAME} status
   ${SCRIPT_NAME} test BackupGold
+  ${SCRIPT_NAME} test --all                  # test every RAID set
   ${SCRIPT_NAME} rename BackupGold BackupPlatinum
 
   ${C_BOLD}-- Health monitoring setup --${C_RESET}
@@ -4820,6 +5034,335 @@ cmd_watch() {
 }
 
 # ----------------------------------------------------------------------
+# Subcommand: blink
+# ----------------------------------------------------------------------
+# Pulse a disk's activity LED by repeatedly reading from it. macOS
+# exposes no API to toggle an enclosure LED, so we generate read I/O
+# instead and let the bus-activity LED do the blinking. This is the
+# same trick SoftRAID's "Identify" button uses.
+pick_physical_disk_interactively() {
+    # $1 = verb shown in the prompt header ("blink", "eject", ...).
+    _verb="${1:-pick}"
+
+    # Enumerate whole disks (skip Virtual: AppleRAID/APFS containers).
+    _disks=$(diskutil list 2>/dev/null | awk '/^\/dev\/disk[0-9]+/ {
+        sub(/:$/, "", $1); sub(/^\/dev\//, "", $1); print $1
+    }')
+
+    _i=0
+    _map=""
+    {
+        printf '%sPick a disk to %s:%s\n\n' "${C_BOLD}" "$_verb" "${C_RESET}"
+        printf '  %3s  %-8s %-9s %-4s %9s  %s\n' "#" "DEV" "LOC" "KIND" "SIZE" "MODEL"
+        printf '  %3s  %-8s %-9s %-4s %9s  %s\n' "-" "---" "---" "----" "----" "-----"
+    } >&2
+
+    for d in $_disks; do
+        info_out=$(diskutil info "/dev/$d" 2>/dev/null) || continue
+        virtual=$(echo "$info_out" | awk -F': +' '/Virtual:/ {print $2; exit}')
+        [ "$virtual" = "Yes" ] && continue
+
+        size=$(echo "$info_out" | awk -F': +' '
+            /Disk Size:/ { print $2; exit }
+            /Total Size:/ { print $2; exit }
+        ' | sed 's/ *(.*)//; s/[[:space:]]*$//')
+
+        solid=$(echo "$info_out"    | awk -F': +' '/Solid State:/  {print $2; exit}')
+        protocol=$(echo "$info_out" | awk -F': +' '/Protocol:/     {print $2; exit}')
+        if   [ "$protocol" = "Disk Image" ]; then kind="img"
+        elif [ "$solid"    = "Yes" ];        then kind="SSD"
+        else                                       kind="HDD"
+        fi
+
+        loc=$(echo "$info_out" | awk -F': +' '/Device Location:/ {print $2; exit}')
+        [ -z "$loc" ] && loc=$(echo "$info_out" | awk -F': +' '/Internal:/ {print ($2=="Yes"?"Internal":"External"); exit}')
+        loc=$(echo "$loc" | awk '{print $1}')
+
+        model=$(echo "$info_out" | awk -F': +' '/Device \/ Media Name:/ {print $2; exit}')
+        [ -z "$model" ] && model=$(echo "$info_out" | awk -F': +' '/Media Name:/ {print $2; exit}')
+        [ -z "$model" ] && model="-"
+
+        _i=$((_i + 1))
+        _map="$_map$_i=$d
+"
+        printf '  %3d  %-8s %-9s %-4s %9s  %s\n' "$_i" "$d" "${loc:-?}" "$kind" "$size" "$model" >&2
+    done
+
+    if [ "$_i" -eq 0 ]; then
+        err "No physical disks found."
+        return 1
+    fi
+
+    {
+        echo
+        printf '%sChoice [1-%d, q to abort]:%s ' "${C_YELLOW}" "$_i" "${C_RESET}"
+    } >&2
+    read -r _choice || return 1
+    case "$_choice" in
+        q|Q|'')      err "Aborted."; return 1 ;;
+        *[!0-9]*)    err "Invalid choice: $_choice"; return 1 ;;
+    esac
+    if [ "$_choice" -lt 1 ] || [ "$_choice" -gt "$_i" ]; then
+        err "Invalid choice: $_choice (must be 1..$_i)"
+        return 1
+    fi
+
+    _picked=$(printf '%s' "$_map" | awk -F= -v c="$_choice" '$1==c {print $2; exit}')
+    [ -n "$_picked" ] || { err "Internal error resolving choice $_choice."; return 1; }
+    echo "$_picked"
+}
+
+cmd_blink() {
+    eval "$(parse_global_flags "$@")"
+
+    arg=""
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -h|--help)
+                cat <<EOF
+Usage: $SCRIPT_NAME blink [<disk>]
+
+Pulse a disk's activity LED so you can identify which physical drive
+(or which enclosure slot) maps to a given /dev/diskN before yanking
+it for a swap or repair.
+
+macOS has no API to toggle an enclosure LED directly, so this
+generates read I/O on the disk and lets the bus-activity LED do the
+blinking. Same trick SoftRAID's "Identify" button uses.
+
+ARGUMENTS
+  <disk>    Optional. Disk number (e.g. 3), short name (disk3) or
+            full path (/dev/disk3). If omitted, you get an
+            interactive picker listing all attached physical disks.
+
+NOTES
+  - Read-only. Will not touch data.
+  - Reads from the raw device (/dev/rdiskN) for maximum throughput;
+    requires sudo on modern macOS.
+  - Pulses ~64 MiB read, then ~0.5 s idle, looping until you press
+    Ctrl-C. The on/off pattern makes the blink obvious.
+EOF
+                return 0
+                ;;
+            -V|--verbose|-D|--debug) ;;
+            -*) warn "Unknown option: $1" ;;
+            *)  arg="$1" ;;
+        esac
+        shift
+    done
+
+    if [ -z "$arg" ]; then
+        arg=$(pick_physical_disk_interactively "blink") || return 1
+    fi
+
+    dev=$(resolve_disk "$arg") || die "Invalid disk spec: $arg"
+    assert_whole_disk "$dev"
+
+    virt=$(diskutil info "$dev" 2>/dev/null | awk -F': *' '/Virtual:/ {print $2; exit}')
+    if [ "$virt" = "Yes" ]; then
+        die "$dev is a VIRTUAL device (RAID/APFS container) and has no LED of its own. Pick a physical disk."
+    fi
+
+    rdev="/dev/r${dev#/dev/}"
+
+    step "Blinking $dev"
+    describe_disk "$dev"
+    explain "Read-only loop: reads ~64 MiB, idles ~0.5 s, repeats. Watch the"
+    explain "drive's activity LED to identify which physical slot $dev is."
+    explain "Press Ctrl-C to stop."
+    echo
+
+    # Trap so Ctrl-C exits cleanly instead of dumping a half-printed dd line.
+    trap 'echo; ok "Blink stopped."; exit 0' INT TERM
+
+    # Prime sudo once so the loop body doesn't trigger a re-prompt mid-pulse.
+    if ! sudo -n true 2>/dev/null; then
+        info "Reading $rdev requires sudo (cached for the rest of the loop)."
+        sudo true || die "sudo authentication failed."
+    fi
+
+    pulse=0
+    while :; do
+        pulse=$((pulse + 1))
+        printf '  pulse %d ...\r' "$pulse"
+        if ! sudo dd if="$rdev" of=/dev/null bs=1m count=64 2>/dev/null; then
+            echo
+            die "Read failed on $rdev (disk disconnected?)"
+        fi
+        sleep 0.5
+    done
+}
+
+# ----------------------------------------------------------------------
+# Subcommand: eject
+# ----------------------------------------------------------------------
+# Spin down and power off a physical disk so it can be safely yanked.
+# Designed as the natural follow-up to `blink`: blink to identify which
+# slot a /dev/diskN is in, then eject it before pulling it.
+cmd_eject() {
+    eval "$(parse_global_flags "$@")"
+
+    arg=""
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -h|--help)
+                cat <<EOF
+Usage: $SCRIPT_NAME eject [<disk>]
+
+Spin down and power off a physical disk so it can be safely
+disconnected. Natural follow-up to '$SCRIPT_NAME blink': blink to
+identify which physical slot a /dev/diskN is in, then eject it
+before pulling it.
+
+Unmounts every volume on the disk and runs 'diskutil eject', which
+flushes caches and parks the heads.
+
+ARGUMENTS
+  <disk>    Optional. Disk number (e.g. 3), short name (disk3) or
+            full path (/dev/disk3). If omitted, you get an
+            interactive picker listing all attached physical disks.
+
+NOTES
+  - If the disk is currently a member of an online AppleRAID set,
+    ejecting it will degrade the set. You'll be prompted to confirm.
+  - Internal disks are refused (would take down macOS).
+  - Virtual devices (RAID/APFS containers) are refused; eject the
+    backing physical disk instead.
+EOF
+                return 0
+                ;;
+            -V|--verbose|-D|--debug) ;;
+            -*) warn "Unknown option: $1" ;;
+            *)  arg="$1" ;;
+        esac
+        shift
+    done
+
+    if [ -z "$arg" ]; then
+        arg=$(pick_physical_disk_interactively "eject") || return 1
+    fi
+
+    dev=$(resolve_disk "$arg") || die "Invalid disk spec: $arg"
+    assert_whole_disk "$dev"
+    short="${dev#/dev/}"
+
+    virt=$(diskutil info "$dev" 2>/dev/null | awk -F': *' '/Virtual:/ {print $2; exit}')
+    if [ "$virt" = "Yes" ]; then
+        die "$dev is a VIRTUAL device (RAID/APFS container). Eject the backing physical disk instead."
+    fi
+
+    internal=$(diskutil info "$dev" 2>/dev/null | awk -F': *' '/Internal:/ {print $2; exit}')
+    if [ "$internal" = "Yes" ]; then
+        die "$dev is an INTERNAL disk - refusing to eject (would take down macOS)."
+    fi
+
+    # Detect if this disk is a member of an existing AppleRAID set.
+    raid_set_name=$(diskutil appleRAID list 2>/dev/null | awk -v d="$short" '
+        /^Name:/             { setname = $2; sub(/^[ \t]+/, "", setname); sub(/ +$/, "", setname) }
+        /^[ ]*[0-9]+[ \t]+disk[0-9]+/ {
+            nf = split($0, parts, /[ \t]+/)
+            for (i = 1; i <= nf; i++) {
+                if (parts[i] ~ /^disk[0-9]+(s[0-9]+)?$/) {
+                    devname = parts[i]; sub(/s[0-9]+$/, "", devname)
+                    if (devname == d) { print setname; exit }
+                }
+            }
+        }
+    ')
+
+    step "Eject plan for $dev"
+    describe_disk "$dev"
+    if [ -n "$raid_set_name" ]; then
+        warn "$dev is currently a member of AppleRAID set '$raid_set_name'."
+        warn "Ejecting it WILL degrade the RAID set until the disk is reconnected"
+        warn "(or replaced and rebuilt via '$SCRIPT_NAME repair')."
+        echo
+        confirm "Eject $dev anyway?" || die "Aborted."
+    fi
+
+    step "Unmounting $dev"
+    run sudo diskutil unmountDisk force "$dev" \
+        || warn "unmountDisk returned non-zero (may be already unmounted)"
+
+    step "Ejecting $dev"
+    if run diskutil eject "$dev"; then
+        ok "$dev ejected. Safe to disconnect."
+    else
+        err "diskutil eject failed for $dev."
+        explain "Possible reasons:"
+        explain "  - A process is still holding files open on a volume on $dev."
+        explain "    Try: lsof +D /Volumes/<name>  (or 'sudo lsof' for system processes)"
+        explain "  - The enclosure does not honor SCSI eject (some USB bridges)."
+        explain "    The disk is unmounted but the device node will persist."
+        explain "  - macOS refused due to a pending I/O operation. Wait a few seconds and retry."
+        exit 1
+    fi
+}
+
+# ----------------------------------------------------------------------
+# Subcommand: smart
+# ----------------------------------------------------------------------
+# Comprehensive on-demand SMART drill-down for one disk: overall health,
+# pre-failure attributes (with non-zero killer highlight), self-test
+# history, and the firmware error log. Complements `health`, which is a
+# recurring monitor that only alerts on threshold crossings - it never
+# shows the firmware error/self-test logs and isn't designed for
+# interactive per-disk inspection.
+cmd_smart() {
+    eval "$(parse_global_flags "$@")"
+
+    arg=""
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -h|--help)
+                cat <<EOF
+Usage: $SCRIPT_NAME smart [<disk>]
+
+Detailed SMART health drill-down for one disk:
+
+  1/4  Overall health           (smartctl -H)
+  2/4  Pre-failure attributes   (smartctl -A) + non-zero killer summary
+  3/4  Self-test log            (smartctl -l selftest)
+  4/4  SMART error log          (smartctl -l error)
+
+The error log and self-test log are exactly the data that answers
+'was this drive ever in trouble in the past' - the firmware itself
+remembers errors and test outcomes across reboots. Neither is shown
+by '$SCRIPT_NAME health', which only alerts on the current value of
+overall health, temperature, and the killer attributes.
+
+ARGUMENTS
+  <disk>    Optional. Disk number (e.g. 3), short name (disk3) or
+            full path (/dev/disk3). If omitted, you get an
+            interactive picker listing all attached physical disks.
+
+NOTES
+  - Read-only.
+  - Auto-detects the right 'smartctl -d <type>' for USB/TB enclosures
+    (cached in ~/.cache/my-appleRAID-smart-dtypes).
+  - Refuses virtual devices (RAID/APFS containers - no SMART of their own).
+  - Requires smartctl: brew install smartmontools
+EOF
+                return 0
+                ;;
+            -V|--verbose|-D|--debug) ;;
+            -*) warn "Unknown option: $1" ;;
+            *)  arg="$1" ;;
+        esac
+        shift
+    done
+
+    if [ -z "$arg" ]; then
+        arg=$(pick_physical_disk_interactively "inspect (SMART)") || return 1
+    fi
+
+    dev=$(resolve_disk "$arg") || die "Invalid disk spec: $arg"
+    assert_whole_disk "$dev"
+
+    _smart_drilldown_one "${dev#/dev/}"
+}
+
+# ----------------------------------------------------------------------
 # Subcommand: wipe
 # ----------------------------------------------------------------------
 # Zero first and last 100 MB of a whole disk.
@@ -5121,19 +5664,11 @@ cmd_repair() {
 # ----------------------------------------------------------------------
 # Subcommand: test
 # ----------------------------------------------------------------------
-cmd_test() {
-    if [ $# -ge 1 ]; then
-        arg="$1"
-        uuid=""
-        for u in $(raid_list_uuids); do
-            [ "$u" = "$arg" ] && uuid="$u" && break
-        done
-        [ -z "$uuid" ] && uuid=$(raid_name_to_uuid "$arg")
-        [ -z "$uuid" ] && die "No RAID set matches '$arg'."
-        SELECTED_UUID="$uuid"
-    else
-        pick_raid_set
-    fi
+# Run T1..T5 on one RAID set UUID. Returns 0 if all tests pass, 1 if any
+# test fails, and dies (exits) only on hard structural errors (no virtual
+# device for the UUID, etc.) - those are bugs, not test failures.
+_cmd_test_one_uuid() {
+    SELECTED_UUID="$1"
 
     step "Testing RAID set $SELECTED_UUID"
     dev=$(raid_uuid_to_device "$SELECTED_UUID")
@@ -5254,10 +5789,94 @@ cmd_test() {
     echo
     if [ $fails -eq 0 ]; then
         ok "All tests passed."
+        return 0
     else
         err "$fails test(s) failed."
-        exit 1
+        return 1
     fi
+}
+
+cmd_test() {
+    eval "$(parse_global_flags "$@")"
+
+    test_all=0
+    arg=""
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -h|--help)
+                cat <<EOF
+Usage: $SCRIPT_NAME test [--all | <name|uuid>]
+
+Run non-destructive tests on a RAID set:
+  T1: overall RAID status is 'Online'
+  T2: every member is 'Online'
+  T3: virtual device exists
+  T4: APFS volume on the RAID is mounted
+  T5: write/read probe to the mounted volume
+
+ARGUMENTS
+  <name|uuid>   Test the named RAID set.
+  --all         Test every AppleRAID set on the system. Continues
+                through failures and exits non-zero if ANY set fails.
+                Mutually exclusive with <name|uuid>.
+  (omitted)     Interactive picker.
+EOF
+                return 0
+                ;;
+            --all) test_all=1 ;;
+            -V|--verbose|-D|--debug) ;;
+            -*) warn "Unknown option: $1" ;;
+            *)  arg="$1" ;;
+        esac
+        shift
+    done
+
+    if [ "$test_all" = "1" ] && [ -n "$arg" ]; then
+        die "--all and a RAID set argument are mutually exclusive."
+    fi
+
+    if [ "$test_all" = "1" ]; then
+        _uuids=$(raid_list_uuids)
+        [ -n "$_uuids" ] || die "No AppleRAID sets found."
+
+        _total=0
+        _failed=""
+        for _u in $_uuids; do
+            _total=$((_total + 1))
+            if ! _cmd_test_one_uuid "$_u"; then
+                _name=$(diskutil appleRAID list "$_u" 2>/dev/null \
+                        | awk -F': +' '/^Name:/ {print $2; exit}')
+                _failed="$_failed${_failed:+
+}$_u${_name:+ ($_name)}"
+            fi
+        done
+
+        echo
+        step "Aggregate test summary"
+        if [ -z "$_failed" ]; then
+            ok "All $_total RAID set(s) passed."
+            return 0
+        else
+            _nfail=$(printf '%s\n' "$_failed" | grep -c .)
+            err "$_nfail of $_total RAID set(s) failed:"
+            printf '%s\n' "$_failed" | sed 's/^/    - /'
+            exit 1
+        fi
+    fi
+
+    if [ -n "$arg" ]; then
+        uuid=""
+        for u in $(raid_list_uuids); do
+            [ "$u" = "$arg" ] && uuid="$u" && break
+        done
+        [ -z "$uuid" ] && uuid=$(raid_name_to_uuid "$arg")
+        [ -z "$uuid" ] && die "No RAID set matches '$arg'."
+        SELECTED_UUID="$uuid"
+    else
+        pick_raid_set
+    fi
+
+    _cmd_test_one_uuid "$SELECTED_UUID" || exit 1
 }
 
 # ----------------------------------------------------------------------
@@ -5539,6 +6158,9 @@ _my-appleRAID() {
         'info:Show detailed info for a RAID set'
         'status:Short status summary (Online / Degraded / ...)'
         'watch:Live-refreshing status'
+        'blink:Pulse a disk activity LED to identify the physical drive'
+        'eject:Spin down + power off a physical disk so it can be safely disconnected'
+        'smart:Detailed SMART drill-down for one disk (history + error log + self-tests)'
         'wipe:Zero first + last 100 MB of /dev/diskN'
         'verify-wipe:Check that first + last 100 MB are zeros'
         'create:Create a new mirror from two disk numbers'
@@ -5582,13 +6204,18 @@ _my-appleRAID() {
                 help|--help|-h)
                     _describe 'help topic' commands
                     ;;
-                info|status|watch|destroy|rename|repair|test)
+                info|status|watch|destroy|rename|repair)
                     _message 'RAID set name or UUID'
+                    ;;
+                test)
+                    _arguments \
+                        '--all[Test every AppleRAID set; non-zero exit if any fail]' \
+                        '*: :_message "RAID set name or UUID"'
                     ;;
                 migrate-softraid|release-softraid)
                     _message 'SoftRAID volume name'
                     ;;
-                wipe|verify-wipe)
+                wipe|verify-wipe|blink|eject|smart)
                     _message 'disk number (e.g. 3 for /dev/disk3)'
                     ;;
                 create)
@@ -5601,7 +6228,8 @@ _my-appleRAID() {
                     _arguments \
                         '--dry-run[Perform checks, no alerts]' \
                         '--once[Bypass rate limits (testing)]' \
-                        '-v[Debug logging for this run]'
+                        '-v[Debug logging for this run]' \
+                        '--disk[SMART drill-down for one disk (skip daemon pass)]:disk number:'
                     ;;
                 baseline)
                     _arguments \
@@ -5714,6 +6342,9 @@ main() {
         info)               cmd_info "$@" ;;
         status)             cmd_status "$@" ;;
         watch)              cmd_watch "$@" ;;
+        blink)              cmd_blink "$@" ;;
+        eject)              cmd_eject "$@" ;;
+        smart)              cmd_smart "$@" ;;
         wipe)               cmd_wipe "$@" ;;
         verify-wipe)        cmd_verify_wipe "$@" ;;
         create)             cmd_create "$@" ;;
