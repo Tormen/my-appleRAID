@@ -2827,16 +2827,46 @@ softraid_volume_member_disks() {
     '
 }
 
-# True if softraidtool knows about a volume by this name.
+# True if softraidtool knows about a volume by this name. NOTE: this
+# is intentionally permissive - softraidtool's CLI also resolves names
+# of AppleRAID and plain (Apple Disk Utility) volumes, so any caller
+# that intends to issue destructive commands MUST also call
+# softraid_volume_is_softraid below to confirm it is actually a
+# SoftRAID-managed volume before proceeding.
 softraid_volume_exists() {
     out=$(softraid_tool volume "$1" info 2>&1)
     case "$out" in
         *"could not find"*|*"is not"*|*"unrecognized"*|*"error"*) return 1 ;;
     esac
     case "$out" in
-        *"Mountpoint:"*) return 0 ;;
+        *"Mountpoint:"*|*"Total Bytes:"*) return 0 ;;
     esac
     return 1
+}
+
+# True ONLY if softraidtool reports the named volume is actually
+# SoftRAID-managed (i.e. the info output contains 'Volume is SoftRAID').
+# Anything else - AppleRAID, Apple Disk Utility, bootable, etc. - returns
+# false. This is the safety gate for any command that would invoke
+# 'softraidtool volume X delete' or 'softraidtool disk Y quickzero',
+# both of which softraidtool will happily execute against AppleRAID
+# member disks if asked, with catastrophic consequences.
+softraid_volume_is_softraid() {
+    out=$(softraid_tool volume "$1" info 2>&1)
+    case "$out" in
+        *"is not unique"*|*"could not find"*|*"is not "*) return 1 ;;
+    esac
+    case "$out" in
+        *"Volume is SoftRAID"*) return 0 ;;
+    esac
+    return 1
+}
+
+# Convenience: extract the 'Volume is X' classification line for
+# diagnostic output (e.g. 'AppleRAID', 'Apple Disk Utility', etc.).
+softraid_volume_flavor() {
+    softraid_tool volume "$1" info 2>&1 \
+        | awk '/^Volume is / {sub(/^Volume is[[:space:]]*/,""); print; exit}'
 }
 
 # Orchestrate the SoftRAID-side release of one named volume:
@@ -2861,6 +2891,16 @@ softraid_release_volume() {
     vol="$1"; shift
     [ $# -ge 1 ] || die "softraid_release_volume: no member disks given"
     softraid_tool_available || die "SoftRAIDTool not found at: $SOFTRAID_TOOL"
+
+    # Defense-in-depth safety gate. softraidtool resolves names of
+    # AppleRAID and plain HFS volumes too; refuse anything that is
+    # not actually 'Volume is SoftRAID' so we can never delete or
+    # quickzero the wrong thing.
+    if ! softraid_volume_is_softraid "$vol"; then
+        flavor=$(softraid_volume_flavor "$vol")
+        err "Refusing to release: \"$vol\" is not a SoftRAID volume (softraidtool reports: ${flavor:-unknown})."
+        return 1
+    fi
 
     # The function emits two kinds of output:
     #   - VISIBLE PROGRESS: info/run/ok/warn -- normally to stdout
@@ -3408,6 +3448,22 @@ SoftRAID does not appear to be installed."
     if ! softraid_volume_exists "$vol"; then
         die "SoftRAID does not know a volume named \"$vol\". List volumes with:
     sudo \"$SOFTRAID_TOOL\" volume all info"
+    fi
+
+    # SAFETY GATE: softraidtool resolves AppleRAID and plain HFS volumes
+    # by name too, and will happily 'delete' them or 'quickzero' their
+    # member disks if asked. Refuse anything that is not 'Volume is
+    # SoftRAID' - this protects an AppleRAID set or a regular volume
+    # that happens to share its name with a (now-stale) SoftRAID label
+    # from being torn down by accident.
+    if ! softraid_volume_is_softraid "$vol"; then
+        flavor=$(softraid_volume_flavor "$vol")
+        err "Volume \"$vol\" is NOT a SoftRAID volume."
+        err "softraidtool reports it as: ${flavor:-(unknown)}"
+        err "Refusing to run destructive teardown against a non-SoftRAID volume."
+        info "If you meant a different SoftRAID volume, list them with:"
+        info "    sudo \"$SOFTRAID_TOOL\" volume all info | grep -nE '^Info for \"|Volume is SoftRAID'"
+        die "Aborted - safety check (not a SoftRAID volume)."
     fi
 
     level=$(softraid_volume_raid_level "$vol")
