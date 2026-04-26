@@ -2728,7 +2728,7 @@ softraid_extension_loaded() {
 
 # ----------------------------------------------------------------------
 # softraidtool wrappers - active SoftRAID-side teardown for migration.
-# Used by cmd_migrate_softraid Step 3b and cmd_release_softraid.
+# Used by cmd_migrate_softraid (probe + Step 5 execution) and cmd_release_softraid.
 #
 # These functions DO modify SoftRAID state (delete volumes, initialize
 # member disks). They exist so that migrate-softraid can run end-to-end
@@ -3166,9 +3166,11 @@ Before proceeding, confirm:
       remain managed by SoftRAID during this migration
 
 NOTE: SoftRAID-side cleanup (volume delete + member initialize) is now
-done automatically in Step 3b - you no longer have to do it manually
-in SoftRAID.app. You will get an explicit, single confirmation prompt
-before any SoftRAID state is modified.
+done automatically as part of Step 4's final plan - you no longer
+have to do it manually in SoftRAID.app. You will get exactly ONE
+confirmation prompt covering the entire destructive pipeline (SoftRAID
+release + disk wipe + AppleRAID create); after that there are no
+further prompts.
 EOF
     echo
     confirm "All three items above are done?" || die "Aborted. Complete the checklist first."
@@ -3208,29 +3210,26 @@ EOF
     echo
 
     # ------------------------------------------------------------------
-    # Step 3b: SoftRAID state probe + auto-release.
-    #
-    # If the chosen disks are still members of an active SoftRAID volume
-    # (the most common reason 'do_auto_wipe' would fail with "Resource
-    # busy" - the SoftRAID kext is asserting an exclusive write claim),
-    # tear down the SoftRAID volume here so the wipe phase can succeed.
-    #
-    # Decision tree:
-    #   - neither disk under SoftRAID                     -> skip (legacy path)
-    #   - exactly one disk under SoftRAID                 -> die (asymmetric state)
-    #   - both disks belong to DIFFERENT SoftRAID volumes -> die
-    #   - shared volume is RAID 1 (mirror)                -> auto-release
-    #   - shared volume is RAID 0/4/5/10 / nonraid        -> die (not migratable
-    #     by this command); point at 'release-softraid' instead.
+    # SoftRAID state probe (silent). If the chosen disks are still
+    # members of an active SoftRAID volume, we add the SoftRAID-side
+    # teardown to the consolidated Step 4 plan. Asymmetric state, two
+    # unrelated volumes, or a non-mirror RAID level abort here before
+    # the user sees any plan. The probe runs softraidtool a few times
+    # and can take a couple of seconds; surface that as a single info
+    # line so it's not mistaken for a hang.
     # ------------------------------------------------------------------
+    info "Probing SoftRAID state for selected disks (this may take a few seconds)..."
     bsd1=${dev1#/dev/}
     bsd2=${dev2#/dev/}
     sr_member1=no; sr_member2=no
     softraid_disk_is_member "$bsd1" && sr_member1=yes
     softraid_disk_is_member "$bsd2" && sr_member2=yes
 
+    sr_release_needed=no
+    sr_vol=""
+    sr_disable_safeguard=no
+    sr_unmount=no
     if [ "$sr_member1" = "yes" ] || [ "$sr_member2" = "yes" ]; then
-        step "Step 3b: SoftRAID state probe"
         if [ "$sr_member1" != "$sr_member2" ]; then
             err "Asymmetric SoftRAID state:"
             err "  /dev/$bsd1 SoftRAID-controlled: $sr_member1"
@@ -3250,11 +3249,9 @@ EOF
         fi
         sr_vol="$vol1"
         sr_level=$(softraid_volume_raid_level "$sr_vol")
-        info "Both disks are members of SoftRAID volume \"$sr_vol\" (level: ${sr_level:-?})."
 
         case "$sr_level" in
-            raid1)
-                ;;
+            raid1) ;;
             "")
                 die "Could not determine RAID level for volume \"$sr_vol\". Inspect with:
     sudo \"$SOFTRAID_TOOL\" volume \"$sr_vol\" info"
@@ -3269,27 +3266,62 @@ EOF
                 ;;
         esac
 
-        explain "About to release the SoftRAID side before the wipe phase:"
-        if softraid_volume_safeguard_enabled "$sr_vol"; then
-            explain "  - softraidtool volume \"$sr_vol\" disablesafeguard"
-        fi
-        if softraid_volume_mounted "$sr_vol"; then
-            explain "  - softraidtool volume \"$sr_vol\" unmount"
-        fi
-        explain "  - softraidtool volume \"$sr_vol\" delete    (destroys the SoftRAID volume)"
-        explain "  - softraidtool disk $bsd1 initialize       (clears SoftRAID metadata)"
-        explain "  - softraidtool disk $bsd2 initialize       (clears SoftRAID metadata)"
-        echo
-        warn "This is destructive: the SoftRAID volume \"$sr_vol\" will be gone after this."
-        warn "Step 2 already confirmed that the data is backed up."
-        echo
-        confirm "Release SoftRAID volume \"$sr_vol\" and initialize both members?" \
-            || die "Aborted at SoftRAID release."
-        echo
+        sr_release_needed=yes
+        softraid_volume_safeguard_enabled "$sr_vol" && sr_disable_safeguard=yes
+        softraid_volume_mounted "$sr_vol" && sr_unmount=yes
+    fi
 
-        # Run the release. Captures NEW BSD ids (kernel may renumber
-        # disks after 'disk initialize'); update dev1/dev2/n1/n2 so
-        # the rest of the flow uses the correct device nodes.
+    # ------------------------------------------------------------------
+    # Step 4: ONE consolidated plan + ONE confirmation. Lists every
+    # destructive action that the rest of the run will perform, in the
+    # exact order it will execute them - SoftRAID-side teardown (if
+    # required), 100 MB wipes front + back of each disk, AppleRAID
+    # mirror create. After 'yes' here there are no further prompts.
+    # ------------------------------------------------------------------
+    step "Step 4: Final plan (single confirmation)"
+    info "About to perform the following pipeline:"
+    plan_step=1
+    if [ "$sr_release_needed" = "yes" ]; then
+        info "  Release SoftRAID volume \"$sr_vol\":"
+        if [ "$sr_disable_safeguard" = "yes" ]; then
+            info "    $plan_step. softraidtool volume \"$sr_vol\" disablesafeguard"
+            plan_step=$((plan_step + 1))
+        fi
+        if [ "$sr_unmount" = "yes" ]; then
+            info "    $plan_step. softraidtool volume \"$sr_vol\" unmount"
+            plan_step=$((plan_step + 1))
+        fi
+        info "    $plan_step. softraidtool volume \"$sr_vol\" delete           (DESTROYS the SoftRAID volume)"
+        plan_step=$((plan_step + 1))
+        info "    $plan_step. softraidtool disk $bsd1 initialize               (clears SoftRAID metadata)"
+        plan_step=$((plan_step + 1))
+        info "    $plan_step. softraidtool disk $bsd2 initialize               (clears SoftRAID metadata)"
+        plan_step=$((plan_step + 1))
+    fi
+    info "  Build AppleRAID mirror:"
+    info "    $plan_step. WIPE first + last 100 MB of $dev1"
+    plan_step=$((plan_step + 1))
+    info "    $plan_step. WIPE first + last 100 MB of $dev2"
+    plan_step=$((plan_step + 1))
+    info "    $plan_step. diskutil appleRAID create mirror \"$new_name\" APFS $dev1 $dev2"
+    echo
+    if [ "$sr_release_needed" = "yes" ]; then
+        warn "DESTRUCTIVE: SoftRAID volume \"$sr_vol\" will be deleted, both disks repartitioned,"
+        warn "             then registered as members of new AppleRAID mirror \"$new_name\"."
+    else
+        warn "DESTRUCTIVE: both disks will be repartitioned and registered as members of"
+        warn "             new AppleRAID mirror \"$new_name\"."
+    fi
+    warn "This is the ONLY confirmation. Step 2 already confirmed the data is backed up."
+    echo
+    confirm "PROCEED with the entire pipeline?" || die "Aborted."
+    echo
+
+    # ------------------------------------------------------------------
+    # Step 5: execute the plan top-to-bottom, no further prompts.
+    # ------------------------------------------------------------------
+    step "Step 5: Executing pipeline"
+    if [ "$sr_release_needed" = "yes" ]; then
         new_bsds=$(softraid_release_volume "$sr_vol" "$bsd1" "$bsd2") \
             || die "SoftRAID release failed - see above for details."
         new_bsd1=$(printf '%s\n' "$new_bsds" | awk 'NF {print; exit}')
@@ -3305,20 +3337,10 @@ EOF
         echo
     fi
 
-    step "Step 4: Confirm plan"
-    info "About to:"
-    info "  - WIPE first + last 100 MB of $dev1"
-    info "  - WIPE first + last 100 MB of $dev2"
-    info "  - Create AppleRAID mirror '$new_name' (APFS) from $dev1 + $dev2"
-    echo
-    confirm "Proceed?" || die "Aborted."
-    echo
-
-    step "Step 5: Handing off to '$SCRIPT_NAME create' with prepared disks"
-    # cmd_create will do its own confirmations. We've pre-confirmed here,
-    # but the existing create flow's safety prompts are valuable and we
-    # don't short-circuit them.
-    cmd_create "$new_name" "$n1" "$n2"
+    # cmd_create handles wipe + AppleRAID create. _PRECONFIRMED=1 tells
+    # it to skip its own internal "PROCEED?" prompt so we honour the
+    # single-confirmation contract from Step 4.
+    _PRECONFIRMED=1 cmd_create "$new_name" "$n1" "$n2"
 
     echo
     ok "Migration complete for mirror '$new_name'."
@@ -3931,11 +3953,13 @@ ${C_BOLD}COMMANDS${C_RESET}
                               members, automatically tear down the
                               SoftRAID volume (Safeguard-aware), wipe
                               the disks, and create an AppleRAID mirror
-                              in their place. Run once per mirror.
-                              With [volume] (e.g. "2.OLD"), pre-selects
-                              that SoftRAID volume and auto-fills its
-                              member disks. Only supports RAID 1; for
-                              other levels see release-softraid.
+                              in their place. ONE consolidated plan +
+                              ONE confirmation for the entire pipeline.
+                              Run once per mirror. With [volume] (e.g.
+                              "2.OLD"), pre-selects that SoftRAID
+                              volume and auto-fills its member disks.
+                              Only supports RAID 1; for other levels
+                              see release-softraid.
   ${C_CYAN}release-softraid${C_RESET} <volume>     Tear down a single SoftRAID volume without
                               creating an AppleRAID set. Disables
                               Safeguard, unmounts, deletes the volume,
@@ -4865,7 +4889,11 @@ cmd_create() {
     explain "The new mirror will appear as a virtual /dev/diskN device with an APFS volume named '$name'."
     echo
 
-    confirm "PROCEED? This erases BOTH disks." || die "Aborted."
+    if [ "${_PRECONFIRMED:-0}" = "1" ]; then
+        info "Pre-confirmed by caller (e.g. migrate-softraid); skipping inner confirmation."
+    else
+        confirm "PROCEED? This erases BOTH disks." || die "Aborted."
+    fi
 
     step "Wipe phase: $dev1"
     # Call wipe but auto-confirm by echoing yes into it -- cleaner to call internals directly.
