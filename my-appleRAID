@@ -4153,8 +4153,23 @@ appleraid_volume_info() {
     bundle=$(printf '%s\n' "$dinfo" | awk -F': *' '/^[[:space:]]*Type \(Bundle\):/ {print $2; exit}')
     case "$bundle" in
         apfs)
-            innervol=$(diskutil list "/dev/$raidnode" 2>/dev/null \
-                | awk '/APFS Volume/ {print $NF; exit}')
+            # APFS-on-AppleRAID: the APFS layer creates a SEPARATE
+            # synthesized disk (e.g. disk12) whose Physical Store is
+            # the AppleRAID node (disk11). The mounted APFS volume
+            # lives there as disk12s1, NOT under disk11. Walk the
+            # full 'diskutil list' to find it.
+            innervol=$(diskutil list 2>/dev/null | awk -v phys="$raidnode" '
+                /^\/dev\/disk[0-9]+ \(synthesized\)/ { in_synth=1; found=0; next }
+                /^\/dev\//                            { in_synth=0; found=0; next }
+                in_synth && /Physical Store/ {
+                    for (i=1; i<=NF; i++) {
+                        s=$i; gsub(/,$/, "", s)
+                        if (s == phys) { found=1 }
+                    }
+                    next
+                }
+                in_synth && found && /APFS Volume/ { print $NF; exit }
+            ')
             if [ -n "$innervol" ]; then
                 vinfo=$(diskutil info "/dev/$innervol" 2>/dev/null)
                 mp=$(printf '%s\n' "$vinfo" | awk -F': *' '/^[[:space:]]*Mount Point:/ {print $2; exit}')
@@ -4185,7 +4200,11 @@ gather_appleraid_rows() {
     diskutil appleRAID list 2>/dev/null | awk '
         function flush() {
             if (have) {
-                printf "Apple|%s|%s|%s|%s|||||%s|%s|\n",
+                # Schema: source|level|state|devnode|size|free|mount|fs|name|members|flags
+                # Apple emits source(1) level(2) state(3) devnode(4) size(5)
+                # then 3 empties (free/mount/fs) then name(9) members(10)
+                # then 1 trailing empty (flags) -> 11 fields, 10 pipes.
+                printf "Apple|%s|%s|%s|%s||||%s|%s|\n",
                        type, status, devnode, size, name, members
             }
             have=0; type=""; name=""; status=""; size=""; devnode=""; members=""
