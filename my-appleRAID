@@ -4173,10 +4173,7 @@ appleraid_volume_info() {
             if [ -n "$innervol" ]; then
                 vinfo=$(diskutil info "/dev/$innervol" 2>/dev/null)
                 mp=$(printf '%s\n' "$vinfo" | awk -F': *' '/^[[:space:]]*Mount Point:/ {print $2; exit}')
-                free=$(printf '%s\n' "$vinfo" \
-                    | awk '/^[[:space:]]*Volume Free Space:/ {
-                        sub(/.*\(/,""); gsub(/[^0-9].*/,""); print; exit
-                    }')
+                free=$(free_bytes_for_mount "$mp")
                 printf 'APFS|%s|%s\n' "${mp:--}" "${free:-}"
                 return
             fi
@@ -4186,11 +4183,19 @@ appleraid_volume_info() {
     esac
     fs=$(printf '%s\n' "$dinfo" | awk -F': *' '/^[[:space:]]*File System Personality:/ {print $2; exit}')
     mp=$(printf '%s\n' "$dinfo" | awk -F': *' '/^[[:space:]]*Mount Point:/ {print $2; exit}')
-    free=$(printf '%s\n' "$dinfo" \
-        | awk '/^[[:space:]]*Volume Free Space:/ {
-            sub(/.*\(/,""); gsub(/[^0-9].*/,""); print; exit
-          }')
+    free=$(free_bytes_for_mount "$mp")
     printf '%s|%s|%s\n' "${fs:-?}" "${mp:--}" "${free:-}"
+}
+
+# Free space in bytes for a mount point. df is reliable across APFS,
+# HFS+, etc. - 'diskutil info Volume Free Space:' is missing on APFS
+# volumes, and 'Container Free Space:' is per-container, not per-volume.
+free_bytes_for_mount() {
+    mp="$1"
+    [ -n "$mp" ] && [ "$mp" != "-" ] && [ -d "$mp" ] || return 0
+    # df -k: 1024-byte blocks. Available column is the 4th in the
+    # data row (POSIX layout, used by macOS df by default).
+    df -k "$mp" 2>/dev/null | awk 'NR==2 {printf "%.0f\n", $4 * 1024; exit}'
 }
 
 # Gather AppleRAID rows. Outputs partial rows; fs/mount/free are
@@ -5543,11 +5548,31 @@ _my-appleRAID "$@"
 COMPLETION_EOF
 
     # Idempotent: only update if content changed.
+    _changed=0
     if [ -r "$_comp_file" ] && cmp -s "$_tmp" "$_comp_file" 2>/dev/null; then
         rm -f "$_tmp"
     else
         mkdir -p "$_comp_dir" 2>/dev/null || { rm -f "$_tmp"; return 0; }
         mv "$_tmp" "$_comp_file" 2>/dev/null || { rm -f "$_tmp"; return 0; }
+        _changed=1
+    fi
+    # mktemp creates files at mode 600; compinit's security check then
+    # refuses to load them. Match the conventional 644 used by other
+    # completion files (e.g. _my-plex). Detect a stale 600 leftover
+    # from earlier versions and treat that as 'changed' too, so the
+    # zcompdump rebuild below kicks in.
+    if [ -r "$_comp_file" ]; then
+        case "$(stat -f '%Lp' "$_comp_file" 2>/dev/null)" in
+            644) ;;
+            *)   chmod 644 "$_comp_file" 2>/dev/null && _changed=1 ;;
+        esac
+    fi
+
+    # When the completion file was created or updated, invalidate the
+    # compinit dump so the next shell rebuilds it - otherwise zsh
+    # keeps reusing the stale cache and the new file is ignored.
+    if [ "$_changed" = "1" ]; then
+        rm -f "$HOME"/.zcompdump* 2>/dev/null || true
     fi
 
     # Patch ~/.zshrc to add the fpath entry, but only once.
