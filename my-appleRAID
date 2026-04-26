@@ -2730,8 +2730,8 @@ softraid_extension_loaded() {
 # softraidtool wrappers - active SoftRAID-side teardown for migration.
 # Used by cmd_migrate_softraid (probe + Step 5 execution) and cmd_release_softraid.
 #
-# These functions DO modify SoftRAID state (delete volumes, initialize
-# member disks). They exist so that migrate-softraid can run end-to-end
+# These functions DO modify SoftRAID state (delete volumes, quickzero
+# member disks to release them). They exist so that migrate-softraid can run end-to-end
 # without the user having to do the SoftRAID-side cleanup by hand in
 # SoftRAID.app, and so that the rare case of an unmigratable RAID-N
 # volume can still be released via 'release-softraid'.
@@ -2893,22 +2893,24 @@ softraid_release_volume() {
 
         for d in "$@"; do
             [ -n "$d" ] || continue
-            info "Initializing /dev/$d - clearing SoftRAID metadata, fresh GPT."
-            run sudo "$SOFTRAID_TOOL" disk "$d" initialize \
-                || die "softraidtool disk $d initialize failed"
+            # IMPORTANT: 'disk initialize' is the WRONG primitive here -
+            # it re-initialises the disk as a FRESH SoftRAID-controlled
+            # disk (assigns a new SoftRAID ID, keeps Driver Type=SoftRAID),
+            # leaving the kext claiming the disk and synthesising a
+            # phantom 'stuff A/B'-labelled mirror device.
+            #
+            # 'disk quickzero' writes zeros to the first and last 100
+            # sectors, which clears the SoftRAID disk-level signature.
+            # On the next probe the kext stops recognising the disk as
+            # a SoftRAID member and releases it, so subsequent dd /
+            # diskutil writes (used by do_auto_wipe) succeed.
+            info "Releasing /dev/$d from SoftRAID (disk quickzero)."
+            run sudo "$SOFTRAID_TOOL" disk "$d" quickzero \
+                || die "softraidtool disk $d quickzero failed"
         done
 
-        # softraidtool's 'disk initialize' rewrites the GPT in place but
-        # does not change the kernel BSD id of the physical device, so
-        # disk14 stays disk14, disk18 stays disk18 etc. Earlier versions
-        # of this code tried to re-resolve by serial number via
-        # 'diskutil info' - but diskutil info on whole disks does NOT
-        # include a 'Serial Number:' line (only smartctl / softraidtool
-        # expose that field), so the lookup always failed. Just verify
-        # the disks are still visible after a brief settle window and
-        # emit them as the result.
         echo
-        info "Verifying disks present after initialize..."
+        info "Verifying disks present after quickzero..."
         for d in "$@"; do
             [ -n "$d" ] || continue
             j=0
@@ -3165,7 +3167,7 @@ Before proceeding, confirm:
   [ ] The OTHER SoftRAID mirrors on this Mac are still intact and will
       remain managed by SoftRAID during this migration
 
-NOTE: SoftRAID-side cleanup (volume delete + member initialize) is now
+NOTE: SoftRAID-side cleanup (volume delete + member quickzero) is now
 done automatically as part of Step 4's final plan - you no longer
 have to do it manually in SoftRAID.app. You will get exactly ONE
 confirmation prompt covering the entire destructive pipeline (SoftRAID
@@ -3259,7 +3261,7 @@ EOF
             *)
                 err "Volume \"$sr_vol\" is RAID level '$sr_level' - not a mirror."
                 err "'migrate-softraid' only supports RAID 1 (mirrors)."
-                info "To just tear down a non-mirror SoftRAID volume (delete + initialize"
+                info "To just tear down a non-mirror SoftRAID volume (delete + quickzero"
                 info "all its members) without creating an AppleRAID set, run:"
                 info "    $SCRIPT_NAME release-softraid \"$sr_vol\""
                 die "Aborted - non-mirror SoftRAID volume."
@@ -3293,9 +3295,9 @@ EOF
         fi
         info "    $plan_step. softraidtool volume \"$sr_vol\" delete           (DESTROYS the SoftRAID volume)"
         plan_step=$((plan_step + 1))
-        info "    $plan_step. softraidtool disk $bsd1 initialize               (clears SoftRAID metadata)"
+        info "    $plan_step. softraidtool disk $bsd1 quickzero               (releases disk from SoftRAID)"
         plan_step=$((plan_step + 1))
-        info "    $plan_step. softraidtool disk $bsd2 initialize               (clears SoftRAID metadata)"
+        info "    $plan_step. softraidtool disk $bsd2 quickzero               (releases disk from SoftRAID)"
         plan_step=$((plan_step + 1))
     fi
     info "  Build AppleRAID mirror:"
@@ -3360,7 +3362,7 @@ EOF
 #   1. Disable Safeguard (if enabled)
 #   2. Unmount the volume (if mounted)
 #   3. Delete the volume
-#   4. Initialize each member disk to fresh GPT (clears SoftRAID metadata)
+#   4. Quickzero each member disk (releases it from SoftRAID control)
 #   5. Re-resolve BSD ids by serial and print the final mapping
 # ----------------------------------------------------------------------
 cmd_release_softraid() {
@@ -3376,7 +3378,7 @@ Tear down a single SoftRAID volume completely:
   1. Disable Safeguard (if enabled)
   2. Unmount the volume (if mounted)
   3. Delete the volume from SoftRAID
-  4. Initialize each member disk (clears SoftRAID metadata, fresh GPT)
+  4. Quickzero each member disk (releases it from SoftRAID's control)
   5. Print the final BSD ids of the released disks
 
 This does NOT create an AppleRAID set on top - use 'create' for that, or
@@ -3440,7 +3442,7 @@ SoftRAID does not appear to be installed."
     fi
     explain "  - softraidtool volume \"$vol\" delete    (DESTROYS the volume)"
     printf '%s\n' "$members" | awk 'NF' | while read -r d; do
-        explain "  - softraidtool disk $d initialize        (clears SoftRAID metadata)"
+        explain "  - softraidtool disk $d quickzero        (releases disk from SoftRAID)"
     done
     echo
     warn "DESTRUCTIVE: volume \"$vol\" and all its data will be gone."
