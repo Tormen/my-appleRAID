@@ -2727,6 +2727,233 @@ softraid_extension_loaded() {
 }
 
 # ----------------------------------------------------------------------
+# softraidtool wrappers - active SoftRAID-side teardown for migration.
+# Used by cmd_migrate_softraid Step 3b and cmd_release_softraid.
+#
+# These functions DO modify SoftRAID state (delete volumes, initialize
+# member disks). They exist so that migrate-softraid can run end-to-end
+# without the user having to do the SoftRAID-side cleanup by hand in
+# SoftRAID.app, and so that the rare case of an unmigratable RAID-N
+# volume can still be released via 'release-softraid'.
+# ----------------------------------------------------------------------
+
+# Path to the SoftRAIDTool CLI shipped by SoftRAID. Quote "$SOFTRAID_TOOL"
+# at every call site - the path contains a literal space.
+SOFTRAID_TOOL="/Library/Application Support/SoftRAID/SoftRAIDTool"
+
+softraid_tool_available() {
+    [ -x "$SOFTRAID_TOOL" ]
+}
+
+# Run softraidtool, capturing stdout+stderr; never let the caller die on
+# softraidtool returning non-zero (callers branch on output).
+softraid_tool() {
+    "$SOFTRAID_TOOL" "$@" 2>&1
+}
+
+# Extract the first "  <key>: <value>" line from softraidtool info output.
+_sr_info_field() {
+    awk -v k="$1" '
+        $0 ~ "^[[:space:]]*"k"[[:space:]]*:" {
+            sub("^[[:space:]]*"k"[[:space:]]*:[[:space:]]*", "")
+            print
+            exit
+        }
+    '
+}
+
+# True if softraidtool reports "diskN" as a SoftRAID-controlled disk.
+softraid_disk_is_member() {
+    out=$(softraid_tool disk "$1" info 2>&1)
+    case "$out" in
+        *"is not a SoftRAID disk"*|*"could not find"*|*"unable to"*) return 1 ;;
+    esac
+    case "$out" in
+        *"Driver Type:"*"SoftRAID"*|*"SoftRAID ID:"*) return 0 ;;
+    esac
+    return 1
+}
+
+# Newline-separated list of SoftRAID volume names that disk <bsd> belongs
+# to (from the "Volumes on diskN:" section). Empty if none.
+softraid_disk_volumes() {
+    softraid_tool disk "$1" info 2>&1 | awk '
+        /^Volumes on / {invol=1; next}
+        invol && /^[[:space:]]*"/ {
+            sub(/^[[:space:]]*"/, "")
+            sub(/".*/, "")
+            print
+            next
+        }
+        invol && NF==0 {invol=0}
+    '
+}
+
+# Disk serial as reported by softraidtool. Stable across re-probes,
+# unlike the BSD diskN id, so we can recover the disk after initialize.
+softraid_disk_serial() {
+    softraid_tool disk "$1" info 2>&1 | _sr_info_field "Serial Number"
+}
+
+# Volume RAID level normalised: raid0 / raid1 / raid4 / raid5 / raid10 /
+# nonraid (lowercase, no spaces). Empty on miss.
+softraid_volume_raid_level() {
+    softraid_tool volume "$1" info 2>&1 \
+        | _sr_info_field "RAID level" \
+        | tr '[:upper:]' '[:lower:]' \
+        | sed -e 's/[[:space:]]\{1,\}//g' -e 's/,.*//'
+}
+
+# True if Volume Safeguard is currently enabled.
+softraid_volume_safeguard_enabled() {
+    state=$(softraid_tool volume "$1" info 2>&1 | _sr_info_field "Volume Safeguard")
+    case "$state" in
+        enabled|Enabled|ENABLED) return 0 ;;
+    esac
+    return 1
+}
+
+# True if the volume is currently mounted somewhere.
+softraid_volume_mounted() {
+    mp=$(softraid_tool volume "$1" info 2>&1 | _sr_info_field "Mountpoint")
+    case "$mp" in
+        ""|"-"|"none"|"None"|"not mounted"*) return 1 ;;
+    esac
+    return 0
+}
+
+# BSD disk ids ("diskN") of every member of the named volume, in the
+# order softraidtool prints them.
+softraid_volume_member_disks() {
+    softraid_tool volume "$1" info 2>&1 | awk '
+        /^Disks used for this volume:/ {indisks=1; next}
+        indisks && /^bsd disk:/        {next}
+        indisks && /^disk[0-9]+/       {print $1; next}
+        indisks && NF==0               {indisks=0}
+    '
+}
+
+# True if softraidtool knows about a volume by this name.
+softraid_volume_exists() {
+    out=$(softraid_tool volume "$1" info 2>&1)
+    case "$out" in
+        *"could not find"*|*"is not"*|*"unrecognized"*|*"error"*) return 1 ;;
+    esac
+    case "$out" in
+        *"Mountpoint:"*) return 0 ;;
+    esac
+    return 1
+}
+
+# Find the current /dev/diskN whose serial matches $1. Used after
+# 'softraidtool disk <X> initialize' to recover the (possibly
+# renumbered) BSD node. Prints "diskN" without /dev/ prefix.
+find_disk_by_serial() {
+    serial="$1"
+    [ -n "$serial" ] || return 1
+    list_all_physical_disks | while read -r d; do
+        [ -n "$d" ] || continue
+        s=$(diskutil info "/dev/$d" 2>/dev/null \
+            | awk -F': *' '/^[[:space:]]*Serial Number:/ {print $2; exit}')
+        [ "$s" = "$serial" ] && { echo "$d"; return 0; }
+    done
+}
+
+# Wait up to N seconds for a disk with the given serial to appear in
+# `diskutil list`. Returns the BSD id on success.
+wait_for_disk_by_serial() {
+    serial="$1"
+    timeout="${2:-30}"
+    i=0
+    while [ "$i" -lt "$timeout" ]; do
+        d=$(find_disk_by_serial "$serial")
+        if [ -n "$d" ]; then echo "$d"; return 0; fi
+        sleep 1
+        i=$((i+1))
+    done
+    return 1
+}
+
+# Orchestrate the SoftRAID-side release of one named volume:
+#
+#   1. (if Safeguard enabled)  volume <V> disablesafeguard
+#   2. (if mounted)            volume <V> unmount
+#   3.                         volume <V> delete
+#   4. for each member disk:   disk <D> initialize
+#   5. re-resolve each member's BSD id by serial (kernel may renumber)
+#
+# Args:
+#   $1   volume name (as shown by softraidtool)
+#   $2+  one or more "diskN" ids; serials are captured BEFORE
+#        initialize so we can find them again afterwards
+#
+# Stdout: NEW BSD ids (one per line) in the same order as the input
+# disks. Caller can capture and reassign dev1/dev2.
+#
+# On any failure: prints a clear error and dies. No partial-success
+# return path - the cache invariant is "fully released or aborted".
+softraid_release_volume() {
+    vol="$1"; shift
+    [ $# -ge 1 ] || die "softraid_release_volume: no member disks given"
+    softraid_tool_available || die "SoftRAIDTool not found at: $SOFTRAID_TOOL"
+
+    # Snapshot serials before we touch anything; used for re-resolution
+    # after 'disk initialize' may have renumbered the BSD ids.
+    members=""
+    for d in "$@"; do
+        s=$(softraid_disk_serial "$d")
+        if [ -z "$s" ]; then
+            s=$(diskutil info "/dev/$d" 2>/dev/null \
+                | awk -F': *' '/^[[:space:]]*Serial Number:/ {print $2; exit}')
+        fi
+        [ -n "$s" ] || die "Could not determine serial number for /dev/$d - cannot recover BSD id after initialize."
+        members="${members}${d}|${s}
+"
+    done
+
+    if softraid_volume_safeguard_enabled "$vol"; then
+        info "Volume \"$vol\" has Safeguard enabled - disabling first."
+        run sudo "$SOFTRAID_TOOL" volume "$vol" disablesafeguard \
+            || die "Failed to disable Safeguard on \"$vol\""
+    fi
+
+    if softraid_volume_mounted "$vol"; then
+        info "Volume \"$vol\" is mounted - unmounting first."
+        run sudo "$SOFTRAID_TOOL" volume "$vol" unmount \
+            || warn "Volume unmount returned non-zero (delete will retry)."
+    fi
+
+    info "Deleting SoftRAID volume \"$vol\"."
+    run sudo "$SOFTRAID_TOOL" volume "$vol" delete \
+        || die "softraidtool volume \"$vol\" delete failed"
+
+    while IFS='|' read -r d s; do
+        [ -n "$d" ] || continue
+        info "Initializing /dev/$d (serial $s) - clearing SoftRAID metadata, fresh GPT."
+        run sudo "$SOFTRAID_TOOL" disk "$d" initialize \
+            || die "softraidtool disk $d initialize failed"
+    done <<EOF
+$members
+EOF
+
+    echo
+    info "Waiting for kernel re-probe to settle..."
+    while IFS='|' read -r d s; do
+        [ -n "$d" ] || continue
+        new_d=$(wait_for_disk_by_serial "$s" 30)
+        [ -n "$new_d" ] || die "Could not find /dev/diskN matching serial $s after initialize. Run '$SCRIPT_NAME disks' to inspect."
+        if [ "$new_d" != "$d" ]; then
+            warn "BSD id changed: /dev/$d -> /dev/$new_d (serial $s)"
+        else
+            ok "/dev/$d unchanged (serial $s)."
+        fi
+        echo "$new_d"
+    done <<EOF
+$members
+EOF
+}
+
+# ----------------------------------------------------------------------
 # `uninstall-softraid` - pre-flight + post-flight checklist for
 # removing SoftRAID. This command does NOT delete anything itself -
 # use SoftRAID's own uninstaller (handles the system extension
@@ -2960,17 +3187,16 @@ EOF
 Before proceeding, confirm:
   [ ] You have backed up the mirror's data (migration is destructive)
   [ ] You have the two member disk numbers ready
-  [ ] You have done the SoftRAID-side cleanup for this specific mirror:
-        * In SoftRAID.app: select the volume -> Volume menu -> Delete Volume
-        * For each member disk: Disk menu -> "Erase Disk" or the
-          equivalent command to remove SoftRAID secrets
-      (if "Delete Secrets" is not in your SoftRAID version's menu, see:
-       '$SCRIPT_NAME' earlier conversation / SoftRAID docs)
   [ ] The OTHER SoftRAID mirrors on this Mac are still intact and will
       remain managed by SoftRAID during this migration
+
+NOTE: SoftRAID-side cleanup (volume delete + member initialize) is now
+done automatically in Step 3b - you no longer have to do it manually
+in SoftRAID.app. You will get an explicit, single confirmation prompt
+before any SoftRAID state is modified.
 EOF
     echo
-    confirm "All four items above are done?" || die "Aborted. Complete the checklist first."
+    confirm "All three items above are done?" || die "Aborted. Complete the checklist first."
     echo
 
     step "Step 3: Select the two disks"
@@ -3006,6 +3232,104 @@ EOF
     [ -n "$new_name" ] || die "Name is required."
     echo
 
+    # ------------------------------------------------------------------
+    # Step 3b: SoftRAID state probe + auto-release.
+    #
+    # If the chosen disks are still members of an active SoftRAID volume
+    # (the most common reason 'do_auto_wipe' would fail with "Resource
+    # busy" - the SoftRAID kext is asserting an exclusive write claim),
+    # tear down the SoftRAID volume here so the wipe phase can succeed.
+    #
+    # Decision tree:
+    #   - neither disk under SoftRAID                     -> skip (legacy path)
+    #   - exactly one disk under SoftRAID                 -> die (asymmetric state)
+    #   - both disks belong to DIFFERENT SoftRAID volumes -> die
+    #   - shared volume is RAID 1 (mirror)                -> auto-release
+    #   - shared volume is RAID 0/4/5/10 / nonraid        -> die (not migratable
+    #     by this command); point at 'release-softraid' instead.
+    # ------------------------------------------------------------------
+    bsd1=${dev1#/dev/}
+    bsd2=${dev2#/dev/}
+    sr_member1=no; sr_member2=no
+    softraid_disk_is_member "$bsd1" && sr_member1=yes
+    softraid_disk_is_member "$bsd2" && sr_member2=yes
+
+    if [ "$sr_member1" = "yes" ] || [ "$sr_member2" = "yes" ]; then
+        step "Step 3b: SoftRAID state probe"
+        if [ "$sr_member1" != "$sr_member2" ]; then
+            err "Asymmetric SoftRAID state:"
+            err "  /dev/$bsd1 SoftRAID-controlled: $sr_member1"
+            err "  /dev/$bsd2 SoftRAID-controlled: $sr_member2"
+            die "Both members must be in the same state. Inspect with: $SCRIPT_NAME disks"
+        fi
+
+        vol1=$(softraid_disk_volumes "$bsd1" | awk 'NF {print; exit}')
+        vol2=$(softraid_disk_volumes "$bsd2" | awk 'NF {print; exit}')
+        if [ -z "$vol1" ] || [ -z "$vol2" ]; then
+            die "SoftRAID claims one of the disks but no volume name was found. Run: $SCRIPT_NAME disks"
+        fi
+        if [ "$vol1" != "$vol2" ]; then
+            err "/dev/$bsd1 belongs to SoftRAID volume \"$vol1\""
+            err "/dev/$bsd2 belongs to SoftRAID volume \"$vol2\""
+            die "Cannot migrate two unrelated SoftRAID volumes in one run."
+        fi
+        sr_vol="$vol1"
+        sr_level=$(softraid_volume_raid_level "$sr_vol")
+        info "Both disks are members of SoftRAID volume \"$sr_vol\" (level: ${sr_level:-?})."
+
+        case "$sr_level" in
+            raid1)
+                ;;
+            "")
+                die "Could not determine RAID level for volume \"$sr_vol\". Inspect with:
+    sudo \"$SOFTRAID_TOOL\" volume \"$sr_vol\" info"
+                ;;
+            *)
+                err "Volume \"$sr_vol\" is RAID level '$sr_level' - not a mirror."
+                err "'migrate-softraid' only supports RAID 1 (mirrors)."
+                info "To just tear down a non-mirror SoftRAID volume (delete + initialize"
+                info "all its members) without creating an AppleRAID set, run:"
+                info "    $SCRIPT_NAME release-softraid \"$sr_vol\""
+                die "Aborted - non-mirror SoftRAID volume."
+                ;;
+        esac
+
+        explain "About to release the SoftRAID side before the wipe phase:"
+        if softraid_volume_safeguard_enabled "$sr_vol"; then
+            explain "  - softraidtool volume \"$sr_vol\" disablesafeguard"
+        fi
+        if softraid_volume_mounted "$sr_vol"; then
+            explain "  - softraidtool volume \"$sr_vol\" unmount"
+        fi
+        explain "  - softraidtool volume \"$sr_vol\" delete    (destroys the SoftRAID volume)"
+        explain "  - softraidtool disk $bsd1 initialize       (clears SoftRAID metadata)"
+        explain "  - softraidtool disk $bsd2 initialize       (clears SoftRAID metadata)"
+        echo
+        warn "This is destructive: the SoftRAID volume \"$sr_vol\" will be gone after this."
+        warn "Step 2 already confirmed that the data is backed up."
+        echo
+        confirm "Release SoftRAID volume \"$sr_vol\" and initialize both members?" \
+            || die "Aborted at SoftRAID release."
+        echo
+
+        # Run the release. Captures NEW BSD ids (kernel may renumber
+        # disks after 'disk initialize'); update dev1/dev2/n1/n2 so
+        # the rest of the flow uses the correct device nodes.
+        new_bsds=$(softraid_release_volume "$sr_vol" "$bsd1" "$bsd2") \
+            || die "SoftRAID release failed - see above for details."
+        new_bsd1=$(printf '%s\n' "$new_bsds" | awk 'NF {print; exit}')
+        new_bsd2=$(printf '%s\n' "$new_bsds" | awk 'NF' | sed -n '2p')
+        [ -n "$new_bsd1" ] && [ -n "$new_bsd2" ] \
+            || die "Could not re-resolve BSD ids after release. Got: $new_bsds"
+        dev1="/dev/$new_bsd1"
+        dev2="/dev/$new_bsd2"
+        n1=${new_bsd1#disk}
+        n2=${new_bsd2#disk}
+        echo
+        ok "SoftRAID side released. Continuing with /dev/$new_bsd1 + /dev/$new_bsd2."
+        echo
+    fi
+
     step "Step 4: Confirm plan"
     info "About to:"
     info "  - WIPE first + last 100 MB of $dev1"
@@ -3028,6 +3352,138 @@ EOF
     info "  - Migrate remaining SoftRAID mirrors: re-run 'appleRAID migrate-softraid'"
     info "  - Once ALL mirrors are migrated, run 'appleRAID uninstall-softraid'"
     info "    for the final uninstall checklist."
+}
+
+# ----------------------------------------------------------------------
+# `release-softraid` - tear down a single named SoftRAID volume without
+# creating an AppleRAID set. Use this for non-mirror SoftRAID volumes
+# (RAID 0/4/5/10), or when you just want to free the disks.
+#
+# Steps (all via softraidtool):
+#   1. Disable Safeguard (if enabled)
+#   2. Unmount the volume (if mounted)
+#   3. Delete the volume
+#   4. Initialize each member disk to fresh GPT (clears SoftRAID metadata)
+#   5. Re-resolve BSD ids by serial and print the final mapping
+# ----------------------------------------------------------------------
+cmd_release_softraid() {
+    eval "$(parse_global_flags "$@")"
+
+    for a in "$@"; do
+        case "$a" in
+            -h|--help)
+                cat <<EOF
+Usage: $SCRIPT_NAME release-softraid <volume>
+
+Tear down a single SoftRAID volume completely:
+  1. Disable Safeguard (if enabled)
+  2. Unmount the volume (if mounted)
+  3. Delete the volume from SoftRAID
+  4. Initialize each member disk (clears SoftRAID metadata, fresh GPT)
+  5. Print the final BSD ids of the released disks
+
+This does NOT create an AppleRAID set on top - use 'create' for that, or
+use 'migrate-softraid' for the integrated end-to-end flow on mirrors.
+
+This IS the intended way to handle:
+  - non-mirror SoftRAID volumes (RAID 0/4/5/10) that 'migrate-softraid'
+    refuses to touch
+  - any SoftRAID volume you simply want to dismantle
+
+DESTRUCTIVE: the volume's data is gone after step 3. Confirm you have
+a backup before running this.
+EOF
+                return 0
+                ;;
+        esac
+    done
+
+    [ $# -ge 1 ] || die "Usage: $SCRIPT_NAME release-softraid <volume>"
+    vol="$1"
+
+    softraid_tool_available || die "SoftRAIDTool not found at: $SOFTRAID_TOOL
+SoftRAID does not appear to be installed."
+
+    step "Release SoftRAID volume \"$vol\""
+
+    if ! softraid_volume_exists "$vol"; then
+        die "SoftRAID does not know a volume named \"$vol\". List volumes with:
+    sudo \"$SOFTRAID_TOOL\" volume all info"
+    fi
+
+    level=$(softraid_volume_raid_level "$vol")
+    members=$(softraid_volume_member_disks "$vol" | awk 'NF')
+    n_members=$(printf '%s\n' "$members" | awk 'NF' | wc -l | tr -d ' ')
+
+    info "Volume \"$vol\":"
+    info "  RAID level: ${level:-?}"
+    info "  Members ($n_members):"
+    printf '%s\n' "$members" | awk 'NF' | sed 's|^|    /dev/|'
+    if softraid_volume_safeguard_enabled "$vol"; then
+        info "  Safeguard:  enabled (will be disabled first)"
+    else
+        info "  Safeguard:  disabled"
+    fi
+    if softraid_volume_mounted "$vol"; then
+        mp=$(softraid_tool volume "$vol" info 2>&1 | _sr_info_field "Mountpoint")
+        info "  Mounted:    yes ($mp - will be unmounted first)"
+    else
+        info "  Mounted:    no"
+    fi
+    echo
+
+    [ "$n_members" -ge 1 ] || die "Volume \"$vol\" has no member disks."
+
+    explain "About to:"
+    if softraid_volume_safeguard_enabled "$vol"; then
+        explain "  - softraidtool volume \"$vol\" disablesafeguard"
+    fi
+    if softraid_volume_mounted "$vol"; then
+        explain "  - softraidtool volume \"$vol\" unmount"
+    fi
+    explain "  - softraidtool volume \"$vol\" delete    (DESTROYS the volume)"
+    printf '%s\n' "$members" | awk 'NF' | while read -r d; do
+        explain "  - softraidtool disk $d initialize        (clears SoftRAID metadata)"
+    done
+    echo
+    warn "DESTRUCTIVE: volume \"$vol\" and all its data will be gone."
+    warn "Make sure you have a backup if the data still matters."
+    echo
+    confirm "Release SoftRAID volume \"$vol\"?" || die "Aborted."
+    echo
+
+    # Translate the newline-separated member list into positional args
+    # for softraid_release_volume.
+    set -- "$vol"
+    while IFS= read -r d; do
+        [ -n "$d" ] || continue
+        set -- "$@" "$d"
+    done <<EOF
+$members
+EOF
+    new_bsds=$(softraid_release_volume "$@") \
+        || die "SoftRAID release failed - see above."
+
+    echo
+    ok "Volume \"$vol\" released. Final disk lineup:"
+    i=0
+    while IFS= read -r d; do
+        [ -n "$d" ] || continue
+        i=$((i + 1))
+        old=$(printf '%s\n' "$members" | awk -v n="$i" 'NF {if (++c==n) {print; exit}}')
+        if [ -n "$old" ] && [ "$old" != "$d" ]; then
+            info "  /dev/$old -> /dev/$d"
+        else
+            info "  /dev/$d (unchanged)"
+        fi
+    done <<EOF
+$new_bsds
+EOF
+    echo
+    info "Next steps (optional):"
+    info "  - Inspect:    $SCRIPT_NAME disks"
+    info "  - Wipe stale GPT/metadata: $SCRIPT_NAME wipe <N>"
+    info "  - Build AppleRAID:         $SCRIPT_NAME create <name> <N1> <N2>"
 }
 
 # ======================================================================
@@ -3492,12 +3948,21 @@ ${C_BOLD}COMMANDS${C_RESET}
 
   ${C_BOLD}-- SoftRAID migration --${C_RESET}
   ${C_CYAN}migrate-softraid${C_RESET} [volume]    Interactive per-mirror guide: detect SoftRAID
-                              members, wipe them, and create an AppleRAID
-                              mirror in their place. Run once per mirror.
+                              members, automatically tear down the
+                              SoftRAID volume (Safeguard-aware), wipe
+                              the disks, and create an AppleRAID mirror
+                              in their place. Run once per mirror.
                               With [volume] (e.g. "2.OLD"), pre-selects
                               that SoftRAID volume and auto-fills its
-                              member disks. Wraps wipe+create with
-                              SoftRAID-specific pre-flight checks.
+                              member disks. Only supports RAID 1; for
+                              other levels see release-softraid.
+  ${C_CYAN}release-softraid${C_RESET} <volume>     Tear down a single SoftRAID volume without
+                              creating an AppleRAID set. Disables
+                              Safeguard, unmounts, deletes the volume,
+                              and initializes each member disk to a
+                              fresh GPT. Use for non-mirror SoftRAID
+                              volumes (RAID 0/4/5/10) or when you just
+                              want to free the disks. DESTRUCTIVE.
   ${C_CYAN}uninstall-softraid${C_RESET}          Pre/post-flight verification for removing
                               SoftRAID. Does NOT delete anything itself -
                               points you at SoftRAID's own uninstaller
@@ -4627,6 +5092,156 @@ cmd_destroy() {
 }
 
 # ----------------------------------------------------------------------
+# Zsh completion installer (transparently managed from within the script,
+# same pattern as my-plex). Runs on every invocation; idempotent: writes
+# nothing if the on-disk file already has the current content.
+# ----------------------------------------------------------------------
+install_zsh_completions() {
+    # Best-effort - never let this fail the run.
+    [ -n "${HOME:-}" ] || return 0
+    # Skip when running as root (sudo) - HOME is root's home, not the
+    # user's. The next non-sudo invocation will install for the user.
+    [ "$(id -u 2>/dev/null)" = "0" ] && return 0
+
+    _comp_dir="$HOME/.zsh/completions"
+    _comp_file="$_comp_dir/_my-appleRAID"
+
+    _tmp=$(mktemp 2>/dev/null) || return 0
+    cat >"$_tmp" <<'COMPLETION_EOF'
+#compdef my-appleRAID
+
+_my-appleRAID() {
+    local context state line
+    typeset -A opt_args
+
+    local -a commands
+    commands=(
+        'list:List all AppleRAID sets and their members'
+        'disks:One line per disk'
+        'info:Show detailed info for a RAID set'
+        'status:Short status summary (Online / Degraded / ...)'
+        'watch:Live-refreshing status'
+        'wipe:Zero first + last 100 MB of /dev/diskN'
+        'verify-wipe:Check that first + last 100 MB are zeros'
+        'create:Create a new mirror from two disk numbers'
+        'repair:Interactive guided repair of a degraded set'
+        'test:Run non-destructive tests on a RAID set'
+        'destroy:Delete a RAID set (data loss)'
+        'rename:Rename a RAID set'
+        'health:Run a monitoring pass'
+        'show-config:Print effective config values'
+        'create-config:Write annotated default config to <path>'
+        'baseline:Snapshot current sets/disks as expected baseline'
+        'report:Human-readable health summary (read-only)'
+        'test-alerts:Exercise every alerting channel'
+        'install-daemon:Install the LaunchDaemon plist'
+        'uninstall-daemon:Unload and remove the LaunchDaemon'
+        'daemon-status:Diagnose the daemon'
+        'migrate-softraid:Migrate ONE SoftRAID mirror to AppleRAID (auto-releases SoftRAID side)'
+        'release-softraid:Tear down a SoftRAID volume without creating an AppleRAID set'
+        'uninstall-softraid:Pre/post-flight verification for SoftRAID removal'
+        'help:Show help (use help <command> for details)'
+    )
+
+    local -a global_opts
+    global_opts=(
+        '(-V --verbose)'{-V,--verbose}'[Show more detail]'
+        '(-D --debug)'{-D,--debug}'[Even more detail; implies -V + set -x]'
+        '(-h --help)'{-h,--help}'[Show help]'
+    )
+
+    _arguments -s : \
+        $global_opts \
+        '1: :->cmd' \
+        '*::arg:->args'
+
+    case "$state" in
+        cmd)
+            _describe 'command' commands
+            ;;
+        args)
+            case "$line[1]" in
+                help|--help|-h)
+                    _describe 'help topic' commands
+                    ;;
+                info|status|watch|destroy|rename|repair|test)
+                    _message 'RAID set name or UUID'
+                    ;;
+                migrate-softraid|release-softraid)
+                    _message 'SoftRAID volume name'
+                    ;;
+                wipe|verify-wipe)
+                    _message 'disk number (e.g. 3 for /dev/disk3)'
+                    ;;
+                create)
+                    _message 'name <N1> <N2>'
+                    ;;
+                create-config)
+                    _files
+                    ;;
+                health)
+                    _arguments \
+                        '--dry-run[Perform checks, no alerts]' \
+                        '--once[Bypass rate limits (testing)]' \
+                        '-v[Debug logging for this run]'
+                    ;;
+                baseline)
+                    _arguments \
+                        '--sets[Only update set baseline]' \
+                        '--disks[Only update disk baseline]' \
+                        '--show[Print current baselines only]'
+                    ;;
+                *)
+                    _files
+                    ;;
+            esac
+            ;;
+    esac
+}
+
+_my-appleRAID "$@"
+COMPLETION_EOF
+
+    # Idempotent: only update if content changed.
+    if [ -r "$_comp_file" ] && cmp -s "$_tmp" "$_comp_file" 2>/dev/null; then
+        rm -f "$_tmp"
+    else
+        mkdir -p "$_comp_dir" 2>/dev/null || { rm -f "$_tmp"; return 0; }
+        mv "$_tmp" "$_comp_file" 2>/dev/null || { rm -f "$_tmp"; return 0; }
+    fi
+
+    # Patch ~/.zshrc to add the fpath entry, but only once.
+    _zshrc="$HOME/.zshrc"
+    [ -f "$_zshrc" ] || return 0
+    if grep -q '\.zsh/completions' "$_zshrc" 2>/dev/null; then
+        return 0
+    fi
+
+    # If oh-my-zsh is loaded, insert fpath BEFORE the source line so
+    # compinit (run by oh-my-zsh) picks up the new path. Otherwise
+    # append fpath + compinit at the end.
+    if grep -q 'oh-my-zsh\.sh' "$_zshrc" 2>/dev/null; then
+        _tmp_rc=$(mktemp 2>/dev/null) || return 0
+        awk -v cdir="$_comp_dir" '
+            !inserted && /oh-my-zsh\.sh/ {
+                print "# my-appleRAID zsh completions"
+                print "fpath=(" cdir " $fpath)"
+                inserted=1
+            }
+            { print }
+        ' "$_zshrc" >"$_tmp_rc" 2>/dev/null \
+            && mv "$_tmp_rc" "$_zshrc" 2>/dev/null
+        rm -f "$_tmp_rc"
+    else
+        {
+            printf '\n# my-appleRAID zsh completions\n'
+            printf 'fpath=(%s $fpath)\n' "$_comp_dir"
+            printf 'autoload -Uz compinit && compinit\n'
+        } >>"$_zshrc" 2>/dev/null || true
+    fi
+}
+
+# ----------------------------------------------------------------------
 # Main dispatch
 # ----------------------------------------------------------------------
 main() {
@@ -4675,6 +5290,7 @@ main() {
         uninstall-daemon)   cmd_uninstall_daemon "$@" ;;
         daemon-status)      cmd_daemon_status "$@" ;;
         migrate-softraid)   cmd_migrate_softraid "$@" ;;
+        release-softraid)   cmd_release_softraid "$@" ;;
         uninstall-softraid) cmd_uninstall_softraid "$@" ;;
         *)
             err "Unknown command: $cmd"
@@ -4685,4 +5301,5 @@ main() {
     esac
 }
 
+install_zsh_completions
 main "$@"
