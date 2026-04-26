@@ -73,7 +73,6 @@ SCRIPT_NAME="$(basename "$0")"
 # ----------------------------------------------------------------------
 VERBOSE=0
 DEBUG=0
-DEEP_DEBUG=0
 
 # Parse -V/--verbose and -D/--debug from an argv list. Because this
 # function has to run in a $(...) subshell to feed its output back to
@@ -92,14 +91,12 @@ DEEP_DEBUG=0
 # Idiomatic use:
 #     eval "$(parse_global_flags "$@")"
 parse_global_flags() {
-    _v=0; _d=0; _dd=0
+    _v=0; _d=0
     _args=""
     for _arg in "$@"; do
         case "$_arg" in
-            -V|--verbose)        _v=1 ;;
-            -D|--debug)          _d=1; _v=1 ;;
-            -DD|--deep-debug|--deepdebug)
-                                 _dd=1; _d=1; _v=1 ;;
+            -V|--verbose) _v=1 ;;
+            -D|--debug)   _d=1; _v=1 ;;
             *)
                 # Shell-safe single-quote: wrap, escape any embedded "'"
                 # by closing the quote, emitting \' , then re-opening.
@@ -113,8 +110,7 @@ parse_global_flags() {
     # them. Using arithmetic evaluation: any prior 1 stays 1.
     # shellcheck disable=SC2016  # arithmetic intentionally literal;
                                  # the caller's eval expands it.
-    printf 'VERBOSE=$((VERBOSE | %d)); DEBUG=$((DEBUG | %d)); DEEP_DEBUG=$((DEEP_DEBUG | %d));' \
-        "$_v" "$_d" "$_dd"
+    printf 'VERBOSE=$((VERBOSE | %d)); DEBUG=$((DEBUG | %d));' "$_v" "$_d"
     # LOG_LEVEL: only escalate if we actually saw a flag this call
     # (otherwise leave caller's choice untouched).
     if [ "$_d" = "1" ] || [ "$_v" = "1" ]; then
@@ -2793,12 +2789,6 @@ softraid_disk_volumes() {
     '
 }
 
-# Disk serial as reported by softraidtool. Stable across re-probes,
-# unlike the BSD diskN id, so we can recover the disk after initialize.
-softraid_disk_serial() {
-    softraid_tool disk "$1" info 2>&1 | _sr_info_field "Serial Number"
-}
-
 # Volume RAID level normalised: raid0 / raid1 / raid4 / raid5 / raid10 /
 # nonraid (lowercase, no spaces). Empty on miss.
 softraid_volume_raid_level() {
@@ -2849,35 +2839,6 @@ softraid_volume_exists() {
     return 1
 }
 
-# Find the current /dev/diskN whose serial matches $1. Used after
-# 'softraidtool disk <X> initialize' to recover the (possibly
-# renumbered) BSD node. Prints "diskN" without /dev/ prefix.
-find_disk_by_serial() {
-    serial="$1"
-    [ -n "$serial" ] || return 1
-    list_all_physical_disks | while read -r d; do
-        [ -n "$d" ] || continue
-        s=$(diskutil info "/dev/$d" 2>/dev/null \
-            | awk -F': *' '/^[[:space:]]*Serial Number:/ {print $2; exit}')
-        [ "$s" = "$serial" ] && { echo "$d"; return 0; }
-    done
-}
-
-# Wait up to N seconds for a disk with the given serial to appear in
-# `diskutil list`. Returns the BSD id on success.
-wait_for_disk_by_serial() {
-    serial="$1"
-    timeout="${2:-30}"
-    i=0
-    while [ "$i" -lt "$timeout" ]; do
-        d=$(find_disk_by_serial "$serial")
-        if [ -n "$d" ]; then echo "$d"; return 0; fi
-        sleep 1
-        i=$((i+1))
-    done
-    return 1
-}
-
 # Orchestrate the SoftRAID-side release of one named volume:
 #
 #   1. (if Safeguard enabled)  volume <V> disablesafeguard
@@ -2914,21 +2875,6 @@ softraid_release_volume() {
     (
         exec 3>&1 1>&2
 
-        # Snapshot serials before we touch anything; used for re-
-        # resolution after 'disk initialize' may have renumbered the
-        # BSD ids.
-        members=""
-        for d in "$@"; do
-            s=$(softraid_disk_serial "$d")
-            if [ -z "$s" ]; then
-                s=$(diskutil info "/dev/$d" 2>/dev/null \
-                    | awk -F': *' '/^[[:space:]]*Serial Number:/ {print $2; exit}')
-            fi
-            [ -n "$s" ] || die "Could not determine serial number for /dev/$d - cannot recover BSD id after initialize."
-            members="${members}${d}|${s}
-"
-        done
-
         if softraid_volume_safeguard_enabled "$vol"; then
             info "Volume \"$vol\" has Safeguard enabled - disabling first."
             run sudo "$SOFTRAID_TOOL" volume "$vol" disablesafeguard \
@@ -2945,32 +2891,40 @@ softraid_release_volume() {
         run sudo "$SOFTRAID_TOOL" volume "$vol" delete \
             || die "softraidtool volume \"$vol\" delete failed"
 
-        while IFS='|' read -r d s; do
+        for d in "$@"; do
             [ -n "$d" ] || continue
-            info "Initializing /dev/$d (serial $s) - clearing SoftRAID metadata, fresh GPT."
+            info "Initializing /dev/$d - clearing SoftRAID metadata, fresh GPT."
             run sudo "$SOFTRAID_TOOL" disk "$d" initialize \
                 || die "softraidtool disk $d initialize failed"
-        done <<EOF
-$members
-EOF
+        done
 
+        # softraidtool's 'disk initialize' rewrites the GPT in place but
+        # does not change the kernel BSD id of the physical device, so
+        # disk14 stays disk14, disk18 stays disk18 etc. Earlier versions
+        # of this code tried to re-resolve by serial number via
+        # 'diskutil info' - but diskutil info on whole disks does NOT
+        # include a 'Serial Number:' line (only smartctl / softraidtool
+        # expose that field), so the lookup always failed. Just verify
+        # the disks are still visible after a brief settle window and
+        # emit them as the result.
         echo
-        info "Waiting for kernel re-probe to settle..."
-        while IFS='|' read -r d s; do
+        info "Verifying disks present after initialize..."
+        for d in "$@"; do
             [ -n "$d" ] || continue
-            new_d=$(wait_for_disk_by_serial "$s" 30)
-            [ -n "$new_d" ] || die "Could not find /dev/diskN matching serial $s after initialize. Run '$SCRIPT_NAME disks' to inspect."
-            if [ "$new_d" != "$d" ]; then
-                warn "BSD id changed: /dev/$d -> /dev/$new_d (serial $s)"
-            else
-                ok "/dev/$d unchanged (serial $s)."
-            fi
-            # The ONLY line written to fd 3 - the original stdout
-            # captured by the caller's $(...).
-            echo "$new_d" >&3
-        done <<EOF
-$members
-EOF
+            j=0
+            while [ "$j" -lt 10 ]; do
+                if diskutil info "/dev/$d" >/dev/null 2>&1; then
+                    ok "/dev/$d present."
+                    # The ONLY line written to fd 3 - the original
+                    # stdout captured by the caller's $(...).
+                    echo "$d" >&3
+                    break
+                fi
+                sleep 1
+                j=$((j + 1))
+            done
+            [ "$j" -lt 10 ] || die "/dev/$d not visible after initialize. Run '$SCRIPT_NAME disks' to inspect."
+        done
     )
 }
 
@@ -3939,11 +3893,8 @@ ${C_BOLD}GLOBAL OPTIONS${C_RESET} (accepted before OR after the command name)
   ${C_CYAN}-V${C_RESET}, ${C_CYAN}--verbose${C_RESET}            Show more detail. Sets LOG_LEVEL=debug.
                               Per-command: extended views where applicable.
   ${C_CYAN}-D${C_RESET}, ${C_CYAN}--debug${C_RESET}              Even more detail. Implies -V, plus shell
-                              tracing (set -x) and raw internal dumps.
-  ${C_CYAN}-DD${C_RESET}, ${C_CYAN}--deep-debug${C_RESET}        Implies -D. Adds a line-number prefix to
-                              the shell trace ('+[L1234] cmd ...') so
-                              every executed shell command is visible
-                              with location context.
+                              tracing (set -x with line-number prefix:
+                              '+[L1234] cmd ...') and raw internal dumps.
 
 ${C_BOLD}COMMANDS${C_RESET}
   ${C_CYAN}list${C_RESET}                        Compact one-line-per-RAID summary covering both
@@ -5654,15 +5605,11 @@ main() {
     eval "$(parse_global_flags "$@")"
 
     # Enable shell tracing AFTER flag parsing so the parser itself
-    # doesn't pollute the trace output. -DD adds a richer PS4 prefix
-    # so each traced line shows where it lives (lineno-ish) and is
-    # visually distinct from regular '$ command' echoes.
-    if [ "$DEEP_DEBUG" = "1" ]; then
-        # Best-effort line-number prefix (BSD dash supports $LINENO).
+    # doesn't pollute the trace output. PS4 adds a line-number prefix
+    # so each traced line shows where it lives in the script.
+    if [ "$DEBUG" = "1" ]; then
         PS4='+[L${LINENO}] '
         export PS4
-        set -x
-    elif [ "$DEBUG" = "1" ]; then
         set -x
     fi
 
