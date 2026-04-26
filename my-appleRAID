@@ -4124,6 +4124,14 @@ do_auto_wipe() {
     seek_mb=$(( size_mb - 100 ))
 
     run sudo diskutil unmountDisk force "$dev" || true
+    # Break DiskArbitration lock and clear stale GPT / partition headers
+    # (incl. orphaned Apple_Boot / AppleRAID_Offline member partitions that
+    # diskarbitrationd would otherwise keep claiming, causing dd to fail
+    # with "Resource busy" on the whole-disk node). 'quick' zeros only the
+    # first ~8 MB -- enough to drop the GPT -- and re-probes the disk.
+    run sudo diskutil zeroDisk quick "$dev" \
+        || die "diskutil zeroDisk quick $dev failed (disk may still be claimed by AppleRAID/APFS/CoreStorage -- inspect 'diskutil list' / 'diskutil appleRAID list' / 'diskutil apfs list')"
+    # Now the real 100 MB wipes (front + back) for SoftRAID/AppleRAID metadata.
     run sudo dd if=/dev/zero of="$rdev" bs=1m count=100 status=progress \
         || die "First-100MB wipe of $dev failed"
     run sudo dd if=/dev/zero of="$rdev" bs=1m seek=$seek_mb count=100 status=progress \
