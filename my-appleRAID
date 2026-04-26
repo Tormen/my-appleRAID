@@ -73,6 +73,7 @@ SCRIPT_NAME="$(basename "$0")"
 # ----------------------------------------------------------------------
 VERBOSE=0
 DEBUG=0
+DEEP_DEBUG=0
 
 # Parse -V/--verbose and -D/--debug from an argv list. Because this
 # function has to run in a $(...) subshell to feed its output back to
@@ -91,12 +92,14 @@ DEBUG=0
 # Idiomatic use:
 #     eval "$(parse_global_flags "$@")"
 parse_global_flags() {
-    _v=0; _d=0
+    _v=0; _d=0; _dd=0
     _args=""
     for _arg in "$@"; do
         case "$_arg" in
-            -V|--verbose) _v=1 ;;
-            -D|--debug)   _d=1; _v=1 ;;
+            -V|--verbose)        _v=1 ;;
+            -D|--debug)          _d=1; _v=1 ;;
+            -DD|--deep-debug|--deepdebug)
+                                 _dd=1; _d=1; _v=1 ;;
             *)
                 # Shell-safe single-quote: wrap, escape any embedded "'"
                 # by closing the quote, emitting \' , then re-opening.
@@ -110,7 +113,8 @@ parse_global_flags() {
     # them. Using arithmetic evaluation: any prior 1 stays 1.
     # shellcheck disable=SC2016  # arithmetic intentionally literal;
                                  # the caller's eval expands it.
-    printf 'VERBOSE=$((VERBOSE | %d)); DEBUG=$((DEBUG | %d));' "$_v" "$_d"
+    printf 'VERBOSE=$((VERBOSE | %d)); DEBUG=$((DEBUG | %d)); DEEP_DEBUG=$((DEEP_DEBUG | %d));' \
+        "$_v" "$_d" "$_dd"
     # LOG_LEVEL: only escalate if we actually saw a flag this call
     # (otherwise leave caller's choice untouched).
     if [ "$_d" = "1" ] || [ "$_v" = "1" ]; then
@@ -2897,60 +2901,77 @@ softraid_release_volume() {
     [ $# -ge 1 ] || die "softraid_release_volume: no member disks given"
     softraid_tool_available || die "SoftRAIDTool not found at: $SOFTRAID_TOOL"
 
-    # Snapshot serials before we touch anything; used for re-resolution
-    # after 'disk initialize' may have renumbered the BSD ids.
-    members=""
-    for d in "$@"; do
-        s=$(softraid_disk_serial "$d")
-        if [ -z "$s" ]; then
-            s=$(diskutil info "/dev/$d" 2>/dev/null \
-                | awk -F': *' '/^[[:space:]]*Serial Number:/ {print $2; exit}')
-        fi
-        [ -n "$s" ] || die "Could not determine serial number for /dev/$d - cannot recover BSD id after initialize."
-        members="${members}${d}|${s}
+    # The function emits two kinds of output:
+    #   - VISIBLE PROGRESS: info/run/ok/warn -- normally to stdout
+    #   - RESULT:           the new BSD ids, one per line, also stdout
+    #
+    # Callers wrap us in $(...) to capture the result, which would
+    # also swallow the visible progress and any softraidtool error
+    # printed on stdout. Run the body in a subshell with fd 1 and 2
+    # swapped: progress (fd 1 -> 2) reaches the user's terminal; the
+    # original stdout is preserved on fd 3 and used only for result
+    # emission, so $(...) only captures the BSD ids.
+    (
+        exec 3>&1 1>&2
+
+        # Snapshot serials before we touch anything; used for re-
+        # resolution after 'disk initialize' may have renumbered the
+        # BSD ids.
+        members=""
+        for d in "$@"; do
+            s=$(softraid_disk_serial "$d")
+            if [ -z "$s" ]; then
+                s=$(diskutil info "/dev/$d" 2>/dev/null \
+                    | awk -F': *' '/^[[:space:]]*Serial Number:/ {print $2; exit}')
+            fi
+            [ -n "$s" ] || die "Could not determine serial number for /dev/$d - cannot recover BSD id after initialize."
+            members="${members}${d}|${s}
 "
-    done
+        done
 
-    if softraid_volume_safeguard_enabled "$vol"; then
-        info "Volume \"$vol\" has Safeguard enabled - disabling first."
-        run sudo "$SOFTRAID_TOOL" volume "$vol" disablesafeguard \
-            || die "Failed to disable Safeguard on \"$vol\""
-    fi
-
-    if softraid_volume_mounted "$vol"; then
-        info "Volume \"$vol\" is mounted - unmounting first."
-        run sudo "$SOFTRAID_TOOL" volume "$vol" unmount \
-            || warn "Volume unmount returned non-zero (delete will retry)."
-    fi
-
-    info "Deleting SoftRAID volume \"$vol\"."
-    run sudo "$SOFTRAID_TOOL" volume "$vol" delete \
-        || die "softraidtool volume \"$vol\" delete failed"
-
-    while IFS='|' read -r d s; do
-        [ -n "$d" ] || continue
-        info "Initializing /dev/$d (serial $s) - clearing SoftRAID metadata, fresh GPT."
-        run sudo "$SOFTRAID_TOOL" disk "$d" initialize \
-            || die "softraidtool disk $d initialize failed"
-    done <<EOF
-$members
-EOF
-
-    echo
-    info "Waiting for kernel re-probe to settle..."
-    while IFS='|' read -r d s; do
-        [ -n "$d" ] || continue
-        new_d=$(wait_for_disk_by_serial "$s" 30)
-        [ -n "$new_d" ] || die "Could not find /dev/diskN matching serial $s after initialize. Run '$SCRIPT_NAME disks' to inspect."
-        if [ "$new_d" != "$d" ]; then
-            warn "BSD id changed: /dev/$d -> /dev/$new_d (serial $s)"
-        else
-            ok "/dev/$d unchanged (serial $s)."
+        if softraid_volume_safeguard_enabled "$vol"; then
+            info "Volume \"$vol\" has Safeguard enabled - disabling first."
+            run sudo "$SOFTRAID_TOOL" volume "$vol" disablesafeguard \
+                || die "Failed to disable Safeguard on \"$vol\""
         fi
-        echo "$new_d"
-    done <<EOF
+
+        if softraid_volume_mounted "$vol"; then
+            info "Volume \"$vol\" is mounted - unmounting first."
+            run sudo "$SOFTRAID_TOOL" volume "$vol" unmount \
+                || warn "Volume unmount returned non-zero (delete will retry)."
+        fi
+
+        info "Deleting SoftRAID volume \"$vol\"."
+        run sudo "$SOFTRAID_TOOL" volume "$vol" delete \
+            || die "softraidtool volume \"$vol\" delete failed"
+
+        while IFS='|' read -r d s; do
+            [ -n "$d" ] || continue
+            info "Initializing /dev/$d (serial $s) - clearing SoftRAID metadata, fresh GPT."
+            run sudo "$SOFTRAID_TOOL" disk "$d" initialize \
+                || die "softraidtool disk $d initialize failed"
+        done <<EOF
 $members
 EOF
+
+        echo
+        info "Waiting for kernel re-probe to settle..."
+        while IFS='|' read -r d s; do
+            [ -n "$d" ] || continue
+            new_d=$(wait_for_disk_by_serial "$s" 30)
+            [ -n "$new_d" ] || die "Could not find /dev/diskN matching serial $s after initialize. Run '$SCRIPT_NAME disks' to inspect."
+            if [ "$new_d" != "$d" ]; then
+                warn "BSD id changed: /dev/$d -> /dev/$new_d (serial $s)"
+            else
+                ok "/dev/$d unchanged (serial $s)."
+            fi
+            # The ONLY line written to fd 3 - the original stdout
+            # captured by the caller's $(...).
+            echo "$new_d" >&3
+        done <<EOF
+$members
+EOF
+    )
 }
 
 # ----------------------------------------------------------------------
@@ -3919,6 +3940,10 @@ ${C_BOLD}GLOBAL OPTIONS${C_RESET} (accepted before OR after the command name)
                               Per-command: extended views where applicable.
   ${C_CYAN}-D${C_RESET}, ${C_CYAN}--debug${C_RESET}              Even more detail. Implies -V, plus shell
                               tracing (set -x) and raw internal dumps.
+  ${C_CYAN}-DD${C_RESET}, ${C_CYAN}--deep-debug${C_RESET}        Implies -D. Adds a line-number prefix to
+                              the shell trace ('+[L1234] cmd ...') so
+                              every executed shell command is visible
+                              with location context.
 
 ${C_BOLD}COMMANDS${C_RESET}
   ${C_CYAN}list${C_RESET}                        Compact one-line-per-RAID summary covering both
@@ -5629,8 +5654,15 @@ main() {
     eval "$(parse_global_flags "$@")"
 
     # Enable shell tracing AFTER flag parsing so the parser itself
-    # doesn't pollute the trace output.
-    if [ "$DEBUG" = "1" ]; then
+    # doesn't pollute the trace output. -DD adds a richer PS4 prefix
+    # so each traced line shows where it lives (lineno-ish) and is
+    # visually distinct from regular '$ command' echoes.
+    if [ "$DEEP_DEBUG" = "1" ]; then
+        # Best-effort line-number prefix (BSD dash supports $LINENO).
+        PS4='+[L${LINENO}] '
+        export PS4
+        set -x
+    elif [ "$DEBUG" = "1" ]; then
         set -x
     fi
 
