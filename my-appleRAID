@@ -282,6 +282,84 @@ raid_name_to_uuid() {
     '
 }
 
+# Read the AppleRAID `Rebuild` (AutoRebuild) flag for a set, via ioreg.
+# Returns "1" (automatic) or "0" (manual). Empty string if the set isn't
+# in ioreg yet (extremely rare; only during a brief window right after
+# create).
+#
+# `diskutil appleRAID list` does NOT expose this field at any output
+# level (verified empirically). ioreg is the only userspace read path.
+# Each set appears twice in `ioreg -arc AppleRAIDSet` (once for the
+# AppleRAIDSet object, once for the synthesized IOMedia child); we
+# dedupe on AppleRAID-SetUUID.
+raid_ar_get() {
+    uuid="$1"
+    [ -n "$uuid" ] || return 0
+    ioreg -arc AppleRAIDSet 2>/dev/null | python3 -c '
+import sys, plistlib
+d = plistlib.loads(sys.stdin.buffer.read())
+target = sys.argv[1]
+seen = set()
+for e in d:
+    u = e.get("AppleRAID-SetUUID")
+    if u != target or u in seen: continue
+    seen.add(u)
+    print(1 if e.get("AppleRAID-AutoRebuild") else 0)
+    break
+' "$uuid" 2>/dev/null
+}
+
+# Read the AppleRAID `SetTimeout` (seconds) for a set, via ioreg.
+# Empty string if not found. Same source-of-truth caveats as raid_ar_get.
+raid_st_get() {
+    uuid="$1"
+    [ -n "$uuid" ] || return 0
+    ioreg -arc AppleRAIDSet 2>/dev/null | python3 -c '
+import sys, plistlib
+d = plistlib.loads(sys.stdin.buffer.read())
+target = sys.argv[1]
+seen = set()
+for e in d:
+    u = e.get("AppleRAID-SetUUID")
+    if u != target or u in seen: continue
+    seen.add(u)
+    v = e.get("AppleRAID-SetTimeout")
+    if v is not None: print(v)
+    break
+' "$uuid" 2>/dev/null
+}
+
+# Apply the DEFAULT_AUTO_REBUILD config policy to a single set:
+#   DEFAULT_AUTO_REBUILD=""    : skip (no enforcement)
+#   DEFAULT_AUTO_REBUILD=0|1   : ensure AR matches; only call diskutil
+#                                 update if there's a drift (AppleRAID
+#                                 returns -69848 for no-op writes on
+#                                 freshly-created mirrors, so always
+#                                 read-current-first).
+# Logs at info level when a change is made; silent when already in sync.
+# Returns 0 on success or no-op, 1 on update failure.
+enforce_default_ar_for_uuid() {
+    uuid="$1"
+    [ -n "$uuid" ] || return 0
+    target="${DEFAULT_AUTO_REBUILD-1}"
+    [ -z "$target" ] && return 0   # enforcement disabled
+    case "$target" in
+        0|1) ;;
+        *)
+            log_warn "DEFAULT_AUTO_REBUILD=$target is not 0/1/empty; skipping enforcement on $uuid"
+            return 0
+            ;;
+    esac
+    current=$(raid_ar_get "$uuid")
+    [ "$current" = "$target" ] && return 0
+    log_info "Enforcing AutoRebuild=$target on $uuid (was: ${current:-<unknown>})"
+    if sudo diskutil appleRAID update AutoRebuild "$target" "$uuid" >/dev/null 2>&1; then
+        return 0
+    fi
+    log_warn "Failed to set AutoRebuild=$target on $uuid"
+    return 1
+}
+
 # Given a virtual device ("disk4" or "/dev/disk4"), return its RAID UUID.
 raid_device_to_uuid() {
     dev="$1"
@@ -345,11 +423,13 @@ pick_raid_set() {
         info "Only one RAID set found; auto-selecting: $SELECTED_UUID"
         return 0
     fi
-    # Multiple: show a menu.
+    # Multiple: show the compact 'list' summary as the menu (one line per
+    # set, instead of the verbose multi-page 'diskutil appleRAID list'
+    # dump). Same view the user is used to from 'my-appleRAID list'.
     step "Multiple RAID sets found - please pick one"
-    run diskutil appleRAID list
+    cmd_list
     echo
-    printf 'Enter RAID set UUID (or Name): '
+    printf 'Enter RAID set name or UUID: '
     read -r choice
     if [ -z "$choice" ]; then
         die "No selection made."
@@ -411,6 +491,13 @@ cfg_set_defaults() {
     TEMP_WARN_C=50
     TEMP_CRIT_C=58
     SMART_CHECK_ENABLED=yes                # yes/no: run smartctl -H / -A
+    # AppleRAID AutoRebuild enforcement.
+    #   1   (default, recommended) enforce AR=1 on every set the script
+    #       touches via create / health / list.
+    #   0   force AR=0 on every set the script touches.
+    #   ""  empty = no enforcement; the script reads/displays AR but
+    #       never writes it. Manage manually via 'autorebuild on|off'.
+    DEFAULT_AUTO_REBUILD=1
     # Alarm
     ALARM_SOUND="/System/Library/Sounds/Basso.aiff"
     ALARM_VOLUME=0.8                       # 0.0 - 1.0
@@ -1649,6 +1736,16 @@ cmd_health() {
     log_debug "Monitoring sets: $MONITOR_SETS"
 
     check_raid_sets
+
+    # Enforce DEFAULT_AUTO_REBUILD policy on every monitored set.
+    # Skipped if config is empty. Silent when no drift; logs an info
+    # line when it actually flips a set's AR.
+    if [ -n "${DEFAULT_AUTO_REBUILD:-}" ]; then
+        for u in $(resolve_monitored_sets 2>/dev/null); do
+            enforce_default_ar_for_uuid "$u" || true
+        done
+    fi
+
     check_auto_baseline_sets
     check_auto_baseline_disks
     check_set_presence
@@ -1767,6 +1864,7 @@ cmd_show_config() {
         AUTO_BASELINE_FOR_SETS_ON_HEALTH AUTO_BASELINE_FOR_DISKS_ON_HEALTH \
         AUTO_BASELINE_GRACE_PERIOD \
         TEMP_WARN_C TEMP_CRIT_C SMART_CHECK_ENABLED \
+        DEFAULT_AUTO_REBUILD \
         ALARM_SOUND ALARM_VOLUME ALARM_VOLUME_MODE ALARM_INTERVAL ALARM_ENABLED \
         EMAIL_TO EMAIL_FROM EMAIL_SENDER EMAIL_INTERVAL \
         SMART_POLL_INTERVAL SELFTEST_SHORT_SCHEDULE SELFTEST_LONG_SCHEDULE SELFTEST_HOUR \
@@ -2018,6 +2116,36 @@ TEMP_CRIT_C=58
 # Set to "no" if you only want RAID set monitoring (disables temp alerts
 # and attribute-based warnings too).
 SMART_CHECK_ENABLED=yes
+
+
+# --- AppleRAID AutoRebuild enforcement -------------------------------
+#
+# Apple's `diskutil appleRAID create` ships every new mirror with
+# `Rebuild: manual` (AutoRebuild=0). With manual rebuild, a member
+# that returns from a transient disconnect sits in `Failed` status
+# until you run `my-appleRAID repair` - which is a full block-by-block
+# rebuild anyway, so deferring it buys you nothing in disk life.
+# Empirical real-disk testing confirms AutoRebuild is the ONLY knob
+# that controls this behavior. SetTimeout has no observable effect
+# on clean physical disconnects.
+#
+# DEFAULT_AUTO_REBUILD controls whether my-appleRAID enforces an
+# AutoRebuild value on every set during create / health / list:
+#
+#   1   (recommended) enforce AR=1 on every set the script touches.
+#       Sets created via `my-appleRAID create` are flipped from
+#       Apple's default of 0 right after creation. Health passes
+#       re-apply if a set has drifted. List calls do the same.
+#   0   force AR=0 on every set. Only useful in narrow cases where
+#       you want a hard, persistent alert (the set stays Degraded
+#       until you act) or where you want to control rebuild scheduling
+#       manually.
+#   ""  (empty) disable enforcement entirely. The script reads and
+#       displays AR but never writes it. Manage by hand per-set via
+#       `my-appleRAID autorebuild <set> on|off`.
+#
+# Default: 1.
+DEFAULT_AUTO_REBUILD=1
 
 
 # --- Audible alarm ---------------------------------------------------
@@ -3970,6 +4098,21 @@ _smart_drilldown_one() {
         die "Device not found: $dev"
     fi
 
+    # smart_dtype_for writes a cache file under $STATE_DIR. STATE_DIR is
+    # only populated by cfg_load (or state_init's fallback), which the
+    # daemon path always runs but our standalone callers (cmd_smart,
+    # cmd_health --disk) do not. Load the config first, then ensure the
+    # dir exists - falling back to /tmp if the configured location isn't
+    # writable (avoids the empty-path 'cannot create' from mktemp).
+    cfg_load
+    if [ -z "${STATE_DIR:-}" ]; then
+        STATE_DIR="/var/db/my-appleRAID"
+    fi
+    if ! mkdir -p "$STATE_DIR" 2>/dev/null; then
+        STATE_DIR="/tmp/my-appleRAID"
+        mkdir -p "$STATE_DIR" 2>/dev/null || true
+    fi
+
     virt=$(diskutil info "$dev" 2>/dev/null | awk -F': *' '/Virtual:/ {print $2; exit}')
     if [ "$virt" = "Yes" ]; then
         die "$dev is a VIRTUAL device (RAID/APFS container) - has no SMART data of its own."
@@ -4018,6 +4161,14 @@ _smart_drilldown_one() {
     explain "  5 Reallocated  187 Reported_Uncorrect  197 Pending  198 Offline_Uncorrectable  199 UDMA_CRC"
     echo
     attrs=$($sc -A "$dev" 2>/dev/null)
+
+    # Current Power_On_Hours - sections 3/4 use this to translate each
+    # log entry's LifeTime(hours) into "X ago" + an approximate date.
+    # Empty if the drive doesn't expose POH (rare).
+    poh=$(echo "$attrs" | awk '
+        /^[[:space:]]*9[[:space:]]+Power_On_Hours/ { print $10; exit }
+        /^Power On Hours:/ { v=$NF; gsub(/,/, "", v); print v; exit }')
+
     if [ -z "$attrs" ]; then
         warn "Could not read SMART attributes."
     else
@@ -4057,8 +4208,53 @@ _smart_drilldown_one() {
         explain "Run one with:  sudo $sc -t short $dev    (~2 min)"
         explain "             or sudo $sc -t long  $dev    (hours, full surface)"
     else
-        echo "$selftest" | sed -n '/Num.*Test_Description/,/^$/p; /^# *[0-9]/p' \
-            | sed 's/^/  /'
+        if [ -n "$poh" ]; then
+            explain "Current Power_On_Hours: $poh - the AGE_AGO / APPROX_DATE columns are"
+            explain "computed as (POH - LifeTime). Calendar-accurate when the drive is"
+            explain "roughly always-on; underestimates the more the drive sleeps."
+            echo
+        else
+            warn "Could not read Power_On_Hours - showing raw LifeTime only."
+            echo
+        fi
+        echo "$selftest" \
+          | sed -n '/Num.*Test_Description/,/^$/p' \
+          | awk -v poh="$poh" '
+            function age_label(d) {
+                if (poh == "" || d == "" || d+0 < 0)  return "?"
+                if (d < 72)         return d "h"
+                if (d < 14*24)      return int(d/24) "d"
+                if (d < 8*7*24)     return int(d/(7*24)) "w"
+                if (d < 365*24)     return int(d/(30*24)) "mo"
+                return sprintf("%.1fy", d/(365*24))
+            }
+            function age_date(d,    cmd, out) {
+                if (poh == "" || d == "" || d+0 < 0)  return "?"
+                cmd = "date -v -" d "H +%Y-%m-%d 2>/dev/null"
+                out = "?"
+                cmd | getline out
+                close(cmd)
+                if (out == "") out = "?"
+                return out
+            }
+            /Num.*Test_Description.*LifeTime/ {
+                gsub(/[[:space:]]+$/, "", $0)
+                printf "  %s  %-7s  %s\n", $0, "AGE_AGO", "APPROX_DATE"
+                next
+            }
+            /^# *[0-9]+/ {
+                gsub(/[[:space:]]+$/, "", $0)
+                lt = $(NF-1)
+                if (lt ~ /^[0-9]+$/ && poh != "" && (poh+0) >= (lt+0)) {
+                    d = poh - lt
+                    printf "  %s  %-7s  %s\n", $0, age_label(d), age_date(d)
+                } else {
+                    printf "  %s  %-7s  %s\n", $0, "?", "?"
+                }
+                next
+            }
+            { print "  " $0 }
+        '
         if echo "$selftest" | grep -qE 'Failed|Aborted_by_host|Interrupted|Completed: read failure'; then
             warn "Past self-test failure(s) above. LBA_of_first_error points to the bad sector."
         else
@@ -4084,7 +4280,47 @@ _smart_drilldown_one() {
         elif [ -n "$ec" ]; then
             err "Error count: $ec  (firmware-recorded errors - inspect below)"
             echo
-            echo "$elog" | awk '/^Error [0-9]+/,/^$/' | sed 's/^/  /' | head -80
+            if [ -n "$poh" ]; then
+                explain "Each 'power-on lifetime: N hours' line is annotated with how long ago"
+                explain "that error happened (current Power_On_Hours: $poh)."
+                echo
+            fi
+            echo "$elog" \
+              | awk '/^Error [0-9]+/,/^$/' \
+              | awk -v poh="$poh" '
+                function age_label(d) {
+                    if (poh == "" || d == "" || d+0 < 0)  return "?"
+                    if (d < 72)         return d "h"
+                    if (d < 14*24)      return int(d/24) "d"
+                    if (d < 8*7*24)     return int(d/(7*24)) "w"
+                    if (d < 365*24)     return int(d/(30*24)) "mo"
+                    return sprintf("%.1fy", d/(365*24))
+                }
+                function age_date(d,    cmd, out) {
+                    if (poh == "" || d == "" || d+0 < 0)  return "?"
+                    cmd = "date -v -" d "H +%Y-%m-%d 2>/dev/null"
+                    out = "?"
+                    cmd | getline out
+                    close(cmd)
+                    if (out == "") out = "?"
+                    return out
+                }
+                /lifetime: [0-9]+ hours/ {
+                    if (match($0, /lifetime: [0-9]+ hours/)) {
+                        seg = substr($0, RSTART, RLENGTH)
+                        gsub(/[^0-9]/, "", seg)
+                        lt = seg+0
+                        if (poh != "" && lt > 0 && (poh+0) >= lt) {
+                            d = (poh+0) - lt
+                            print $0 "    -> ~" age_label(d) " ago / " age_date(d)
+                            next
+                        }
+                    }
+                    print
+                    next
+                }
+                { print }
+              ' | sed 's/^/  /' | head -120
         else
             warn "Could not parse error count - raw output:"
             echo "$elog" | sed 's/^/  /' | head -40
@@ -4092,12 +4328,10 @@ _smart_drilldown_one() {
     fi
     echo
 
-    step "Further commands"
-    explain "Full report:        $sc -x $dev"
-    explain "Just the error log: $sc -l error $dev"
-    explain "Just self-tests:    $sc -l selftest $dev"
-    explain "Run a short test:   sudo $sc -t short $dev   (~2 min, online)"
-    explain "Run a long test:    sudo $sc -t long  $dev   (hours, full surface)"
+    step "Run a fresh self-test"
+    explain "Short test:  sudo $sc -t short $dev   (~2 min, online; quick electronics + media sample)"
+    explain "Long  test:  sudo $sc -t long  $dev   (hours, full surface scan)"
+    explain "Results land in 'smart $d' section 3/4 once the test completes."
 }
 
 # ----------------------------------------------------------------------
@@ -4169,7 +4403,7 @@ ${C_BOLD}COMMANDS${C_RESET}
                                 -V         extended: adds SERIAL TEMP SMART
                                            ROT TRIM PROTOCOL
                                 -D         full 'diskutil list' output
-  ${C_CYAN}info${C_RESET} [name|uuid]            Show detailed info for a RAID set.
+  ${C_CYAN}info${C_RESET} [name|uuid] [-V]       Synonym for 'status'.
   ${C_CYAN}create${C_RESET} <name> <N1> <N2>     Create a new mirror from two disk NUMBERS
                               (e.g. '${SCRIPT_NAME} create BackupGold 2 3').
                               APFS format. Wipes both disks first.
@@ -4198,7 +4432,13 @@ ${C_BOLD}COMMANDS${C_RESET}
   ${C_CYAN}verify-wipe${C_RESET} <N>             Check that first and last 100 MB are zeros.
   ${C_CYAN}repair${C_RESET} [name|uuid]          Interactive guided repair of a degraded set.
                               Handles both 'old disk returned' and 'new replacement'.
-  ${C_CYAN}status${C_RESET} [name|uuid]          Short status summary (Online / Degraded / ...).
+  ${C_CYAN}status${C_RESET} [name|uuid] [-V]     Detailed status for one RAID set: header
+                              (Level / State / AutoRebuild / SetTimeout /
+                              size / mount / FS) plus a member table with
+                              parent-disk info. Without arg, auto-shows
+                              the only set or prints the compact 'list'.
+                              -V appends the full diskutil dumps.
+                              Synonym: 'info'.
   ${C_CYAN}watch${C_RESET} [name|uuid]           Live-refreshing status (refreshes every 10 s).
   ${C_CYAN}test${C_RESET} [--all | name|uuid]    Run non-destructive tests: mount status,
                               write/read probe, RAID consistency.
@@ -4210,6 +4450,12 @@ ${C_BOLD}COMMANDS${C_RESET}
                               no sudo required). Updates only the RAID set
                               name shown in 'diskutil appleRAID list' - not
                               the file system volume inside.
+  ${C_CYAN}autorebuild${C_RESET} [<set>] [on|off]   Manage AppleRAID's AutoRebuild policy.
+                              No-args: explainer + table of all sets w/ AR.
+                              <set>: prompt to flip current value.
+                              <set> on|off: non-interactive flip.
+                              The DEFAULT_AUTO_REBUILD config (default 1)
+                              auto-enforces this on create / health / list.
 
   ${C_BOLD}-- SoftRAID migration --${C_RESET}
   ${C_CYAN}migrate-softraid${C_RESET} [volume]    Interactive per-mirror guide: detect SoftRAID
@@ -4410,7 +4656,9 @@ ar_member_state_short() {
         Missing)    echo "M" ;;
         Spare)      echo "P" ;;
         Rebuilding) echo "R" ;;
-        Offline)    echo "F" ;;
+        Failed)     echo "F" ;;
+        Standby)    echo "S" ;;
+        Offline)    echo "X" ;;
         *)          echo "?" ;;
     esac
 }
@@ -4477,20 +4725,22 @@ gather_appleraid_rows() {
     diskutil appleRAID list 2>/dev/null | awk '
         function flush() {
             if (have) {
-                # Schema: source|level|state|devnode|size|free|mount|fs|name|members|flags
+                # Schema: source|level|state|devnode|size|free|mount|fs|name|members|flags|ar|rebuild_pct
                 # Apple emits source(1) level(2) state(3) devnode(4) size(5)
                 # then 3 empties (free/mount/fs) then name(9) members(10)
-                # then 1 trailing empty (flags) -> 11 fields, 10 pipes.
-                printf "Apple|%s|%s|%s|%s||||%s|%s|\n",
-                       type, status, devnode, size, name, members
+                # flags(11) auto_rebuild(12) rebuild_pct(13) -> 13 fields.
+                printf "Apple|%s|%s|%s|%s||||%s|%s||%s|%s\n",
+                       type, status, devnode, size, name, members, auto_rebuild, rebuild_pct
             }
-            have=0; type=""; name=""; status=""; size=""; devnode=""; members=""
+            have=0; type=""; name=""; status=""; size=""; devnode=""
+            members=""; auto_rebuild=""; rebuild_pct=""
             dash_count=0; in_members=0
         }
         /^=+$/ { flush(); next }
         /^Name:[[:space:]]/         { sub(/^Name:[[:space:]]*/,""); name=$0; have=1; next }
         /^Type:[[:space:]]/         { sub(/^Type:[[:space:]]*/,""); type=$0; next }
         /^Status:[[:space:]]/       { sub(/^Status:[[:space:]]*/,""); status=$0; next }
+        /^Rebuild:[[:space:]]/      { sub(/^Rebuild:[[:space:]]*/,""); auto_rebuild=$0; next }
         /^Size:[[:space:]]/         {
             n=split($0,p,"(")
             if (n>=2) { gsub(/[^0-9]/,"",p[2]); size=p[2] }
@@ -4501,7 +4751,29 @@ gather_appleraid_rows() {
         in_members && /^# +DevNode/ { next }
         in_members && /^[0-9]+[[:space:]]+disk/ {
             # Columns: # DevNode UUID Status Size
-            members = (members ? members " " : "") $2 ":" $4
+            # Status may be multi-word, e.g. "0% (rebuilding)" or "Online".
+            # Reconstruct everything between $3 (UUID) and $NF (size-bytes)
+            # as the per-member status.
+            mstatus=""
+            for (i=4; i<NF; i++) mstatus = (mstatus == "" ? $i : mstatus " " $i)
+            # Capture overall rebuild progress (highest %) for the set.
+            if (match(mstatus, /[0-9]+%/)) {
+                pct = substr(mstatus, RSTART, RLENGTH)
+                gsub(/%/, "", pct)
+                if (rebuild_pct == "" || pct+0 > rebuild_pct+0) rebuild_pct = pct
+            }
+            # Member-state code: simplify multi-word status to a single
+            # keyword we map to a letter in ar_member_state_short.
+            mcode = "?"
+            if (mstatus ~ /[Rr]ebuild/) mcode = "Rebuilding"
+            else if (mstatus == "Online")   mcode = "Online"
+            else if (mstatus == "Missing")  mcode = "Missing"
+            else if (mstatus == "Spare")    mcode = "Spare"
+            else if (mstatus == "Offline")  mcode = "Offline"
+            else if (mstatus == "Failed")   mcode = "Failed"
+            else if (mstatus == "Stale")    mcode = "Stale"
+            else                            mcode = mstatus
+            members = (members ? members " " : "") $2 ":" mcode
             next
         }
         END { flush() }
@@ -4579,7 +4851,7 @@ gather_softraid_rows() {
 # Render one Apple row's level + member states from the raw schema row.
 # Receives the row on stdin (single line). Outputs the rendered row.
 _render_apple_row() {
-    IFS='|' read -r src level state devnode size_b free_b mount fs name members flags _rest
+    IFS='|' read -r src level state devnode size_b free_b mount fs name members flags ar rebuild_pct _rest
     short_level=$(ar_level_short "$level")
     # Resolve fs/mount/free from the synthesized RAID device node.
     info_line=$(appleraid_volume_info "$devnode")
@@ -4602,8 +4874,32 @@ _render_apple_row() {
     [ -n "$fs" ] || fs="?"
     flags_str=""
     [ -n "$flags" ] && flags_str=" $flags"
-    printf 'AppleRAID  %-4s %-9s %-5s %-9s %-9s %-22s %s [%s]%s\n' \
-        "$short_level" "${state:--}" "$fs" "$size_str" "$free_str" "$mount" \
+
+    # Append rebuild progress to STATE while a rebuild is active.
+    state_text="${state:--}"
+    if [ -n "$rebuild_pct" ]; then
+        state_text="${state} ${rebuild_pct}%"
+    fi
+    # Pre-pad state (width 13) BEFORE adding color escapes: %-Ns counts
+    # escape bytes against the field width.
+    state_padded=$(printf '%-13s' "$state_text")
+    case "$state" in
+        Online)             state_disp="${C_GREEN}${state_padded}${C_RESET}"  ;;
+        Degraded)           state_disp="${C_YELLOW}${state_padded}${C_RESET}" ;;
+        Failed|Offline)     state_disp="${C_RED}${state_padded}${C_RESET}"    ;;
+        *)                  state_disp="$state_padded" ;;
+    esac
+
+    # AR column: AppleRAID's Rebuild policy. Lowercased + abbreviated to
+    # "auto" / "manual" / "-" so the column is narrow.
+    ar_text="-"
+    case "$(printf '%s' "$ar" | tr '[:upper:]' '[:lower:]')" in
+        automatic|auto|true|1|yes) ar_text="auto"   ;;
+        manual|false|0|no)         ar_text="manual" ;;
+    esac
+
+    printf 'AppleRAID  %-4s %s %-6s %-5s %-9s %-9s %-22s %s [%s]%s\n' \
+        "$short_level" "$state_disp" "$ar_text" "$fs" "$size_str" "$free_str" "$mount" \
         "$name" "$short_members" "$flags_str"
 }
 
@@ -4621,8 +4917,18 @@ _render_soft_row() {
     fi
     flags_str=""
     [ -n "$flags" ] && flags_str=" $flags"
-    printf 'SoftRAID   %-4s %-9s %-5s %-9s %-9s %-22s %s [%s]%s\n' \
-        "$short_level" "$state" "$fs" "$size_str" "$free_str" "$mount" \
+    # SoftRAID has its own rebuild policy (separate from AppleRAID's
+    # AutoRebuild). Print "-" in the AR column to keep column
+    # alignment with AppleRAID rows.
+    state_padded=$(printf '%-13s' "$state")
+    case "$state" in
+        Online|Optimal)         state_disp="${C_GREEN}${state_padded}${C_RESET}"  ;;
+        Degraded|Rebuilding)    state_disp="${C_YELLOW}${state_padded}${C_RESET}" ;;
+        Failed|Offline|Missing) state_disp="${C_RED}${state_padded}${C_RESET}"    ;;
+        *)                      state_disp="$state_padded" ;;
+    esac
+    printf 'SoftRAID   %-4s %s %-6s %-5s %-9s %-9s %-22s %s [%s]%s\n' \
+        "$short_level" "$state_disp" "-" "$fs" "$size_str" "$free_str" "$mount" \
         "$name" "$members" "$flags_str"
 }
 
@@ -4636,8 +4942,8 @@ print_raid_summary() {
         return
     fi
 
-    printf '%s%-10s %-4s %-9s %-5s %-9s %-9s %-22s %s%s\n' \
-        "${C_BOLD}" "SOURCE" "LVL" "STATE" "FS" "SIZE" "FREE" "MOUNT" "NAME [MEMBERS]" "${C_RESET}"
+    printf '%s%-10s %-4s %-13s %-6s %-5s %-9s %-9s %-22s %s%s\n' \
+        "${C_BOLD}" "SOURCE" "LVL" "STATE" "AR" "FS" "SIZE" "FREE" "MOUNT" "NAME [MEMBERS]" "${C_RESET}"
 
     if [ -n "$apple_rows" ]; then
         printf '%s\n' "$apple_rows" | while IFS= read -r row; do
@@ -4658,8 +4964,8 @@ print_raid_summary() {
     n_soft_degraded=$(printf '%s\n' "$soft_rows" | awk -F'|' 'NF && $3 != "normal" {n++} END {print n+0}')
 
     echo
-    explain "Member states: O=Online M=Missing P=Spare/Primary S=Secondary R=Rebuilding F=Offline ?=Unknown"
-    explain "Flags: SG=Safeguard enabled (SoftRAID)"
+    explain "Member states: O=Online R=Rebuilding F=Failed S=Standby M=Missing P=Spare X=Offline ?=Unknown"
+    explain "AR column: AppleRAID Rebuild policy (auto/manual). Flags: SG=Safeguard enabled (SoftRAID)."
     if softraid_tool_available; then
         printf 'Totals: %s AppleRAID set(s) (%s degraded), %s SoftRAID volume(s) (%s degraded).\n' \
             "${n_apple:-0}" "$n_apple_degraded" "${n_soft:-0}" "$n_soft_degraded"
@@ -4725,9 +5031,22 @@ EOF
         esac
     done
 
+    # Load config so DEFAULT_AUTO_REBUILD (and other defaults) are available.
+    cfg_load 2>/dev/null
+
     if [ "$VERBOSE" = "1" ] || [ "$DEBUG" = "1" ]; then
         cmd_list_verbose_dump
         echo
+    fi
+
+    # Enforce DEFAULT_AUTO_REBUILD on every visible set BEFORE gathering
+    # the summary, so the AR column reflects post-enforcement state.
+    # No-op (silent) if every set already matches the configured target,
+    # or if DEFAULT_AUTO_REBUILD is empty.
+    if [ -n "${DEFAULT_AUTO_REBUILD:-}" ]; then
+        for u in $(raid_list_uuids 2>/dev/null); do
+            enforce_default_ar_for_uuid "$u" >/dev/null 2>&1 || true
+        done
     fi
 
     step "RAID summary"
@@ -4936,12 +5255,65 @@ EOF
 }
 
 # ----------------------------------------------------------------------
-# Subcommand: info
+# Subcommand: status (also accessible as 'info' - synonym in dispatch)
 # ----------------------------------------------------------------------
-cmd_info() {
-    if [ $# -ge 1 ]; then
-        arg="$1"
-        # Try as UUID first, then as name.
+# Behavior:
+#   No arg, 0 sets   -> warn + exit 1
+#   No arg, 1 set    -> auto-show that set's full status
+#   No arg, 2+ sets  -> compact list (cmd_list output)
+#   <name|uuid>      -> full status for that set (set-level header,
+#                       members table with parent-disk info, AR +
+#                       SetTimeout from ioreg, mount info)
+#   -V               -> ALSO append the full 'diskutil appleRAID list'
+#                       dump and 'diskutil info' on the synthesized
+#                       virtual device.
+cmd_status() {
+    eval "$(parse_global_flags "$@")"
+
+    arg=""
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -h|--help)
+                cat <<EOF
+Usage: $SCRIPT_NAME status [<set>] [-V]
+       $SCRIPT_NAME info   [<set>] [-V]    (synonym)
+
+Show detailed status for one AppleRAID set: header (level, state,
+AutoRebuild, SetTimeout, size, mount, free, FS, virtual device), plus
+a per-member table (kernel state + parent physical disk info).
+
+Without <set>:
+  - 0 sets    : prints a warning, exits 1.
+  - 1 set     : auto-shows that set's full status.
+  - 2+ sets   : prints the compact 'list' summary (use 'status <set>'
+                for the per-set drill-down).
+
+With -V: appends the full 'diskutil appleRAID list' dump and the
+'diskutil info' for the synthesized RAID device.
+EOF
+                return 0
+                ;;
+            -V|--verbose|-D|--debug) ;;
+            -*) warn "Unknown option: $1" ;;
+            *)  arg="$1" ;;
+        esac
+        shift
+    done
+
+    cfg_load 2>/dev/null
+
+    if [ -z "$arg" ]; then
+        n=$(raid_count)
+        if [ "$n" -eq 0 ]; then
+            warn "No AppleRAID sets found."
+            return 1
+        fi
+        if [ "$n" -ge 2 ]; then
+            cmd_list
+            return 0
+        fi
+        SELECTED_UUID=$(raid_list_uuids | head -1)
+    else
         uuid=""
         for u in $(raid_list_uuids); do
             [ "$u" = "$arg" ] && uuid="$u" && break
@@ -4949,64 +5321,100 @@ cmd_info() {
         [ -z "$uuid" ] && uuid=$(raid_name_to_uuid "$arg")
         [ -z "$uuid" ] && die "No RAID set matches '$arg'."
         SELECTED_UUID="$uuid"
-    else
-        pick_raid_set
     fi
 
-    step "RAID set details: $SELECTED_UUID"
-    dev=$(raid_uuid_to_device "$SELECTED_UUID")
+    UUID="$SELECTED_UUID"
+    name=$(diskutil appleRAID list "$UUID" 2>/dev/null \
+        | awk -F': +' '/^Name:/ {v=$2; sub(/[[:space:]]+$/,"",v); print v; exit}')
 
-    explain "Command: diskutil appleRAID list <uuid>"
+    step "Status of RAID set '$name' ($UUID)"
+
+    # Set-level fields
+    type_str=$(diskutil appleRAID list "$UUID" 2>/dev/null \
+        | awk -F': +' '/^Type:/ {print $2; exit}' | sed 's/[[:space:]]*$//')
+    state=$(raid_status "$UUID")
+    size_str=$(diskutil appleRAID list "$UUID" 2>/dev/null \
+        | awk -F': +' '/^Size:/ {print $2; exit}' | sed 's/ *(.*//; s/[[:space:]]*$//')
+    dev=$(raid_uuid_to_device "$UUID")
+
+    ar_raw=$(raid_ar_get "$UUID")
+    case "$ar_raw" in
+        1) ar_word="auto (1)"   ;;
+        0) ar_word="manual (0)" ;;
+        *) ar_word="?"          ;;
+    esac
+    st_secs=$(raid_st_get "$UUID")
+
+    info_line=$(appleraid_volume_info "$dev")
+    fs=$(printf '%s\n' "$info_line" | awk -F'|' '{print $1}')
+    mount_pt=$(printf '%s\n' "$info_line" | awk -F'|' '{print $2}')
+    free_b=$(printf '%s\n' "$info_line" | awk -F'|' '{print $3}')
+    if [ -z "$mount_pt" ] || [ "$mount_pt" = "-" ]; then
+        mount_pt="<not mounted>"
+        free_str="n/a"
+    else
+        free_str=$(fmt_bytes "$free_b")
+    fi
+    [ -n "$fs" ] || fs="?"
+
+    case "$state" in
+        Online)   state_disp="${C_GREEN}${state}${C_RESET}"  ;;
+        Degraded) state_disp="${C_YELLOW}${state}${C_RESET}" ;;
+        *)        state_disp="${C_RED}${state:-?}${C_RESET}" ;;
+    esac
+    printf '  %-15s %s\n' "Level:"        "${type_str:-?}"
+    printf '  %-15s %s\n' "State:"        "$state_disp"
+    printf '  %-15s %s\n' "AutoRebuild:"  "$ar_word"
+    printf '  %-15s %s%s\n' "SetTimeout:" "${st_secs:-?}" "s  (informational - changes have no observable runtime effect; see README)"
+    printf '  %-15s %s\n' "Size:"         "${size_str:-?}"
+    printf '  %-15s %s\n' "Mount:"        "$mount_pt"
+    [ "$mount_pt" != "<not mounted>" ] && printf '  %-15s %s\n' "Free:" "$free_str"
+    printf '  %-15s %s\n' "Volume FS:"    "$fs"
+    printf '  %-15s /dev/%s\n' "RAID device:" "${dev:-?}"
+
     echo
-    run diskutil appleRAID list "$SELECTED_UUID"
-
-    if [ -n "$dev" ]; then
-        echo
-        step "Virtual device backing the RAID set: /dev/$dev"
-        explain "Command: diskutil info /dev/$dev"
-        echo
-        run diskutil info "/dev/$dev"
-    fi
-}
-
-# ----------------------------------------------------------------------
-# Subcommand: status
-# ----------------------------------------------------------------------
-cmd_status() {
-    if [ $# -ge 1 ]; then
-        arg="$1"
-        uuid=""
-        for u in $(raid_list_uuids); do
-            [ "$u" = "$arg" ] && uuid="$u" && break
-        done
-        [ -z "$uuid" ] && uuid=$(raid_name_to_uuid "$arg")
-        [ -z "$uuid" ] && die "No RAID set matches '$arg'."
-        uuids="$uuid"
-    else
-        uuids=$(raid_list_uuids)
-    fi
-
-    if [ -z "$uuids" ]; then
-        warn "No AppleRAID sets found."
-        return 1
-    fi
-
-    step "AppleRAID status summary"
-    for u in $uuids; do
-        name=$(diskutil appleRAID list | awk -F': +' -v u="$u" '
-            /^Name:/      { cur = $2; sub(/ +$/, "", cur) }
-            /^Unique ID:/ { uuid = $2; sub(/ +$/, "", uuid); if (uuid == u) { print cur; exit } }
-        ')
-        st=$(raid_status "$u")
-        dev=$(raid_uuid_to_device "$u")
-        case "$st" in
-            Online)    color="$C_GREEN" ;;
-            Degraded)  color="$C_YELLOW" ;;
-            *)         color="$C_RED" ;;
+    step "Members"
+    diskutil appleRAID list "$UUID" 2>/dev/null | awk '
+        BEGIN { found=0 }
+        /^#[[:space:]]+DevNode/ { found=1; next }
+        found && /^[0-9]+[[:space:]]+disk/ {
+            n = split($0, p, /[[:space:]]+/)
+            delete q; nq=0
+            for (i=1; i<=n; i++) if (p[i] != "") { nq++; q[nq]=p[i] }
+            if (nq < 5) next
+            idx=q[1]; devnode=q[2]; muuid=q[3]
+            status=q[4]
+            for (i=5; i<=nq-1; i++) status = status " " q[i]
+            size=q[nq]
+            printf "%s|%s|%s|%s|%s\n", idx, devnode, muuid, status, size
+        }
+    ' | while IFS='|' read -r idx devnode muuid mstatus msize; do
+        parent=$(echo "$devnode" | sed 's/s[0-9]*$//')
+        pinfo=$(diskutil info "/dev/$parent" 2>/dev/null)
+        model=$(echo "$pinfo" | awk -F': +' '/Device \/ Media Name:/ {print $2; exit}')
+        [ -z "$model" ] && model=$(echo "$pinfo" | awk -F': +' '/Media Name:/ {print $2; exit}')
+        loc=$(echo "$pinfo"   | awk -F': +' '/Device Location:/ {print $2; exit}')
+        loc=$(echo "$loc"     | awk '{print $1}')
+        psize=$(echo "$pinfo" | awk -F': +' '/Disk Size:/ {print $2; exit}' | sed 's/ *(.*//; s/[[:space:]]*$//')
+        case "$mstatus" in
+            Online)              ms="${C_GREEN}${mstatus}${C_RESET}"  ;;
+            *[Rr]ebuild*)        ms="${C_YELLOW}${mstatus}${C_RESET}" ;;
+            *)                   ms="${C_RED}${mstatus}${C_RESET}"    ;;
         esac
-        printf '  %-20s  %s%-12s%s  uuid=%s  dev=/dev/%s\n' \
-            "$name" "$color" "$st" "$C_RESET" "$u" "$dev"
+        printf '  [%s] %-9s %s  parent=/dev/%-7s loc=%-9s size=%-9s model=%s\n' \
+            "$idx" "$devnode" "$ms" "$parent" "${loc:-?}" "${psize:-?}" "${model:-?}"
     done
+
+    if [ "$VERBOSE" = "1" ]; then
+        echo
+        step "Verbose: full diskutil appleRAID list output"
+        run diskutil appleRAID list "$UUID"
+        if [ -n "$dev" ]; then
+            echo
+            step "Verbose: diskutil info /dev/$dev"
+            run diskutil info "/dev/$dev"
+        fi
+    fi
 }
 
 # ----------------------------------------------------------------------
@@ -5223,8 +5631,14 @@ ARGUMENTS
             interactive picker listing all attached physical disks.
 
 NOTES
-  - If the disk is currently a member of an online AppleRAID set,
-    ejecting it will degrade the set. You'll be prompted to confirm.
+  - If the disk is a member of an online AppleRAID set, the set's
+    kernel claim blocks 'diskutil eject'. You'll be shown a 3-step
+    plan and one confirmation:
+        1. unmount the disk
+        2. diskutil appleRAID remove <member-uuid> <set-uuid>
+           (set goes DEGRADED here)
+        3. diskutil eject
+    After swapping the disk, rebuild with: '$SCRIPT_NAME repair <set>'.
   - Internal disks are refused (would take down macOS).
   - Virtual devices (RAID/APFS containers) are refused; eject the
     backing physical disk instead.
@@ -5256,42 +5670,98 @@ EOF
         die "$dev is an INTERNAL disk - refusing to eject (would take down macOS)."
     fi
 
-    # Detect if this disk is a member of an existing AppleRAID set.
-    raid_set_name=$(diskutil appleRAID list 2>/dev/null | awk -v d="$short" '
-        /^Name:/             { setname = $2; sub(/^[ \t]+/, "", setname); sub(/ +$/, "", setname) }
-        /^[ ]*[0-9]+[ \t]+disk[0-9]+/ {
-            nf = split($0, parts, /[ \t]+/)
-            for (i = 1; i <= nf; i++) {
-                if (parts[i] ~ /^disk[0-9]+(s[0-9]+)?$/) {
-                    devname = parts[i]; sub(/s[0-9]+$/, "", devname)
-                    if (devname == d) { print setname; exit }
+    # Detect if this disk is a member of an existing AppleRAID set, and
+    # if so capture the set name + UUID, member UUID, and member partition
+    # node (e.g. disk7s2). We need all four to call
+    # 'diskutil appleRAID remove <member-uuid> <set-uuid>', which is the
+    # only way to release the disk: AppleRAID claims members at the
+    # kernel level so 'diskutil eject' fails while membership is live.
+    raid_info=$(diskutil appleRAID list 2>/dev/null | awk -F': +' -v d="$short" '
+        /^Name:/         { setname = $2; sub(/[[:space:]]+$/, "", setname) }
+        /^Unique ID:/    { setuuid = $2; sub(/[[:space:]]+$/, "", setuuid) }
+        /^[[:space:]]*[0-9]+[[:space:]]+disk[0-9]+/ {
+            n = split($0, p, /[[:space:]]+/)
+            j = 0
+            for (i = 1; i <= n; i++) {
+                if (p[i] != "") {
+                    j++
+                    if (j == 2) devnode = p[i]
+                    if (j == 3) muuid   = p[i]
                 }
+            }
+            base = devnode; sub(/s[0-9]+$/, "", base)
+            if (base == d) {
+                printf "%s|%s|%s|%s\n", setname, setuuid, muuid, devnode
+                exit
             }
         }
     ')
+    raid_set_name=$(   echo "$raid_info" | cut -d'|' -f1)
+    raid_set_uuid=$(   echo "$raid_info" | cut -d'|' -f2)
+    raid_member_uuid=$(echo "$raid_info" | cut -d'|' -f3)
+    raid_member_part=$(echo "$raid_info" | cut -d'|' -f4)
 
     step "Eject plan for $dev"
     describe_disk "$dev"
+    release_from_raid=0
     if [ -n "$raid_set_name" ]; then
-        warn "$dev is currently a member of AppleRAID set '$raid_set_name'."
-        warn "Ejecting it WILL degrade the RAID set until the disk is reconnected"
-        warn "(or replaced and rebuilt via '$SCRIPT_NAME repair')."
+        warn "$dev is a member of AppleRAID set '$raid_set_name'."
+        warn "  Set UUID:    $raid_set_uuid"
+        warn "  Member:      $raid_member_part  ($raid_member_uuid)"
         echo
-        confirm "Eject $dev anyway?" || die "Aborted."
+        explain "AppleRAID claims member disks at the kernel level, so 'diskutil eject'"
+        explain "fails while membership is live. To eject we must first release the"
+        explain "disk from the set."
+        echo
+        explain "Plan if you confirm:"
+        explain "  1. sudo diskutil unmountDisk force $dev"
+        explain "  2. sudo diskutil appleRAID remove $raid_member_uuid $raid_set_uuid"
+        explain "     (set '$raid_set_name' goes DEGRADED here)"
+        explain "  3. diskutil eject $dev"
+        explain ""
+        explain "After swapping the disk, rebuild with:  $SCRIPT_NAME repair $raid_set_name"
+        echo
+        confirm "Eject $dev and degrade set '$raid_set_name'?" || die "Aborted."
+        release_from_raid=1
     fi
 
     step "Unmounting $dev"
     run sudo diskutil unmountDisk force "$dev" \
         || warn "unmountDisk returned non-zero (may be already unmounted)"
 
+    if [ "$release_from_raid" = "1" ]; then
+        step "Removing $raid_member_part from AppleRAID set '$raid_set_name'"
+        explain "'diskutil appleRAID remove <member-uuid> <set-uuid>' releases the disk"
+        explain "from the kernel-level RAID claim. Set goes DEGRADED."
+        if ! run sudo diskutil appleRAID remove "$raid_member_uuid" "$raid_set_uuid"; then
+            err "appleRAID remove failed."
+            explain "Possible reasons:"
+            explain "  - The set is currently rebuilding; wait for it to finish."
+            explain "  - macOS refused to remove the last viable member of the set."
+            explain "  - The member UUID changed since this run started. Verify with:"
+            explain "      diskutil appleRAID list $raid_set_uuid"
+            exit 1
+        fi
+    fi
+
     step "Ejecting $dev"
     if run diskutil eject "$dev"; then
         ok "$dev ejected. Safe to disconnect."
+        if [ "$release_from_raid" = "1" ]; then
+            echo
+            info "Set '$raid_set_name' is now DEGRADED."
+            info "After connecting a replacement (or this same disk back),"
+            info "rebuild with:  $SCRIPT_NAME repair $raid_set_name"
+        fi
     else
         err "diskutil eject failed for $dev."
         explain "Possible reasons:"
         explain "  - A process is still holding files open on a volume on $dev."
         explain "    Try: lsof +D /Volumes/<name>  (or 'sudo lsof' for system processes)"
+        if [ -n "$raid_set_name" ] && [ "$release_from_raid" != "1" ]; then
+            explain "  - $dev is still a member of AppleRAID set '$raid_set_name'."
+            explain "    Re-run '$SCRIPT_NAME eject $short' and confirm the release prompt."
+        fi
         explain "  - The enclosure does not honor SCSI eject (some USB bridges)."
         explain "    The disk is unmounted but the device node will persist."
         explain "  - macOS refused due to a pending I/O operation. Wait a few seconds and retry."
@@ -5521,10 +5991,30 @@ cmd_create() {
 
     ok "Mirror '$name' created successfully."
 
+    # Load config (sets DEFAULT_AUTO_REBUILD, AUTO_BASELINE_*, etc.).
+    cfg_load 2>/dev/null || true
+
+    # Apply DEFAULT_AUTO_REBUILD policy to the new set. Apple's default
+    # is AutoRebuild=0 (manual); our default config (DEFAULT_AUTO_REBUILD=1)
+    # flips it to automatic right after creation, so a returning member
+    # auto-rebuilds without operator intervention. Skipped if config
+    # is empty.
+    if [ -n "${DEFAULT_AUTO_REBUILD:-}" ]; then
+        new_uuid=$(raid_name_to_uuid "$name")
+        if [ -n "$new_uuid" ]; then
+            step "Applying DEFAULT_AUTO_REBUILD=$DEFAULT_AUTO_REBUILD to '$name'"
+            if enforce_default_ar_for_uuid "$new_uuid"; then
+                ok "AutoRebuild set to ${DEFAULT_AUTO_REBUILD} on '$name'."
+            else
+                warn "Failed to set AutoRebuild=$DEFAULT_AUTO_REBUILD on '$name'."
+                warn "You can retry manually:  $SCRIPT_NAME autorebuild $name on"
+            fi
+        fi
+    fi
+
     # Auto-baseline hook: if the user has opted in (via config or by
     # default), add the new set to the baseline immediately so the
     # health daemon's REQUIRED_SETS=all check knows about it right away.
-    cfg_load 2>/dev/null || true
     if [ "${AUTO_BASELINE_FOR_SETS_ON_CREATE:-no}" = "yes" ]; then
         state_init 2>/dev/null || true
         baseline_write_sets
@@ -5555,9 +6045,117 @@ do_auto_wipe() {
 }
 
 # ----------------------------------------------------------------------
+# Educated guess for the replacement disk in `cmd_repair`.
+#
+# Inputs:
+#   $1  target_size_bytes  size of the existing RAID member (replacement
+#                          must be >= this)
+#   $2  set_name           name of the RAID being repaired (so a
+#                          previously-recognized returning member can be
+#                          identified by 'role = RAID member (set_name)')
+#
+# Output (single line, pipe-separated):
+#   <diskN>|<reason>
+#
+# Empty output if no good candidate exists.
+#
+# Scoring ladder (highest wins; ties broken by lowest disk number):
+#   95  already a member of THIS set             - returning member that
+#                                                   AppleRAID still has
+#                                                   claimed (Stale/Spare/
+#                                                   Failed); cmd_repair
+#                                                   releases it via
+#                                                   'appleRAID remove'
+#                                                   before wipe + rebuild
+#   80  free disk, exact size match              - "looks like a clean
+#                                                   replacement of the
+#                                                   right size"
+#   60  free disk, larger than target            - "fits, with slack"
+#
+# Excluded outright: internal disks, virtual devices, members of OTHER
+# RAID sets, and disks smaller than target_size_bytes.
+#
+# Cache-of-serials note: the smart_dtype_for cache stores
+# disk|serial_hash|dtype. We use disk_serial / disk_serial_hash to surface
+# the candidate's serial in the suggestion message so the user can verify
+# "yes that's my disk", but the cache currently does NOT track which
+# RAID a serial belonged to historically - that would be a useful future
+# enhancement (cache RAID-member serials during health/list runs and
+# match returning members by serial here).
+# ----------------------------------------------------------------------
+_repair_guess_replacement() {
+    target_size="$1"
+    selected_set_name="$2"
+
+    # Build "disk -> set name" mapping for current RAIDs.
+    raid_map=$(diskutil appleRAID list 2>/dev/null | awk -F': +' '
+        /^Name:/ { setname = $2; sub(/[[:space:]]+$/, "", setname) }
+        /^[[:space:]]*[0-9]+[[:space:]]+disk[0-9]+/ {
+            n = split($0, p, /[[:space:]]+/)
+            j = 0
+            for (i = 1; i <= n; i++) {
+                if (p[i] != "") { j++; if (j==2) { devnode = p[i]; break } }
+            }
+            base = devnode; sub(/s[0-9]+$/, "", base)
+            print base "|" setname
+        }
+    ')
+
+    disks=$(diskutil list 2>/dev/null | awk '/^\/dev\/disk[0-9]+/ {
+        sub(/:$/, "", $1); sub(/^\/dev\//, "", $1); print $1
+    }')
+
+    best_disk=""
+    best_score=0
+    best_reason=""
+
+    for d in $disks; do
+        info_out=$(diskutil info "/dev/$d" 2>/dev/null) || continue
+        virtual=$(echo "$info_out"  | awk -F': +' '/Virtual:/  {print $2; exit}')
+        [ "$virtual" = "Yes" ] && continue
+        internal=$(echo "$info_out" | awk -F': +' '/Internal:/ {print $2; exit}')
+        [ "$internal" = "Yes" ] && continue
+
+        size_bytes=$(disk_size_bytes "/dev/$d")
+        size_bytes=$(printf '%s' "$size_bytes" | tr -dc '0-9')
+        [ -n "$size_bytes" ] || continue
+
+        if [ -n "$target_size" ] && [ "$target_size" -gt 0 ] 2>/dev/null \
+           && [ "$size_bytes" -lt "$target_size" ] 2>/dev/null; then
+            continue
+        fi
+
+        my_set=$(printf '%s\n' "$raid_map" \
+                 | awk -F'|' -v d="$d" '$1==d {print $2; exit}')
+
+        score=0; reason=""
+        if [ -z "$my_set" ]; then
+            if [ -n "$target_size" ] && [ "$size_bytes" = "$target_size" ]; then
+                score=80; reason="exact size match, currently free"
+            else
+                score=60; reason="larger free disk"
+            fi
+        elif [ "$my_set" = "$selected_set_name" ]; then
+            score=95; reason="returning member of '$selected_set_name'"
+        else
+            continue
+        fi
+
+        if [ "$score" -gt "$best_score" ]; then
+            best_score="$score"
+            best_disk="$d"
+            best_reason="$reason"
+        fi
+    done
+
+    [ -n "$best_disk" ] && echo "$best_disk|$best_reason"
+}
+
+# ----------------------------------------------------------------------
 # Subcommand: repair (interactive guided)
 # ----------------------------------------------------------------------
 cmd_repair() {
+    eval "$(parse_global_flags "$@")"
     if [ $# -ge 1 ]; then
         arg="$1"
         uuid=""
@@ -5572,8 +6170,10 @@ cmd_repair() {
     fi
 
     step "Interactive repair for RAID set $SELECTED_UUID"
-    run diskutil appleRAID list "$SELECTED_UUID"
-    echo
+    if [ "$VERBOSE" = "1" ]; then
+        run diskutil appleRAID list "$SELECTED_UUID"
+        echo
+    fi
 
     st=$(raid_status "$SELECTED_UUID")
     case "$st" in
@@ -5606,14 +6206,139 @@ cmd_repair() {
     explain ""
     explain "Either way, the operation is the same: wipe + repairMirror."
     echo
-    info "Current disks on the system:"
-    run diskutil list | awk '/^\/dev\/disk[0-9]+ \(external/,/^$/'
+    # Use the compact 'disks' table for selection - the ROLE column makes
+    # it obvious which disks are already RAID members vs free. With -V
+    # cmd_disks itself shows the extended view (adds SERIAL/TEMP/SMART).
+    cmd_disks
     echo
-    printf 'Enter the disk NUMBER of the replacement drive (e.g. 3): '
+
+    # Compute target member size + set name for the educated guess.
+    target_member_size=$(diskutil appleRAID list "$SELECTED_UUID" 2>/dev/null \
+        | awk '/^[0-9]+[ \t]+disk/ {print $NF; exit}')
+    target_set_name=$(diskutil appleRAID list "$SELECTED_UUID" 2>/dev/null \
+        | awk -F': +' '/^Name:/ {v=$2; sub(/[[:space:]]+$/,"",v); print v; exit}')
+
+    guess=""
+    guess_reason=""
+    if [ -n "$target_member_size" ]; then
+        g=$(_repair_guess_replacement "$target_member_size" "$target_set_name")
+        if [ -n "$g" ]; then
+            guess=$(echo "$g" | cut -d'|' -f1)
+            guess_reason=$(echo "$g" | cut -d'|' -f2-)
+        fi
+    fi
+
+    if [ -n "$guess" ]; then
+        guess_num="${guess#disk}"
+        # Pull model + serial for display so the user can verify "yes
+        # that's my disk" before pressing Enter.
+        guess_model=$(diskutil info "/dev/$guess" 2>/dev/null \
+            | awk -F': +' '/Device \/ Media Name:/ {print $2; exit}')
+        guess_serial=$(disk_serial "$guess" 2>/dev/null)
+        info "Suggested replacement: $guess  ($guess_reason)"
+        [ -n "$guess_model" ]  && info "  model:  $guess_model"
+        [ -n "$guess_serial" ] && info "  serial: $guess_serial"
+        echo
+        printf 'Enter the disk NUMBER of the replacement drive [Enter for %s]: ' "$guess_num"
+    else
+        printf 'Enter the disk NUMBER of the replacement drive (e.g. 3): '
+    fi
     read -r disknum
+    if [ -z "$disknum" ] && [ -n "$guess" ]; then
+        disknum="$guess_num"
+        info "Using suggested: $guess"
+    fi
     [ -n "$disknum" ] || die "No disk number entered."
     dev=$(resolve_disk "$disknum") || die "Invalid disk spec: $disknum"
     assert_whole_disk "$dev"
+
+    # Returning-member case: if the chosen disk is currently a member of
+    # THIS set, branch on its MemberStatus:
+    #   Online                 - nothing to repair, refuse loudly
+    #   *Rebuild* / Rebuilding - rebuild already running, point to 'watch' and refuse
+    #   Failed / Standby /
+    #   Missing / Spare-Missing
+    #   / anything else        - the legitimate stale-member case: explicitly
+    #                            warn that AppleRAID has no incremental resync
+    #                            so a FULL rebuild is required, then release
+    #                            the kernel claim via 'appleRAID remove' so
+    #                            assert_safe_target passes and repairMirror
+    #                            can proceed.
+    chosen_short="${dev#/dev/}"
+    chosen_member_uuid=""
+    chosen_member_part=""
+    chosen_member_status=""
+    if [ -n "$target_set_name" ]; then
+        chosen_member_info=$(diskutil appleRAID list 2>/dev/null \
+            | awk -F': +' -v sname="$target_set_name" -v d="$chosen_short" '
+                /^Name:/      { setname = $2; sub(/[[:space:]]+$/, "", setname) }
+                /^Unique ID:/ { setuuid = $2; sub(/[[:space:]]+$/, "", setuuid) }
+                /^[[:space:]]*[0-9]+[[:space:]]+disk[0-9]+/ {
+                    # Member line: index devnode uuid status... size-bytes.
+                    # Status may be multi-word (e.g. "0% (rebuilding)"), so
+                    # parse via clean non-empty token array.
+                    nraw = split($0, p, /[[:space:]]+/)
+                    delete q; nq = 0
+                    for (i = 1; i <= nraw; i++) {
+                        if (p[i] != "") { nq++; q[nq] = p[i] }
+                    }
+                    if (nq < 5) next
+                    devnode = q[2]; muuid = q[3]
+                    base = devnode; sub(/s[0-9]+$/, "", base)
+                    if (base == d && setname == sname) {
+                        status = q[4]
+                        for (i = 5; i <= nq - 1; i++) status = status " " q[i]
+                        printf "%s|%s|%s\n", muuid, devnode, status
+                        exit
+                    }
+                }')
+        if [ -n "$chosen_member_info" ]; then
+            chosen_member_uuid=$(echo "$chosen_member_info"   | cut -d'|' -f1)
+            chosen_member_part=$(echo "$chosen_member_info"   | cut -d'|' -f2)
+            chosen_member_status=$(echo "$chosen_member_info" | cut -d'|' -f3-)
+
+            case "$chosen_member_status" in
+                Online)
+                    err "$dev is currently an ONLINE member of set '$target_set_name'."
+                    err "Nothing to repair on this disk - it's already part of an active mirror."
+                    explain "Possible reasons:"
+                    explain "  - You picked the wrong disk. Use '$SCRIPT_NAME disks' to find a free one."
+                    explain "  - You meant the OTHER member of this set."
+                    die "Aborted - active member."
+                    ;;
+                *[Rr]ebuild*)
+                    err "$dev is currently REBUILDING as a member of '$target_set_name'"
+                    err "  (status: $chosen_member_status)."
+                    err "A rebuild is already running. Don't start another one."
+                    explain "Watch progress:"
+                    explain "    $SCRIPT_NAME watch $target_set_name"
+                    explain "Wait for it to finish, then re-run repair only if it didn't recover."
+                    die "Aborted - rebuild already in progress."
+                    ;;
+                *)
+                    warn "$dev is currently a $chosen_member_status member of set '$target_set_name'"
+                    warn "  ($chosen_member_part, member-uuid $chosen_member_uuid)."
+                    echo
+                    explain "AppleRAID has NO incremental resync (no write-intent bitmap), so"
+                    explain "any re-add of this member triggers a FULL block-level rebuild."
+                    explain "  Estimated time: ~14 hours per 10 TB at sustained ~200 MB/s."
+                    explain "  The mirror stays mounted and usable during the rebuild."
+                    explain ""
+                    explain "AppleRAID still has the kernel claim on this slot, so we must"
+                    explain "release it via 'diskutil appleRAID remove' before wiping and"
+                    explain "calling repairMirror."
+                    echo
+                    confirm "Release $dev from '$target_set_name' and start a full rebuild?" \
+                        || die "Aborted."
+                    run sudo diskutil appleRAID remove "$chosen_member_uuid" "$SELECTED_UUID" \
+                        || die "appleRAID remove failed - cannot proceed."
+                    ok "Disk released from set."
+                    echo
+                    ;;
+            esac
+        fi
+    fi
+
     assert_safe_target "$dev"
 
     step "Replacement disk details"
@@ -5877,6 +6602,183 @@ EOF
     fi
 
     _cmd_test_one_uuid "$SELECTED_UUID" || exit 1
+}
+
+# ----------------------------------------------------------------------
+# Subcommand: autorebuild
+# ----------------------------------------------------------------------
+# Manage AppleRAID's `AutoRebuild` (a.k.a. `Rebuild:` in `diskutil
+# appleRAID list`) per set. With AutoRebuild=automatic, a returning
+# member after a transient disconnect auto-rebuilds without operator
+# intervention. With manual, a returning member sits in `Failed` until
+# you run `repair`.
+#
+# Usage:
+#   autorebuild                    explainer + table of all sets w/ AR
+#   autorebuild <set>              show current state for one set;
+#                                  prompt yes/no to flip
+#   autorebuild <set> on|off       non-interactive flip
+#
+# (`SetTimeout` is intentionally NOT manageable via this command -
+# empirical testing on real disks shows it has no observable effect on
+# physical-disconnect behavior. See README "Empirically-verified
+# AppleRAID behavior" section. SetTimeout is displayed read-only in
+# `status`.)
+cmd_autorebuild() {
+    eval "$(parse_global_flags "$@")"
+
+    arg_set=""
+    arg_mode=""
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -h|--help)
+                cat <<EOF
+Usage: $SCRIPT_NAME autorebuild [<set>] [on|off]
+
+  (no args)             Print an explainer about AutoRebuild + show every
+                        set's current AR setting. No prompts, read-only.
+  <set>                 Show the named set's current AR; prompt yes/no to
+                        flip it. Requires sudo for the update.
+  <set> on              Set AutoRebuild=automatic non-interactively.
+  <set> off             Set AutoRebuild=manual non-interactively.
+
+<set> can be a UUID or the set's name.
+
+Why AutoRebuild=on (recommended):
+  Empirical real-disk testing shows AutoRebuild is the ONLY knob that
+  controls what happens when a temporarily-missing member returns.
+  With on (automatic): the kernel auto-rebuilds the returning member
+  back to Online (full block-by-block rebuild, takes hours per TB).
+  With off (manual): the returning member stays in 'Failed' status
+  forever until you run '$SCRIPT_NAME repair'.
+
+Note: SetTimeout (also a per-set parameter) has NO observable runtime
+effect for clean physical disconnects on the enclosures we tested. It
+is intentionally not managed by this command. Apple's default is 30s;
+see '$SCRIPT_NAME status <set>' for the current value.
+EOF
+                return 0
+                ;;
+            -V|--verbose|-D|--debug) ;;
+            on|off|ON|OFF) arg_mode="$1" ;;
+            -*) warn "Unknown option: $1" ;;
+            *)
+                if [ -z "$arg_set" ]; then arg_set="$1"
+                else warn "Unexpected extra arg: $1"; fi
+                ;;
+        esac
+        shift
+    done
+
+    cfg_load 2>/dev/null
+
+    # No-args mode: explainer + table of all sets.
+    if [ -z "$arg_set" ]; then
+        cat <<'EOF'
+
+=== AutoRebuild explainer ===
+
+AppleRAID has TWO per-set parameters: AutoRebuild and SetTimeout.
+
+* AutoRebuild (this command):
+    automatic (1) - When a temporarily-missing member returns, the
+                    kernel auto-starts a FULL rebuild on it. The
+                    member transitions Failed -> Rebuilding -> Online.
+                    Takes hours per TB (block-by-block; AppleRAID
+                    has no incremental resync mechanism).
+    manual    (0) - The returning member stays in 'Failed' status
+                    until you run '$SCRIPT_NAME repair' manually.
+
+* SetTimeout (NOT managed by this command, displayed in 'status'):
+    The kernel's "patience window" before declaring a missing member
+    failed. Apple's default is 30s. EMPIRICAL FINDING: changing this
+    has NO observable effect on clean physical disconnects of the
+    enclosures we've tested - the kernel transitions to Degraded
+    immediately and a returning member is treated as failed
+    regardless of how long it was missing. We don't write this field.
+
+The script's DEFAULT_AUTO_REBUILD config controls automatic enforcement
+of AutoRebuild on every set the script touches (create / health / list
+calls). Default value: 1 (auto-enable AR on every set).
+
+EOF
+        # Table of every set with current AR.
+        printf '%s%-8s %-22s %-36s %-7s%s\n' \
+            "${C_BOLD}" "STATUS" "NAME" "UUID" "AR" "${C_RESET}"
+        for u in $(raid_list_uuids 2>/dev/null); do
+            n=$(diskutil appleRAID list "$u" 2>/dev/null \
+                | awk -F': +' '/^Name:/ {v=$2; sub(/[[:space:]]+$/,"",v); print v; exit}')
+            st=$(raid_status "$u")
+            ar_raw=$(raid_ar_get "$u")
+            case "$ar_raw" in
+                1) ar="auto"   ;;
+                0) ar="manual" ;;
+                *) ar="?"      ;;
+            esac
+            printf '  %-8s %-22s %-36s %-7s\n' "$st" "$n" "$u" "$ar"
+        done
+        echo
+        if [ -n "${DEFAULT_AUTO_REBUILD:-}" ]; then
+            info "Effective DEFAULT_AUTO_REBUILD config: $DEFAULT_AUTO_REBUILD (sets that drift will be re-applied on next list/health run)."
+        else
+            info "DEFAULT_AUTO_REBUILD is empty - no automatic enforcement; sets will keep whatever AR they have."
+        fi
+        return 0
+    fi
+
+    # Resolve set arg to UUID.
+    uuid=""
+    for u in $(raid_list_uuids); do
+        [ "$u" = "$arg_set" ] && uuid="$u" && break
+    done
+    [ -z "$uuid" ] && uuid=$(raid_name_to_uuid "$arg_set")
+    [ -z "$uuid" ] && die "No RAID set matches '$arg_set'."
+    name=$(diskutil appleRAID list "$uuid" 2>/dev/null \
+        | awk -F': +' '/^Name:/ {v=$2; sub(/[[:space:]]+$/,"",v); print v; exit}')
+
+    cur=$(raid_ar_get "$uuid")
+    cur_word="manual"
+    [ "$cur" = "1" ] && cur_word="auto"
+
+    # Per-set mode without explicit on/off: show + prompt.
+    if [ -z "$arg_mode" ]; then
+        step "AutoRebuild for set '$name' ($uuid)"
+        info "Current value: $cur_word ($cur)"
+        echo
+        if [ "$cur_word" = "manual" ]; then
+            confirm "Switch to AUTOMATIC (recommended)?" || { info "No change."; return 0; }
+            arg_mode="on"
+        else
+            confirm "Switch to MANUAL?" || { info "No change."; return 0; }
+            arg_mode="off"
+        fi
+    fi
+
+    # Apply the requested change.
+    case "$(printf '%s' "$arg_mode" | tr '[:upper:]' '[:lower:]')" in
+        on)  target=1; word="automatic" ;;
+        off) target=0; word="manual"    ;;
+        *)   die "Unknown mode '$arg_mode' (expected on or off)" ;;
+    esac
+
+    if [ "$cur" = "$target" ]; then
+        ok "AutoRebuild already $word on '$name'. No change."
+        return 0
+    fi
+
+    step "Setting AutoRebuild=$word on '$name'"
+    if run sudo diskutil appleRAID update AutoRebuild "$target" "$uuid"; then
+        new=$(raid_ar_get "$uuid")
+        new_word="manual"
+        [ "$new" = "1" ] && new_word="auto"
+        if [ "$new" = "$target" ]; then
+            ok "AutoRebuild is now $word on '$name'."
+        else
+            warn "diskutil reported success but ioreg shows AutoRebuild=$new_word."
+        fi
+    else
+        die "Failed to set AutoRebuild=$word on '$name'."
+    fi
 }
 
 # ----------------------------------------------------------------------
@@ -6168,6 +7070,7 @@ _my-appleRAID() {
         'test:Run non-destructive tests on a RAID set'
         'destroy:Delete a RAID set (data loss)'
         'rename:Rename a RAID set'
+        'autorebuild:Manage AppleRAID AutoRebuild policy (per set)'
         'health:Run a monitoring pass'
         'show-config:Print effective config values'
         'create-config:Write annotated default config to <path>'
@@ -6206,6 +7109,11 @@ _my-appleRAID() {
                     ;;
                 info|status|watch|destroy|rename|repair)
                     _message 'RAID set name or UUID'
+                    ;;
+                autorebuild)
+                    _arguments \
+                        '1: :_message "RAID set name or UUID (or omit for explainer + table)"' \
+                        '2: :(on off)'
                     ;;
                 test)
                     _arguments \
@@ -6339,8 +7247,7 @@ main() {
         help|--help|-h|-\?) cmd_help ;;
         list)               cmd_list "$@" ;;
         disks)              cmd_disks "$@" ;;
-        info)               cmd_info "$@" ;;
-        status)             cmd_status "$@" ;;
+        info|status)        cmd_status "$@" ;;
         watch)              cmd_watch "$@" ;;
         blink)              cmd_blink "$@" ;;
         eject)              cmd_eject "$@" ;;
@@ -6352,6 +7259,7 @@ main() {
         test)               cmd_test "$@" ;;
         destroy)            cmd_destroy "$@" ;;
         rename)             cmd_rename "$@" ;;
+        autorebuild)        cmd_autorebuild "$@" ;;
         health)             cmd_health "$@" ;;
         show-config)        cmd_show_config "$@" ;;
         create-config)      cmd_create_config "$@" ;;
