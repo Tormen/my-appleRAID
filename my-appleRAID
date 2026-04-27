@@ -373,7 +373,10 @@ enforce_default_ar_for_uuid() {
             ;;
     esac
     current=$(raid_ar_get "$uuid")
-    [ "$current" = "$target" ] && return 0
+    if [ "$current" = "$target" ]; then
+        log_debug "  $uuid: AutoRebuild already $target (no change)"
+        return 0
+    fi
     log_info "Enforcing AutoRebuild=$target on $uuid (was: ${current:-<unknown>})"
     if sudo diskutil appleRAID update AutoRebuild "$target" "$uuid" >/dev/null 2>&1; then
         return 0
@@ -1691,7 +1694,10 @@ resolve_monitored_disks() {
 #   MISSING_DISK_SEVERITY    warn|crit
 #   MISSING_DISK_GRACE_PERIOD   duration         seconds missing before alerting
 check_disk_presence() {
-    [ "${ALERT_ON_MISSING_DISK:-no}" = "yes" ] || return 0
+    if [ "${ALERT_ON_MISSING_DISK:-no}" != "yes" ]; then
+        log_debug "Disk presence check skipped: ALERT_ON_MISSING_DISK=${ALERT_ON_MISSING_DISK:-no}"
+        return 0
+    fi
 
     sev="${MISSING_DISK_SEVERITY:-crit}"
     case "$sev" in
@@ -1701,11 +1707,16 @@ check_disk_presence() {
 
     grace="${MISSING_DISK_GRACE_PERIOD:-300}"
     required=$(resolve_required_disks)
-    [ -n "$required" ] || return 0
+    if [ -z "$required" ]; then
+        log_debug "Disk presence check skipped: REQUIRED_DISKS resolves to empty"
+        return 0
+    fi
+    log_debug "Disk presence: $(echo "$required" | wc -l | tr -d ' ') required entries, grace=${grace}s, severity=$sev"
 
     # Each required entry is either:
-    #   - A tagged baseline id (SN:..., USB:..., VOL:...) - resolved via
-    #     disk_for_baseline_id, which scans currently-attached disks.
+    #   - A tagged baseline id (SN:..., PART:..., USB:..., VOL:...) -
+    #     resolved via disk_for_baseline_id, which scans currently-
+    #     attached disks for one with that identifier.
     #   - A bare disk-node name (disk2, disk3 - from explicit comma-list
     #     REQUIRED_DISKS) - looked up via diskutil info /dev/<name>.
     # Bare disk-node entries are TRANSIENT and may match a different
@@ -1714,11 +1725,13 @@ check_disk_presence() {
     echo "$required" | awk 'NF>0 && !seen[$0]++' | while read -r r; do
         [ -n "$r" ] || continue
         case "$r" in
-            SN:*|USB:*|VOL:*)
+            SN:*|PART:*|USB:*|VOL:*)
                 cur=$(disk_for_baseline_id "$r")
                 if [ -n "$cur" ]; then
+                    log_debug "  $r -> /dev/$cur (present)"
                     grace_clear "disk" "$r"
                 else
+                    log_debug "  $r -> NOT attached"
                     if grace_check "disk" "$r" "$grace"; then
                         h=$(problem_hash "disk-missing" "$r" "not-present")
                         seen_add "$h"
@@ -1729,8 +1742,10 @@ check_disk_presence() {
                 ;;
             *)
                 if diskutil info "/dev/$r" >/dev/null 2>&1; then
+                    log_debug "  /dev/$r: present (note: bare-node form is transient)"
                     grace_clear "disk" "$r"
                 else
+                    log_debug "  /dev/$r: NOT attached"
                     if grace_check "disk" "$r" "$grace"; then
                         h=$(problem_hash "disk-missing" "$r" "not-present")
                         seen_add "$h"
@@ -1754,7 +1769,10 @@ check_disk_presence() {
 #   MISSING_SET_SEVERITY     warn|crit
 #   MISSING_SET_GRACE_PERIOD    duration         seconds missing before alerting
 check_set_presence() {
-    [ "${ALERT_ON_MISSING_SET:-no}" = "yes" ] || return 0
+    if [ "${ALERT_ON_MISSING_SET:-no}" != "yes" ]; then
+        log_debug "Set presence check skipped: ALERT_ON_MISSING_SET=${ALERT_ON_MISSING_SET:-no}"
+        return 0
+    fi
 
     sev="${MISSING_SET_SEVERITY:-crit}"
     case "$sev" in
@@ -1764,7 +1782,11 @@ check_set_presence() {
 
     grace="${MISSING_SET_GRACE_PERIOD:-300}"
     required=$(resolve_required_sets)
-    [ -n "$required" ] || return 0
+    if [ -z "$required" ]; then
+        log_debug "Set presence check skipped: REQUIRED_SETS resolves to empty"
+        return 0
+    fi
+    log_debug "Set presence: $(echo "$required" | wc -l | tr -d ' ') required, grace=${grace}s, severity=$sev"
 
     # Build a list of currently-present set names for fast lookup.
     present_names=$(diskutil appleRAID list 2>/dev/null | awk -F': +' '
@@ -1774,8 +1796,10 @@ check_set_presence() {
     echo "$required" | awk 'NF>0 && !seen[$0]++' | while read -r name; do
         [ -n "$name" ] || continue
         if echo "$present_names" | grep -qxF "$name"; then
+            log_debug "  set '$name': present"
             grace_clear "set" "$name"
         else
+            log_debug "  set '$name': NOT present"
             if grace_check "set" "$name" "$grace"; then
                 h=$(problem_hash "set-missing" "$name" "not-present")
                 seen_add "$h"
@@ -1791,9 +1815,18 @@ check_set_presence() {
 # Only runs if REQUIRED_SETS=all (otherwise the baseline file isn't
 # authoritative - the user is managing an explicit list manually).
 check_auto_baseline_sets() {
-    [ "${AUTO_BASELINE_FOR_SETS_ON_HEALTH:-no}" = "yes" ] || return 0
-    case "${REQUIRED_SETS:-}" in all|ALL) ;; *) return 0 ;; esac
-    [ "${ALERT_ON_MISSING_SET:-no}" = "yes" ] || return 0
+    if [ "${AUTO_BASELINE_FOR_SETS_ON_HEALTH:-no}" != "yes" ]; then
+        log_debug "Auto-baseline sets skipped: AUTO_BASELINE_FOR_SETS_ON_HEALTH=${AUTO_BASELINE_FOR_SETS_ON_HEALTH:-no}"
+        return 0
+    fi
+    case "${REQUIRED_SETS:-}" in
+        all|ALL) ;;
+        *) log_debug "Auto-baseline sets skipped: REQUIRED_SETS='${REQUIRED_SETS:-}' (not 'all')"; return 0 ;;
+    esac
+    if [ "${ALERT_ON_MISSING_SET:-no}" != "yes" ]; then
+        log_debug "Auto-baseline sets skipped: ALERT_ON_MISSING_SET=${ALERT_ON_MISSING_SET:-no}"
+        return 0
+    fi
 
     grace="${AUTO_BASELINE_GRACE_PERIOD:-86400}"
     # Current baseline for lookup.
@@ -1802,13 +1835,15 @@ check_auto_baseline_sets() {
     present=$(diskutil appleRAID list 2>/dev/null | awk -F': +' '
         /^Name:/ { n=$2; sub(/ +$/,"",n); if (n!="") print n }
     ')
+    log_debug "Auto-baseline sets: present=$(echo "$present" | wc -l | tr -d ' '), baselined=$(echo "$current" | wc -l | tr -d ' '), grace=${grace}s"
 
     echo "$present" | awk 'NF>0 && !seen[$0]++' | while read -r name; do
         [ -n "$name" ] || continue
         if echo "$current" | grep -qxF "$name"; then
-            # Already baselined; clear any stale sighting timer.
+            log_debug "  set '$name': already in baseline"
             auto_baseline_clear "set" "$name"
         else
+            log_debug "  set '$name': new (waiting for ${grace}s of continuous presence)"
             if auto_baseline_check "set" "$name" "$grace"; then
                 log_info "Auto-baselining new RAID set: $name (present >= ${grace}s)"
                 baseline_write_sets
@@ -1828,12 +1863,22 @@ check_auto_baseline_sets() {
 # Auto-baseline for disks: same logic as sets, but for physical disk
 # identifiers.
 check_auto_baseline_disks() {
-    [ "${AUTO_BASELINE_FOR_DISKS_ON_HEALTH:-no}" = "yes" ] || return 0
-    case "${REQUIRED_DISKS:-}" in all|ALL) ;; *) return 0 ;; esac
-    [ "${ALERT_ON_MISSING_DISK:-no}" = "yes" ] || return 0
+    if [ "${AUTO_BASELINE_FOR_DISKS_ON_HEALTH:-no}" != "yes" ]; then
+        log_debug "Auto-baseline disks skipped: AUTO_BASELINE_FOR_DISKS_ON_HEALTH=${AUTO_BASELINE_FOR_DISKS_ON_HEALTH:-no}"
+        return 0
+    fi
+    case "${REQUIRED_DISKS:-}" in
+        all|ALL) ;;
+        *) log_debug "Auto-baseline disks skipped: REQUIRED_DISKS='${REQUIRED_DISKS:-}' (not 'all')"; return 0 ;;
+    esac
+    if [ "${ALERT_ON_MISSING_DISK:-no}" != "yes" ]; then
+        log_debug "Auto-baseline disks skipped: ALERT_ON_MISSING_DISK=${ALERT_ON_MISSING_DISK:-no}"
+        return 0
+    fi
 
     grace="${AUTO_BASELINE_GRACE_PERIOD:-86400}"
     current=$(baseline_read_disks 2>/dev/null)
+    log_debug "Auto-baseline disks: baselined=$(echo "$current" | wc -l | tr -d ' '), grace=${grace}s"
 
     # Compare by tagged baseline id, not by /dev/diskN node, so a disk
     # whose number changed (replug, hub swap) does not get spuriously
@@ -1842,13 +1887,14 @@ check_auto_baseline_disks() {
         [ -n "$d" ] || continue
         id=$(disk_baseline_id "$d" 2>/dev/null)
         if [ -z "$id" ]; then
-            # Untrackable disk (no SN/USB/VOL). Skip silently here;
-            # baseline_write_disks logs a warning when run interactively.
+            log_debug "  /dev/$d: skip (no stable identifier discoverable)"
             continue
         fi
         if echo "$current" | grep -qxF "$id"; then
+            log_debug "  /dev/$d ($id): already in baseline"
             auto_baseline_clear "disk" "$id"
         else
+            log_debug "  /dev/$d ($id): new (waiting for ${grace}s of continuous presence)"
             if auto_baseline_check "disk" "$id" "$grace"; then
                 log_info "Auto-baselining new disk: $d ($id, present >= ${grace}s)"
                 baseline_write_disks
@@ -1860,10 +1906,25 @@ check_auto_baseline_disks() {
 }
 
 check_smart() {
-    smart_should_run || return 0
+    if ! smart_should_run; then
+        f=$(smart_last_run_file)
+        if [ -f "$f" ]; then
+            last=$(cat "$f" 2>/dev/null)
+            now=$(date +%s)
+            age=$((now - ${last:-0}))
+            log_debug "SMART check skipped: last ran ${age}s ago, interval=${SMART_POLL_INTERVAL}s"
+        else
+            log_debug "SMART check skipped: SMART_CHECK_ENABLED=${SMART_CHECK_ENABLED:-yes} or smartctl missing"
+        fi
+        return 0
+    fi
     log_info "Running SMART check (runs every ${SMART_POLL_INTERVAL}s)"
     disks=$(resolve_monitored_disks)
-    [ -n "$disks" ] || { log_warn "No disks resolved for SMART check"; return 0; }
+    if [ -z "$disks" ]; then
+        log_warn "No disks resolved for SMART check"
+        return 0
+    fi
+    log_debug "SMART scope: $(echo "$disks" | wc -w | tr -d ' ') disk(s): $(echo "$disks" | tr '\n' ' ')"
 
     for d in $disks; do
         dev="/dev/$d"
@@ -1874,15 +1935,17 @@ check_smart() {
         # cache avoids re-probing on every run.
         sc=$(smart_cmd "$d")
         if [ "$sc" = "smartctl" ] && [ "$(smart_dtype_for "$d")" = "" ]; then
-            log_debug "No SMART support for $d; skipping"
+            log_debug "  $d: no SMART support; skipping"
             continue
         fi
+        log_debug "  $d: probing via '$sc'"
 
         # Overall health (PASSED/FAILED)
         health=$($sc -H "$dev" 2>/dev/null | awk -F': *' \
             '/SMART overall-health/ {print $2; exit}
              /SMART Health Status/   {print $2; exit}')
         health=$(echo "$health" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+        log_debug "    health: ${health:-<unknown>}"
 
         if [ -n "$health" ] && [ "$health" != "PASSED" ] && [ "$health" != "OK" ]; then
             h=$(problem_hash "smart-health" "$d" "$health")
@@ -1967,8 +2030,10 @@ run_selftests() {
         # ensure the flag is set in case SMART_CHECK_ENABLED=no but we
         # still got here somehow.
         SMART_UNAVAILABLE=1
+        log_debug "Self-tests skipped: smartctl not in PATH"
         return 0
     fi
+    log_debug "Self-tests: short=${SELFTEST_SHORT_SCHEDULE:-never}, long=${SELFTEST_LONG_SCHEDULE:-weekly}, hour=$(printf '%02d' "${SELFTEST_HOUR:-3}"), now=$(date '+%H'):00"
     for d in $(resolve_monitored_disks); do
         dev="/dev/$d"
         [ -e "$dev" ] || continue
@@ -1980,10 +2045,14 @@ run_selftests() {
         if selftest_should_run "${SELFTEST_SHORT_SCHEDULE:-never}" "$short_sentinel"; then
             log_info "Starting SHORT self-test on $d"
             $sc -t short "$dev" >/dev/null 2>&1 && touch "$short_sentinel"
+        else
+            log_debug "  $d: short self-test not due (schedule=${SELFTEST_SHORT_SCHEDULE:-never})"
         fi
         if selftest_should_run "${SELFTEST_LONG_SCHEDULE:-daily}" "$long_sentinel"; then
             log_info "Starting LONG self-test on $d (runs in background, ~24-30h on 26TB)"
             $sc -t long "$dev" >/dev/null 2>&1 && touch "$long_sentinel"
+        else
+            log_debug "  $d: long self-test not due (schedule=${SELFTEST_LONG_SCHEDULE:-weekly})"
         fi
     done
 }
