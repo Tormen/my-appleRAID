@@ -7280,109 +7280,30 @@ cmd_repair() {
                     warn "  ($chosen_member_part, member-uuid $chosen_member_uuid)."
                     echo
                     explain "AppleRAID has NO incremental resync (no write-intent bitmap), so"
-                    explain "ANY re-add of this member triggers a FULL block-level rebuild."
+                    explain "any re-add of this member triggers a FULL block-level rebuild."
                     explain "  Estimated time: ~14 hours per 10 TB at sustained ~200 MB/s."
                     explain "  The mirror stays mounted and usable during the rebuild."
                     echo
-                    explain "Two paths produce that rebuild; pick by what the disk has been"
-                    explain "through:"
-                    explain ""
-                    explain "  [1] Auto-rebuild in place, leave AutoRebuild at 1:"
-                    explain "        sudo diskutil appleRAID update AutoRebuild 1 $SELECTED_UUID"
-                    explain "      The kernel notices the Failed-but-attached member and"
-                    explain "      rebuilds onto it. AutoRebuild policy stays 1 - flip"
-                    explain "      back manually later with:"
-                    explain "        $SCRIPT_NAME autorebuild $target_set_name off"
-                    explain ""
-                    explain "  [2] Remove + wipe + repairMirror (defensive, current default):"
-                    explain "        sudo diskutil appleRAID remove $chosen_member_uuid $SELECTED_UUID"
-                    explain "        $SCRIPT_NAME wipe ${dev#/dev/disk}        # first/last 100 MB"
-                    explain "        sudo diskutil appleRAID repairMirror $SELECTED_UUID $dev"
-                    explain "      Fully wipes the disk before adding it back. Use this for"
-                    explain "      a brand-new drive, or when you're not sure the failed"
-                    explain "      drive is actually the same one (e.g. it was swapped while"
-                    explain "      offline)."
-                    explain ""
-                    explain "  [3] AutoRebuild NUDGE (recommended for 'same disk returned'):"
-                    explain "        sudo diskutil appleRAID update AutoRebuild 1 $SELECTED_UUID"
-                    explain "        # poll until any member shows Rebuilding..."
-                    explain "        sudo diskutil appleRAID update AutoRebuild 0 $SELECTED_UUID"
-                    explain "      Flips AutoRebuild to 1 just long enough for the kernel"
-                    explain "      to start the rebuild, then flips back to 0 - so future"
-                    explain "      detach+reattach events stay manual. The in-flight"
-                    explain "      rebuild continues to completion regardless. No remove,"
-                    explain "      no wipe; the disk's existing Apple_RAID partition is"
-                    explain "      reused."
+                    explain "AppleRAID still has the kernel claim on this slot, so we must"
+                    explain "release it via 'diskutil appleRAID remove' before wiping and"
+                    explain "calling repairMirror."
                     echo
-                    printf 'Pick path [1] AR=1 permanent, [2] remove+wipe+repairMirror, [3] AR=1 nudge: '
-                    read -r _path_choice
-                    case "$_path_choice" in
-                        1)
-                            step "Path [1]: flip AutoRebuild to 1; let the kernel rebuild in place"
-                            run sudo diskutil appleRAID update AutoRebuild 1 "$SELECTED_UUID" \
-                                || die "AutoRebuild flip failed."
-                            ok "AutoRebuild=1 set on '$target_set_name'."
-                            info "The kernel should now begin rebuilding $dev in place."
-                            info "Monitor:  $SCRIPT_NAME watch $target_set_name"
-                            info "Once rebuild is Online, optionally flip back to manual:"
-                            info "    $SCRIPT_NAME autorebuild $target_set_name off"
-                            return 0
-                            ;;
-                        3)
-                            step "Path [3]: AR=1 nudge (flip on, wait for rebuild to start, flip back)"
-                            explain "Step a: set AutoRebuild=1"
-                            run sudo diskutil appleRAID update AutoRebuild 1 "$SELECTED_UUID" \
-                                || die "AutoRebuild flip to 1 failed."
-
-                            explain "Step b: poll for the kernel to begin rebuilding (timeout 60s)"
-                            _deadline=$(( $(date +%s) + 60 ))
-                            _saw_rebuild=0
-                            while [ "$(date +%s)" -lt "$_deadline" ]; do
-                                # Look for any member-row with a Rebuilding
-                                # status (or '<n>%' indicator).
-                                if diskutil appleRAID list "$SELECTED_UUID" 2>/dev/null \
-                                   | grep -qiE 'Rebuild|[0-9]+%'; then
-                                    _saw_rebuild=1
-                                    break
-                                fi
-                                sleep 2
-                            done
-
-                            if [ "$_saw_rebuild" = "0" ]; then
-                                warn "Did not observe a rebuild starting within 60s."
-                                warn "AutoRebuild remains at 1. Flip back manually if you want:"
-                                warn "    $SCRIPT_NAME autorebuild $target_set_name off"
-                                warn "If the kernel never starts a rebuild, fall back to path [2]"
-                                warn "(remove + wipe + repairMirror)."
-                                return 0
-                            fi
-                            ok "Kernel started the rebuild."
-
-                            explain "Step c: flip AutoRebuild back to 0"
-                            explain "  (in-flight rebuilds keep running; AutoRebuild only gates"
-                            explain "   STARTING new ones, so future detach+reattach events"
-                            explain "   stay manual.)"
-                            if run sudo diskutil appleRAID update AutoRebuild 0 "$SELECTED_UUID"; then
-                                ok "AutoRebuild back to 0; the rebuild continues to completion."
-                            else
-                                warn "AutoRebuild flip back to 0 failed; flip manually:"
-                                warn "    $SCRIPT_NAME autorebuild $target_set_name off"
-                            fi
-                            info "Monitor:  $SCRIPT_NAME watch $target_set_name"
-                            return 0
-                            ;;
-                        2|"")
-                            confirm "Path [2]: release $dev from '$target_set_name' and start a full rebuild?" \
-                                || die "Aborted."
-                            run sudo diskutil appleRAID remove "$chosen_member_uuid" "$SELECTED_UUID" \
-                                || die "appleRAID remove failed - cannot proceed."
-                            ok "Disk released from set."
-                            echo
-                            ;;
-                        *)
-                            die "Aborted - unknown choice '$_path_choice'."
-                            ;;
-                    esac
+                    explain "Alternative path (NOT done here): if you'd rather the kernel"
+                    explain "rebuild this disk in place without removing or wiping it,"
+                    explain "stop now and use the autorebuild command instead, e.g."
+                    explain "    $SCRIPT_NAME autorebuild $target_set_name on"
+                    explain "to flip AutoRebuild=1 (the kernel will then rebuild $dev"
+                    explain "automatically), then optionally"
+                    explain "    $SCRIPT_NAME autorebuild $target_set_name off"
+                    explain "once the rebuild has started, to keep future detach+reattach"
+                    explain "events manual. 'repair' does not touch AutoRebuild."
+                    echo
+                    confirm "Release $dev from '$target_set_name' and start a full rebuild?" \
+                        || die "Aborted."
+                    run sudo diskutil appleRAID remove "$chosen_member_uuid" "$SELECTED_UUID" \
+                        || die "appleRAID remove failed - cannot proceed."
+                    ok "Disk released from set."
+                    echo
                     ;;
             esac
         fi
