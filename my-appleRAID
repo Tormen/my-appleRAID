@@ -4600,8 +4600,9 @@ ${C_BOLD}COMMANDS${C_RESET}
                               Generates read-only I/O - same trick SoftRAID's
                               "Identify" button uses. Without an argument,
                               shows an interactive picker. Ctrl-C to stop.
-  ${C_CYAN}eject${C_RESET} [<disk>] [--release]   Unmount + spin-down + power off so the
-                              disk can be safely disconnected. Without an
+  ${C_CYAN}eject${C_RESET} [<disk>] [--release]   Unmount + STANDBY IMMEDIATE (smartctl spin-down)
+                              + diskutil eject, so the disk can be
+                              safely disconnected. Without an
                               argument, shows an interactive picker.
                               For an active RAID member, plain eject
                               REFUSES (the kernel claim blocks it). Pass
@@ -5811,10 +5812,18 @@ cmd_eject() {
                 cat <<EOF
 Usage: $SCRIPT_NAME eject [<disk>] [--release]
 
-Unmount every volume on the disk and run 'diskutil eject' so the
-disk can be safely disconnected. Natural follow-up to
+Unmount every volume on the disk, issue an explicit STANDBY IMMEDIATE
+via smartctl to spin the platter down, and run 'diskutil eject' so
+the disk can be safely disconnected. Natural follow-up to
 '$SCRIPT_NAME blink': blink to identify which physical slot a
 /dev/diskN is in, then eject it before pulling it.
+
+The explicit smartctl spin-down is needed because 'diskutil eject'
+is unreliable on direct-SATA / JBOD enclosures - it returns success
+while the disk keeps spinning. smartctl -s standby,now actually
+parks the heads and stops the platter via ATA STANDBY IMMEDIATE.
+USB bridges that intercept ATA pass-through may still ignore it;
+in that case the warning is non-fatal and the eject still runs.
 
 ARGUMENTS
   <disk>      Optional. Disk number (e.g. 3), short name (disk3) or
@@ -5958,6 +5967,25 @@ EOF
             explain "  - The member UUID changed since this run started. Verify with:"
             explain "      diskutil appleRAID list $raid_set_uuid"
             exit 1
+        fi
+    fi
+
+    # Issue STANDBY IMMEDIATE via smartctl. macOS 'diskutil eject' is
+    # unreliable about spinning the platter down: for USB hot-plug bays
+    # it usually does, for direct-SATA / JBOD enclosures it often
+    # returns success while the disk keeps spinning. smartctl
+    # -s standby,now talks ATA STANDBY IMMEDIATE through the SAT layer
+    # ('-d sat,auto' lets smartctl auto-detect the right transport),
+    # which actually parks the heads and stops the platter.
+    step "Spinning down $dev (STANDBY IMMEDIATE)"
+    smartctl_bin=$(command -v smartctl 2>/dev/null)
+    if [ -z "$smartctl_bin" ]; then
+        warn "smartctl not found in PATH - skipping explicit spin-down."
+        warn "  Install with: brew install smartmontools"
+    else
+        if ! run sudo "$smartctl_bin" -s standby,now -d sat,auto "$dev"; then
+            warn "STANDBY IMMEDIATE returned non-zero. Some USB bridges intercept"
+            warn "ATA pass-through; the eject below may still spin the disk down."
         fi
     fi
 
@@ -7474,6 +7502,21 @@ main() {
     if [ $# -lt 1 ]; then
         cmd_help
         exit 0
+    fi
+
+    # Make `my-appleRAID --help <topic>` (and 'help <topic>' / '-h <topic>')
+    # an exact synonym for `my-appleRAID <topic> --help`. Without this,
+    # the case dispatch below would route '--help' to cmd_help and drop
+    # the topic argument on the floor. We rewrite argv in place so the
+    # rest of main() doesn't need to know.
+    if [ $# -ge 2 ]; then
+        case "$1" in
+            help|--help|-h|-\?)
+                _topic="$2"
+                shift 2
+                set -- "$_topic" --help "$@"
+                ;;
+        esac
     fi
 
     cmd="$1"
