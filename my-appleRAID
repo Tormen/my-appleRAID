@@ -4544,15 +4544,13 @@ ${C_BOLD}COMMANDS${C_RESET}
                               Generates read-only I/O - same trick SoftRAID's
                               "Identify" button uses. Without an argument,
                               shows an interactive picker. Ctrl-C to stop.
-  ${C_CYAN}eject${C_RESET} [<disk>]                Unmount every volume on the disk, spin
-                              it down + power it off so it can be safely
-                              disconnected. Natural follow-up to 'blink'.
-                              Without an argument, shows an interactive
-                              picker. If the disk is an active RAID member,
-                              the kernel claim is released first via
-                              'appleRAID remove' (set goes Degraded);
-                              one confirmation prompt covers the whole
-                              unmount + remove + eject pipeline.
+  ${C_CYAN}eject${C_RESET} [<disk>] [--release]   Unmount + spin-down + power off so the
+                              disk can be safely disconnected. Without an
+                              argument, shows an interactive picker.
+                              For an active RAID member, plain eject
+                              REFUSES (the kernel claim blocks it). Pass
+                              --release to ALSO break it from the set
+                              (DESTRUCTIVE: set goes Degraded).
   ${C_CYAN}smart${C_RESET} [<disk>]                Detailed SMART drill-down for one disk:
                               overall health, pre-failure attributes (with
                               non-zero "killer" highlight), self-test log,
@@ -5750,34 +5748,39 @@ cmd_eject() {
     eval "$(parse_global_flags "$@")"
 
     arg=""
+    do_release=0
     while [ $# -gt 0 ]; do
         case "$1" in
             -h|--help)
                 cat <<EOF
-Usage: $SCRIPT_NAME eject [<disk>]
+Usage: $SCRIPT_NAME eject [<disk>] [--release]
 
-Spin down and power off a physical disk so it can be safely
-disconnected. Natural follow-up to '$SCRIPT_NAME blink': blink to
-identify which physical slot a /dev/diskN is in, then eject it
-before pulling it.
-
-Unmounts every volume on the disk and runs 'diskutil eject', which
-flushes caches and parks the heads.
+Unmount every volume on the disk and run 'diskutil eject' so the
+disk can be safely disconnected. Natural follow-up to
+'$SCRIPT_NAME blink': blink to identify which physical slot a
+/dev/diskN is in, then eject it before pulling it.
 
 ARGUMENTS
-  <disk>    Optional. Disk number (e.g. 3), short name (disk3) or
-            full path (/dev/disk3). If omitted, you get an
-            interactive picker listing all attached physical disks.
+  <disk>      Optional. Disk number (e.g. 3), short name (disk3) or
+              full path (/dev/disk3). If omitted, you get an
+              interactive picker listing all attached physical disks.
+
+OPTIONS
+  --release   Only meaningful when the disk is an active AppleRAID
+              member. Releases the kernel claim via
+                  diskutil appleRAID remove <member-uuid> <set-uuid>
+              before ejecting. THIS IS DESTRUCTIVE: the set goes
+              DEGRADED and rejoining the disk later requires a full
+              rebuild via '$SCRIPT_NAME repair'. Without --release,
+              eject REFUSES for an active RAID member and tells you
+              what to do instead.
 
 NOTES
-  - If the disk is a member of an online AppleRAID set, the set's
-    kernel claim blocks 'diskutil eject'. You'll be shown a 3-step
-    plan and one confirmation:
-        1. unmount the disk
-        2. diskutil appleRAID remove <member-uuid> <set-uuid>
-           (set goes DEGRADED here)
-        3. diskutil eject
-    After swapping the disk, rebuild with: '$SCRIPT_NAME repair <set>'.
+  - For a temporary unplug (cable test, slot swap), do NOT use eject
+    on a RAID member. Just yank the cable. The set will go Degraded;
+    the volume stays mounted and writes go to the survivor; on
+    reconnect AutoRebuild=1 rebuilds, AutoRebuild=0 leaves the disk
+    Failed (and you can recover via '$SCRIPT_NAME repair').
   - Internal disks are refused (would take down macOS).
   - Virtual devices (RAID/APFS containers) are refused; eject the
     backing physical disk instead.
@@ -5785,6 +5788,7 @@ EOF
                 return 0
                 ;;
             -V|--verbose|-D|--debug) ;;
+            --release) do_release=1 ;;
             -*) warn "Unknown option: $1" ;;
             *)  arg="$1" ;;
         esac
@@ -5844,15 +5848,32 @@ EOF
     describe_disk "$dev"
     release_from_raid=0
     if [ -n "$raid_set_name" ]; then
+        if [ "$do_release" = "0" ]; then
+            err "$dev is an active member of AppleRAID set '$raid_set_name'"
+            err "  ($raid_member_part, member-uuid $raid_member_uuid)."
+            echo
+            explain "Plain eject won't work: AppleRAID claims member disks at the"
+            explain "kernel level, so 'diskutil eject' fails while the membership"
+            explain "is live. Two ways forward:"
+            explain ""
+            explain "  - For a TEMPORARY unplug (cable test, slot swap, brief move):"
+            explain "    just yank the cable. The set goes Degraded; the volume stays"
+            explain "    mounted; on reconnect AutoRebuild=1 rebuilds, AutoRebuild=0"
+            explain "    leaves the disk Failed (recoverable via '$SCRIPT_NAME repair')."
+            explain ""
+            explain "  - To DESTROY the membership and physically remove the disk,"
+            explain "    re-run with --release :"
+            explain "      $SCRIPT_NAME eject $short --release"
+            explain "    THIS IS DESTRUCTIVE: the set goes DEGRADED and rejoining"
+            explain "    this disk later requires a full rebuild via 'repair'."
+            die "Aborted - 'eject' alone won't release a RAID member."
+        fi
         warn "$dev is a member of AppleRAID set '$raid_set_name'."
         warn "  Set UUID:    $raid_set_uuid"
         warn "  Member:      $raid_member_part  ($raid_member_uuid)"
         echo
-        explain "AppleRAID claims member disks at the kernel level, so 'diskutil eject'"
-        explain "fails while membership is live. To eject we must first release the"
-        explain "disk from the set."
-        echo
-        explain "Plan if you confirm:"
+        explain "--release was specified, so we'll release the kernel claim before"
+        explain "ejecting. Plan if you confirm:"
         explain "  1. sudo diskutil unmountDisk force $dev"
         explain "  2. sudo diskutil appleRAID remove $raid_member_uuid $raid_set_uuid"
         explain "     (set '$raid_set_name' goes DEGRADED here)"
@@ -5860,7 +5881,8 @@ EOF
         explain ""
         explain "After swapping the disk, rebuild with:  $SCRIPT_NAME repair $raid_set_name"
         echo
-        confirm "Eject $dev and degrade set '$raid_set_name'?" || die "Aborted."
+        confirm "Release $dev from set '$raid_set_name' (set will go Degraded) and eject?" \
+            || die "Aborted."
         release_from_raid=1
     fi
 
@@ -5899,7 +5921,8 @@ EOF
         explain "    Try: lsof +D /Volumes/<name>  (or 'sudo lsof' for system processes)"
         if [ -n "$raid_set_name" ] && [ "$release_from_raid" != "1" ]; then
             explain "  - $dev is still a member of AppleRAID set '$raid_set_name'."
-            explain "    Re-run '$SCRIPT_NAME eject $short' and confirm the release prompt."
+            explain "    To release + eject, run:  $SCRIPT_NAME eject $short --release"
+            explain "    (DESTRUCTIVE: the set will go Degraded.)"
         fi
         explain "  - The enclosure does not honor SCSI eject (some USB bridges)."
         explain "    The disk is unmounted but the device node will persist."
@@ -7275,8 +7298,13 @@ _my-appleRAID() {
                 migrate-softraid|release-softraid)
                     _message 'SoftRAID volume name'
                     ;;
-                wipe|verify-wipe|blink|eject|smart)
+                wipe|verify-wipe|blink|smart)
                     _message 'disk number (e.g. 3 for /dev/disk3)'
+                    ;;
+                eject)
+                    _arguments \
+                        '--release[Also break the disk out of its AppleRAID set (DESTRUCTIVE: set goes Degraded)]' \
+                        '*: :_message "disk number (e.g. 3 for /dev/disk3)"'
                     ;;
                 create)
                     _message 'name <N1> <N2>'
