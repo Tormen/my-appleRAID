@@ -7284,155 +7284,29 @@ cmd_repair() {
                     explain "  Estimated time: ~14 hours per 10 TB at sustained ~200 MB/s."
                     explain "  The mirror stays mounted and usable during the rebuild."
                     echo
-                    explain "Two paths produce that rebuild; pick by what the disk has been"
-                    explain "through:"
-                    explain ""
-                    explain "  [1] AutoRebuild NUDGE (recommended for 'same disk returned'):"
-                    explain "        sudo diskutil appleRAID update AutoRebuild 1 $SELECTED_UUID"
-                    explain "        # poll until a member shows Rebuilding..."
-                    explain "        sudo diskutil appleRAID update AutoRebuild 0 $SELECTED_UUID"
-                    explain "      Flips AutoRebuild to 1 just long enough for the kernel"
-                    explain "      to start the rebuild, then flips it back to 0 so future"
-                    explain "      detach+reattach events stay manual. The in-flight"
-                    explain "      rebuild continues to completion regardless. No remove,"
-                    explain "      no wipe; the disk's existing Apple_RAID partition is"
-                    explain "      reused. The set's AutoRebuild policy ends up where it"
-                    explain "      started (0); to actually CHANGE the policy, use"
-                    explain "      '$SCRIPT_NAME autorebuild <set> on|off' instead."
-                    explain ""
-                    explain "  [2] Remove + wipe + repairMirror (defensive):"
-                    explain "        sudo diskutil appleRAID remove $chosen_member_uuid $SELECTED_UUID"
-                    explain "        $SCRIPT_NAME wipe ${dev#/dev/disk}        # first/last 100 MB"
-                    explain "        sudo diskutil appleRAID repairMirror $SELECTED_UUID $dev"
-                    explain "      Fully wipes the disk before adding it back. Use this for"
-                    explain "      a brand-new drive, or when you're not sure the failed"
-                    explain "      drive is actually the same one (e.g. it was swapped while"
-                    explain "      offline)."
+                    explain "AppleRAID still has the kernel claim on this slot, so we must"
+                    explain "release it via 'diskutil appleRAID remove' before wiping and"
+                    explain "calling repairMirror."
                     echo
-                    printf 'Pick path [1] AutoRebuild nudge, or [2] remove+wipe+repairMirror: '
-                    read -r _path_choice
-                    case "$_path_choice" in
-                        1|"")
-                            step "Path [1]: AutoRebuild nudge (flip on, wait for rebuild to start, flip back)"
-
-                            # 'diskutil appleRAID update AutoRebuild 1' on a
-                            # DEGRADED set can take a long time to return -
-                            # the kernel reacts to the metadata change by
-                            # immediately preparing the rebuild, and the
-                            # syscall doesn't return until that's queued.
-                            # We work around that by:
-                            #   - running diskutil in the BACKGROUND, so
-                            #     we can poll 'diskutil appleRAID list'
-                            #     in parallel for Rebuilding status, and
-                            #   - wrapping the whole thing in a timeout
-                            #     (default 180s) so the script doesn't
-                            #     appear stuck if diskutil truly hangs.
-                            _du_log=$(mktemp 2>/dev/null) \
-                                || _du_log=/tmp/my-appleRAID-du-$$.log
-                            _du_exit_file="${_du_log}.exit"
-                            : >"$_du_log"
-                            : >"$_du_exit_file"
-
-                            explain "Step a: launch 'diskutil appleRAID update AutoRebuild 1' in the background"
-                            explain "        (log: $_du_log)"
-                            (
-                                sudo diskutil appleRAID update AutoRebuild 1 "$SELECTED_UUID" \
-                                    >"$_du_log" 2>&1
-                                printf '%s\n' "$?" >"$_du_exit_file"
-                            ) &
-                            _du_pid=$!
-                            explain "        pid=$_du_pid"
-
-                            explain "Step b: poll 'diskutil appleRAID list' for Rebuilding status (timeout 180s)"
-                            _deadline=$(( $(date +%s) + 180 ))
-                            _saw_rebuild=0
-                            while [ "$(date +%s)" -lt "$_deadline" ]; do
-                                if diskutil appleRAID list "$SELECTED_UUID" 2>/dev/null \
-                                   | grep -qiE 'Rebuild|[0-9]+%'; then
-                                    _saw_rebuild=1
-                                    ok "Kernel has started the rebuild."
-                                    break
-                                fi
-                                # Background diskutil already finished?
-                                # If yes, break out and re-check once more.
-                                if ! kill -0 "$_du_pid" 2>/dev/null; then
-                                    break
-                                fi
-                                sleep 2
-                            done
-
-                            # Give diskutil up to 60 more seconds to wrap
-                            # up its bookkeeping before we move on.
-                            if kill -0 "$_du_pid" 2>/dev/null; then
-                                explain "Step b': diskutil update still running; giving it 60s more to wrap up"
-                                _wait_deadline=$(( $(date +%s) + 60 ))
-                                while kill -0 "$_du_pid" 2>/dev/null \
-                                      && [ "$(date +%s)" -lt "$_wait_deadline" ]; do
-                                    sleep 2
-                                done
-                            fi
-                            if kill -0 "$_du_pid" 2>/dev/null; then
-                                warn "diskutil update has not finished within the grace window."
-                                warn "  pid $_du_pid will continue running in the background."
-                                warn "  Watch progress with:  $SCRIPT_NAME watch $target_set_name"
-                                warn "  Log so far:           $_du_log"
-                            fi
-
-                            # Final rebuild-detection re-check in case the
-                            # rebuild only became visible after diskutil
-                            # returned.
-                            if [ "$_saw_rebuild" = "0" ] \
-                               && diskutil appleRAID list "$SELECTED_UUID" 2>/dev/null \
-                                  | grep -qiE 'Rebuild|[0-9]+%'; then
-                                _saw_rebuild=1
-                                ok "Kernel has started the rebuild (detected post-diskutil)."
-                            fi
-
-                            if [ "$_saw_rebuild" = "0" ]; then
-                                warn "Did not observe a rebuild starting within the timeout window."
-                                _du_exit=$(cat "$_du_exit_file" 2>/dev/null)
-                                warn "  diskutil update exit: ${_du_exit:-<still running>}"
-                                if [ -s "$_du_log" ]; then
-                                    warn "  diskutil update output:"
-                                    sed 's/^/      /' "$_du_log" >&2
-                                fi
-                                warn "AutoRebuild may or may not have been flipped to 1 - verify with:"
-                                warn "    $SCRIPT_NAME autorebuild $target_set_name"
-                                warn "Possible next steps:"
-                                warn "  - Try the alternate diskutil syntax:"
-                                warn "      sudo diskutil appleRAID enable AutoRebuild $SELECTED_UUID"
-                                warn "  - Or fall back to path [2] (remove + wipe + repairMirror)."
-                                rm -f "$_du_log" "$_du_exit_file" 2>/dev/null
-                                return 0
-                            fi
-
-                            rm -f "$_du_log" "$_du_exit_file" 2>/dev/null
-
-                            explain "Step c: flip AutoRebuild back to 0"
-                            explain "  (in-flight rebuilds keep running; AutoRebuild only gates"
-                            explain "   STARTING new ones, so future detach+reattach events"
-                            explain "   stay manual.)"
-                            if run sudo diskutil appleRAID update AutoRebuild 0 "$SELECTED_UUID"; then
-                                ok "AutoRebuild back to 0; the rebuild continues to completion."
-                            else
-                                warn "AutoRebuild flip back to 0 failed; flip manually:"
-                                warn "    $SCRIPT_NAME autorebuild $target_set_name off"
-                            fi
-                            info "Monitor:  $SCRIPT_NAME watch $target_set_name"
-                            return 0
-                            ;;
-                        2)
-                            confirm "Path [2]: release $dev from '$target_set_name' and start a full rebuild?" \
-                                || die "Aborted."
-                            run sudo diskutil appleRAID remove "$chosen_member_uuid" "$SELECTED_UUID" \
-                                || die "appleRAID remove failed - cannot proceed."
-                            ok "Disk released from set."
-                            echo
-                            ;;
-                        *)
-                            die "Aborted - unknown choice '$_path_choice'."
-                            ;;
-                    esac
+                    explain "(Earlier versions of this command offered an 'AutoRebuild=1"
+                    explain " nudge' as an alternative path. That path was REMOVED after"
+                    explain " empirical testing on real degraded sets: 'diskutil appleRAID"
+                    explain " update AutoRebuild' on a Degraded set with a logically-"
+                    explain " dissociated Failed member can wedge diskmanagementd /"
+                    explain " diskarbitrationd to the point that even read-only 'diskutil"
+                    explain " appleRAID list' blocks, and SIP forbids userspace from"
+                    explain " bouncing those daemons - the only recovery is a reboot."
+                    explain " Worse, the kernel commits AR=Yes but does NOT actually"
+                    explain " start the rebuild, because the failed slot has already been"
+                    explain " logically removed from its candidate list. The remove +"
+                    explain " wipe + repairMirror flow below avoids all of that.)"
+                    echo
+                    confirm "Release $dev from '$target_set_name' and start a full rebuild?" \
+                        || die "Aborted."
+                    run sudo diskutil appleRAID remove "$chosen_member_uuid" "$SELECTED_UUID" \
+                        || die "appleRAID remove failed - cannot proceed."
+                    ok "Disk released from set."
+                    echo
                     ;;
             esac
         fi

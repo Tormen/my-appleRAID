@@ -328,6 +328,42 @@ sudo diskutil appleRAID repairMirror <set-uuid> /dev/diskN # repartition + add +
 does its own GPT layout and refuses members with leftover Apple_RAID
 metadata.
 
+**The `AutoRebuild=1 nudge` is NOT a viable shortcut.** An earlier
+version of `my-appleRAID repair` offered a path that flipped
+`AutoRebuild` to `Yes` and then waited for the kernel to start the
+rebuild on the same disk in place. Empirical testing on a real
+Degraded set with a logically-dissociated Failed member (disk19s2
+of `weg`, after a yank+reattach cycle) showed three failure modes
+that make this path unsafe:
+
+1. **`diskutil appleRAID update AutoRebuild 1 <set>` blocks for
+   minutes** instead of the sub-second return seen on healthy sets.
+   The kernel reacts to the metadata write by trying to evaluate
+   the failed slot, and the syscall doesn't return until that
+   evaluation completes.
+2. **The userspace disk daemons get wedged.** Once `diskutil update`
+   is in that long-blocked state, even read-only `diskutil appleRAID
+   list` from another shell blocks indefinitely — `diskmanagementd`
+   / `diskarbitrationd` are stuck waiting on the same kernel call.
+   With SIP enabled, `launchctl kickstart -k` is refused
+   ("Operation not permitted while System Integrity Protection is
+   engaged"), so there is **no userspace recovery**: a reboot is
+   the only way out.
+3. **Even when AR=Yes is committed, the rebuild does NOT start.**
+   `ioreg -rc AppleRAIDSet` confirmed the metadata write reached
+   the kernel (`AppleRAID-AutoRebuild = Yes`), but the set stayed
+   `Degraded` and the failed member never transitioned to
+   `Rebuilding`. Apparently the kernel had already removed the
+   failed slot from its rebuild-candidate list when the member
+   went Failed, and re-enabling AR doesn't re-evaluate that slot.
+
+The remove + wipe + repairMirror flow avoids all three: it
+explicitly tears down the failed slot (clearing the kernel's
+candidate list), wipes the disk so `repairMirror` doesn't refuse
+the leftover metadata, and re-adds the disk as a fresh member
+which the kernel definitely *will* rebuild. It's also the
+documented Apple flow (man page + Apple-Community thread #7650392).
+
 ### 13. `diskutil eject` of an active RAID member
 
 Plain `diskutil eject /dev/diskN` **fails** for a disk that's still
