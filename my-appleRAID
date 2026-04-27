@@ -7335,10 +7335,31 @@ cmd_repair() {
         fi
     fi
 
-    confirm "Wipe $dev and add it to RAID set $SELECTED_UUID?" || die "Aborted."
+    # Only pre-wipe disks that carry SoftRAID metadata. SoftRAID's
+    # on-disk signature is sticky enough that 'repairMirror' can fail
+    # (or worse, succeed with a confused layout) when it's still
+    # present. For vanilla AppleRAID-leftover or fresh disks,
+    # 'repairMirror' does its own GPT layout - a pre-wipe is wear
+    # without benefit. (Same per-disk decision as 'cmd_create'.)
+    short="${dev#/dev/}"
+    do_repair_wipe=0
+    if list_softraid_disks 2>/dev/null | grep -qxF "$short"; then
+        do_repair_wipe=1
+    fi
 
-    step "Step 2: wipe replacement disk"
-    do_auto_wipe "$dev"
+    if [ "$do_repair_wipe" = "1" ]; then
+        confirm "SoftRAID metadata detected on $dev. Wipe $dev (first + last 100 MB) and add it to RAID set $SELECTED_UUID?" \
+            || die "Aborted."
+        step "Step 2: wipe replacement disk (SoftRAID metadata detected)"
+        do_auto_wipe "$dev"
+    else
+        confirm "Add $dev to RAID set $SELECTED_UUID? (no pre-wipe; repairMirror will repartition)" \
+            || die "Aborted."
+        step "Step 2: skipping pre-wipe (no SoftRAID metadata)"
+        explain "  repairMirror will repartition the disk itself; a 100 MB wipe is"
+        explain "  unnecessary here. Use 'my-appleRAID wipe ${short#disk}' beforehand"
+        explain "  by hand if you want defensive zeroing."
+    fi
 
     step "Step 3: add disk to mirror (repairMirror)"
     explain "'diskutil appleRAID repairMirror <set-uuid> <device>' will:"

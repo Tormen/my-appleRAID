@@ -319,14 +319,17 @@ recipe is:
 ```
 sudo diskutil appleRAID remove <member-uuid> <set-uuid>   # release the kernel claim
 sudo diskutil unmountDisk force /dev/diskN                 # belt-and-braces unmount
-my-appleRAID wipe N                                        # zero first/last 100 MB
+[ my-appleRAID wipe N ]                                    # ONLY if SoftRAID metadata present
 sudo diskutil appleRAID repairMirror <set-uuid> /dev/diskN # repartition + add + sync
 ```
 
 `my-appleRAID repair` runs all of this interactively, with a single
-"yes" confirmation. The wipe is necessary because `repairMirror`
-does its own GPT layout and refuses members with leftover Apple_RAID
-metadata.
+"yes" confirmation. The pre-wipe step is **conditional**: it fires
+only when `list_softraid_disks` finds SoftRAID metadata on the disk
+(SoftRAID's signature is sticky enough that `repairMirror` can fail
+or produce a confused layout otherwise). For vanilla AppleRAID-
+leftover or fresh disks the wipe is skipped — `repairMirror` does
+its own GPT layout and a 100 MB wipe is wear without benefit.
 
 **The `AutoRebuild=1 nudge` is NOT a viable shortcut.** An earlier
 version of `my-appleRAID repair` offered a path that flipped
