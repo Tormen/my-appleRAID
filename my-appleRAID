@@ -7179,7 +7179,7 @@ _my-appleRAID() {
         'status:Short status summary (Online / Degraded / ...)'
         'watch:Live-refreshing status'
         'blink:Pulse a disk activity LED to identify the physical drive'
-        'eject:Unmount + spin-down + power off a physical disk for safe disconnect'
+        'eject:Unmount + (if RAID member: release from set) + spin-down + power off'
         'smart:Detailed SMART drill-down for one disk (history + error log + self-tests)'
         'wipe:Zero first + last 100 MB of /dev/diskN'
         'verify-wipe:Check that first + last 100 MB are zeros'
