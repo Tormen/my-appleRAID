@@ -4563,6 +4563,48 @@ If you received this, the email alert chain is working."
 # ----------------------------------------------------------------------
 # Subcommand: help
 # ----------------------------------------------------------------------
+
+# Print the section of cmd_help that documents a single subcommand.
+# Used as the --help fallback in main() for subcommands that don't have
+# their own per-command --help block. Returns 1 if the topic isn't
+# found in cmd_help (so main() can fall back to the global cmd_help).
+#
+# The COMMANDS section of cmd_help is structured as:
+#   2-space indent + topic name [+ args]
+#                               (continuation lines, deeper indent)
+#   2-space indent + NEXT topic name ...
+# We strip ANSI colors before matching so this works regardless of
+# terminal type.
+show_subcmd_help() {
+    _topic="$1"
+    cmd_help 2>/dev/null | awk -v t="$_topic" '
+        function strip(s) { gsub(/\x1b\[[0-9;]*m/, "", s); return s }
+        BEGIN { capture = 0; found = 0 }
+        {
+            line = strip($0)
+            # Topic line: starts with exactly 2 spaces + the topic
+            # followed by a space, comma, EOL, or "[".
+            if (line ~ "^  " t "([ ,[]|$)") {
+                capture = 1; found = 1
+                print
+                next
+            }
+            # New topic header (2-space indent + alpha, NOT continuation
+            # which uses 28+ spaces) ends the block we are capturing.
+            if (capture && line ~ /^  [a-zA-Z]/ && line !~ /^   / ) {
+                exit
+            }
+            # Top-level section header (no leading space, capital letter)
+            # ends the block.
+            if (capture && line ~ /^[A-Z]/) {
+                exit
+            }
+            if (capture) print
+        }
+        END { if (!found) exit 1 }
+    '
+}
+
 cmd_help() {
     cat <<EOF
 ${C_BOLD}${SCRIPT_NAME}${C_RESET} - The Swiss Army knife for disks and RAIDs on macOS
@@ -5971,22 +6013,36 @@ EOF
     fi
 
     # Issue STANDBY IMMEDIATE via smartctl. macOS 'diskutil eject' is
-    # unreliable about spinning the platter down: for USB hot-plug bays
-    # it usually does, for direct-SATA / JBOD enclosures it often
-    # returns success while the disk keeps spinning. smartctl
-    # -s standby,now talks ATA STANDBY IMMEDIATE through the SAT layer
-    # ('-d sat,auto' lets smartctl auto-detect the right transport),
-    # which actually parks the heads and stops the platter.
+    # unreliable about spinning the platter down: it returns success
+    # while the disk often keeps spinning. smartctl -s standby,now
+    # asks the drive firmware to park the heads and stop the platter.
+    #
+    # macOS limitation worth knowing: the kernel's IOATAFamily driver
+    # (used for direct-SATA / internal disks) BLOCKS non-SMART ATA
+    # commands, so STANDBY IMMEDIATE fails with "Non-SMART commands
+    # not implemented" for those devices. It still works for USB and
+    # other-bus enclosures whose bridge presents the disk via the
+    # IOSCSIArchitectureModelFamily path. We attempt it best-effort
+    # and explain the failure mode if the kernel blocks us.
     step "Spinning down $dev (STANDBY IMMEDIATE)"
     smartctl_bin=$(command -v smartctl 2>/dev/null)
     if [ -z "$smartctl_bin" ]; then
         warn "smartctl not found in PATH - skipping explicit spin-down."
         warn "  Install with: brew install smartmontools"
+    elif run sudo "$smartctl_bin" -s standby,now "$dev"; then
+        ok "Drive accepted STANDBY IMMEDIATE - platter is spinning down."
     else
-        if ! run sudo "$smartctl_bin" -s standby,now -d sat,auto "$dev"; then
-            warn "STANDBY IMMEDIATE returned non-zero. Some USB bridges intercept"
-            warn "ATA pass-through; the eject below may still spin the disk down."
-        fi
+        warn "STANDBY IMMEDIATE failed (exit non-zero)."
+        explain "On macOS, this is expected for direct-SATA / internal disks:"
+        explain "  the IOATAFamily kernel driver blocks non-SMART ATA"
+        explain "  pass-through, so userspace cannot send STANDBY IMMEDIATE."
+        explain "  USB / Thunderbolt-bridged enclosures that route the disk"
+        explain "  through IOSCSIArchitectureModelFamily are not affected."
+        explain "'diskutil eject' below will detach the device. The platter"
+        explain "may keep spinning until you power down the enclosure or"
+        explain "unplug the cable - modern drives park heads automatically"
+        explain "on power-loss (emergency-park via stored capacitor charge),"
+        explain "so unplugging while spinning is safe in practice."
     fi
 
     step "Ejecting $dev"
@@ -7515,6 +7571,31 @@ main() {
                 _topic="$2"
                 shift 2
                 set -- "$_topic" --help "$@"
+                ;;
+        esac
+    fi
+
+    # `<topic> --help` / `<topic> -h` for subcommands that DON'T have a
+    # per-command --help block of their own: print the relevant section
+    # of cmd_help and exit. Subcommands listed in the pass-through case
+    # below have their own rich --help and are left to handle it. If
+    # show_subcmd_help cannot find the topic (typo, removed command),
+    # we fall back to the global help.
+    if [ $# -ge 2 ]; then
+        case "$2" in
+            -h|--help)
+                case "$1" in
+                    list|disks|status|info|blink|eject|smart|autorebuild|test|rename|baseline|migrate-softraid|release-softraid)
+                        # Pass through: subcommand handles --help itself.
+                        ;;
+                    *)
+                        if show_subcmd_help "$1"; then
+                            exit 0
+                        fi
+                        cmd_help
+                        exit 0
+                        ;;
+                esac
                 ;;
         esac
     fi
