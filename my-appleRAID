@@ -6322,40 +6322,88 @@ EOF
             eta_slow_h=$(awk -v b="$rem_b" \
                 'BEGIN { printf "%.1f", b / (200 * 1024 * 1024 * 3600) }')
 
-            # Measured rate: compare with last (timestamp, pct) sample.
-            # Stored in $STATE_DIR if state_init has set it; otherwise
-            # /tmp fallback so the feature works without a state dir.
+            # Measured rate via anchor sampling. AppleRAID's % is
+            # integer-rounded - on a 10 TB / ~14h rebuild that's ~14
+            # minutes per visible tick. Comparing two samples that are
+            # only seconds apart will almost always see dpct=0 and tell
+            # the user nothing. Instead we store an ANCHOR (the FIRST
+            # time we observed the rebuild at any %) and compute the
+            # rate over the entire (anchor -> now) span. A single tick
+            # 1%->2% is then enough to produce a meaningful rate.
+            #
+            # File format: 'epoch|pct'. Reset when current_pct < anchor_pct
+            # (different rebuild) or when % rolls back to 0.
             sample_dir="${STATE_DIR:-/tmp}"
             sample_file="${sample_dir}/rebuild-${UUID}"
             now_ts=$(date +%s)
             measured_line=""
+            anchor_ts=""
+            anchor_pct=""
             if [ -r "$sample_file" ]; then
-                prev=$(cat "$sample_file" 2>/dev/null)
-                prev_ts=$(echo "$prev" | awk -F'|' '{print $1}')
-                prev_pct=$(echo "$prev" | awk -F'|' '{print $2}')
-                if [ -n "$prev_ts" ] && [ -n "$prev_pct" ]; then
-                    dt=$(( now_ts - prev_ts ))
-                    dpct=$(awk -v a="$rebuild_pct_now" -v b="$prev_pct" \
-                        'BEGIN { printf "%.4f", a - b }')
-                    if [ "$dt" -ge 30 ] \
-                       && awk -v d="$dpct" 'BEGIN { exit !(d > 0) }'; then
-                        # bytes per second observed:
-                        bytes_per_s=$(awk -v s="$rebuild_size_b" -v d="$dpct" -v t="$dt" \
-                            'BEGIN { printf "%.0f", s * (d / 100) / t }')
-                        if [ "$bytes_per_s" -gt 0 ] 2>/dev/null; then
-                            mbs=$(awk -v b="$bytes_per_s" \
-                                'BEGIN { printf "%.0f", b / (1024 * 1024) }')
-                            eta_meas_h=$(awk -v b="$rem_b" -v r="$bytes_per_s" \
-                                'BEGIN { printf "%.1f", b / (r * 3600) }')
-                            measured_line="  (measured: ${mbs} MB/s over ${dt}s -> ETA ~${eta_meas_h}h)"
-                        fi
+                anchor_line=$(cat "$sample_file" 2>/dev/null)
+                anchor_ts=$(echo "$anchor_line" | awk -F'|' '{print $1}')
+                anchor_pct=$(echo "$anchor_line" | awk -F'|' '{print $2}')
+            fi
+            # If no anchor yet, OR the rebuild has clearly restarted
+            # (current % is lower than anchor), (re-)anchor now.
+            if [ -z "$anchor_ts" ] || [ -z "$anchor_pct" ] \
+               || awk -v c="$rebuild_pct_now" -v a="$anchor_pct" \
+                      'BEGIN { exit !(c < a) }'; then
+                anchor_ts="$now_ts"
+                anchor_pct="$rebuild_pct_now"
+                printf '%s|%s\n' "$anchor_ts" "$anchor_pct" \
+                    > "${sample_file}.tmp" 2>/dev/null \
+                    && mv "${sample_file}.tmp" "$sample_file" 2>/dev/null
+            fi
+
+            dt=$(( now_ts - anchor_ts ))
+            dpct=$(awk -v a="$rebuild_pct_now" -v b="$anchor_pct" \
+                'BEGIN { printf "%.4f", a - b }')
+
+            if [ "$dt" -ge 30 ] \
+               && awk -v d="$dpct" 'BEGIN { exit !(d > 0) }'; then
+                # bytes per second observed over the anchor span:
+                bytes_per_s=$(awk -v s="$rebuild_size_b" -v d="$dpct" -v t="$dt" \
+                    'BEGIN { printf "%.0f", s * (d / 100) / t }')
+                if [ "$bytes_per_s" -gt 0 ] 2>/dev/null; then
+                    mbs=$(awk -v b="$bytes_per_s" \
+                        'BEGIN { printf "%.0f", b / (1024 * 1024) }')
+                    eta_meas_h=$(awk -v b="$rem_b" -v r="$bytes_per_s" \
+                        'BEGIN { printf "%.1f", b / (r * 3600) }')
+                    span_min=$(( dt / 60 ))
+                    measured_line="  (measured: ${mbs} MB/s over ${span_min}min -> ETA ~${eta_meas_h}h)"
+                fi
+            else
+                # No measurable progress yet. Tell the user that we're
+                # tracking, AND tell them roughly when the next % tick
+                # is expected so they know when to re-run 'info' to get
+                # a real rate. The next % advance takes
+                #   set_size_bytes / 100 / rate_bytes_per_s   seconds
+                # so we report the band [300 MB/s ... 200 MB/s] of that.
+                tick_fast_s=$(awk -v s="$rebuild_size_b" \
+                    'BEGIN { printf "%.0f", (s / 100) / (300 * 1024 * 1024) }')
+                tick_slow_s=$(awk -v s="$rebuild_size_b" \
+                    'BEGIN { printf "%.0f", (s / 100) / (200 * 1024 * 1024) }')
+                tick_fast_min=$(( tick_fast_s / 60 ))
+                tick_slow_min=$(( tick_slow_s / 60 ))
+                if [ "$dt" -lt 30 ]; then
+                    # Anchor was just set this run.
+                    measured_line="  (actual rate still measuring; come back in ~${tick_fast_min}-${tick_slow_min}min for the next % tick)"
+                else
+                    # Anchor is older; tell the user how long we have
+                    # been waiting and how much longer to expect.
+                    span_min=$(( dt / 60 ))
+                    rest_fast_min=$(( tick_fast_min - span_min ))
+                    rest_slow_min=$(( tick_slow_min - span_min ))
+                    [ "$rest_fast_min" -lt 0 ] && rest_fast_min=0
+                    [ "$rest_slow_min" -lt 0 ] && rest_slow_min=0
+                    if [ "$rest_slow_min" -le 0 ]; then
+                        measured_line="  (actual rate still measuring; % is overdue for a tick after ${span_min}min - rebuild may be slower than 200 MB/s)"
+                    else
+                        measured_line="  (actual rate still measuring; ${span_min}min since anchor at ${anchor_pct}%, next tick in ~${rest_fast_min}-${rest_slow_min}min)"
                     fi
                 fi
             fi
-            # Always update the sample file (atomic-ish via mv).
-            tmp_file="${sample_file}.tmp"
-            printf '%s|%s\n' "$now_ts" "$rebuild_pct_now" > "$tmp_file" 2>/dev/null \
-                && mv "$tmp_file" "$sample_file" 2>/dev/null
 
             printf '\n'
             printf '  %-15s %s%% complete\n' "Rebuild:"   "${rebuild_pct_now}"
