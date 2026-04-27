@@ -2889,9 +2889,31 @@ EOF
         step "Updating RAID set baseline"
         explain "Snapshotting names of all currently-existing RAID sets to:"
         explain "  $(baseline_sets_file)"
+        # Capture the previous baseline so we can show what changed.
+        _prev_sets=$(baseline_read_sets 2>/dev/null)
         baseline_write_sets
+        _new_sets=$(baseline_read_sets 2>/dev/null)
         info "Baselined RAID sets:"
-        baseline_read_sets | sed 's/^/    /'
+        echo "$_new_sets" | awk 'NF>0' | sed 's/^/    /'
+
+        # Diff: what was added vs removed since the prior baseline.
+        # Both lists are simple newline-separated names.
+        _added_sets=$(printf '%s\n' "$_new_sets" "$_prev_sets" "$_prev_sets" \
+            | awk 'NF>0' | sort | uniq -u)
+        _removed_sets=$(printf '%s\n' "$_prev_sets" "$_new_sets" "$_new_sets" \
+            | awk 'NF>0' | sort | uniq -u)
+        echo
+        if [ -n "$_added_sets" ]; then
+            info "Added RAID sets (new since previous baseline):"
+            echo "$_added_sets" | sed 's/^/    + /'
+        fi
+        if [ -n "$_removed_sets" ]; then
+            info "Removed RAID sets (gone since previous baseline):"
+            echo "$_removed_sets" | sed 's/^/    - /'
+        fi
+        if [ -z "$_added_sets" ] && [ -z "$_removed_sets" ]; then
+            info "RAID set baseline unchanged."
+        fi
     fi
 
     if [ "$do_disks" = "1" ]; then
@@ -2899,14 +2921,50 @@ EOF
         explain "Snapshotting stable identifiers of all currently-attached"
         explain "physical disks to:"
         explain "  $(baseline_disks_file)"
-        baseline_write_disks
-        info "Baselined disks (id, current node, size, model):"
-        # Show the full data lines (skip comment block) so the user can
-        # see at a glance which physical disk each baseline entry points
-        # at, including the size/model hints.
+        # Capture the previous baseline file's data lines (full lines
+        # including the bsd/size/model comment) so we can diff and show
+        # the human-readable hint alongside each added/removed id.
         f=$(baseline_disks_file)
-        if [ -f "$f" ]; then
-            awk 'NF>0 && !/^#/' "$f" | sed 's/^/    /'
+        _prev_disks_lines=""
+        [ -f "$f" ] && _prev_disks_lines=$(awk 'NF>0 && !/^#/' "$f")
+        _prev_disk_ids=$(echo "$_prev_disks_lines" | awk 'NF>0 {print $1}')
+
+        baseline_write_disks
+
+        _new_disks_lines=""
+        [ -f "$f" ] && _new_disks_lines=$(awk 'NF>0 && !/^#/' "$f")
+        _new_disk_ids=$(echo "$_new_disks_lines" | awk 'NF>0 {print $1}')
+
+        info "Baselined disks (id, current node, size, model):"
+        echo "$_new_disks_lines" | sed 's/^/    /'
+
+        # Diff: which ids are new, which are gone. We display the full
+        # data line (including the bsd/size/model comment) for each, so
+        # the user can see "what hardware" was added or lost without
+        # cross-referencing.
+        _added_ids=$(printf '%s\n' "$_new_disk_ids" "$_prev_disk_ids" "$_prev_disk_ids" \
+            | awk 'NF>0' | sort | uniq -u)
+        _removed_ids=$(printf '%s\n' "$_prev_disk_ids" "$_new_disk_ids" "$_new_disk_ids" \
+            | awk 'NF>0' | sort | uniq -u)
+        echo
+        if [ -n "$_added_ids" ]; then
+            info "Added disks (new since previous baseline):"
+            echo "$_added_ids" | while IFS= read -r _id; do
+                [ -n "$_id" ] || continue
+                _line=$(echo "$_new_disks_lines" | awk -v id="$_id" '$1==id {print; exit}')
+                printf '    + %s\n' "${_line:-$_id}"
+            done
+        fi
+        if [ -n "$_removed_ids" ]; then
+            info "Removed disks (gone since previous baseline):"
+            echo "$_removed_ids" | while IFS= read -r _id; do
+                [ -n "$_id" ] || continue
+                _line=$(echo "$_prev_disks_lines" | awk -v id="$_id" '$1==id {print; exit}')
+                printf '    - %s\n' "${_line:-$_id}"
+            done
+        fi
+        if [ -z "$_added_ids" ] && [ -z "$_removed_ids" ]; then
+            info "Disk baseline unchanged."
         fi
     fi
 
