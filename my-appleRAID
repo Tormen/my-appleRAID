@@ -534,7 +534,10 @@ cfg_set_defaults() {
     # Email
     EMAIL_TO=""                            # empty disables email
     EMAIL_FROM="my-appleRAID@$(hostname)"
-    EMAIL_SENDER="/usr/local/bin/msmtp"
+    EMAIL_SENDER="msmtp"                   # bare name; resolved via PATH (which
+                                           # the top-of-script PATH block extends to
+                                           # include Homebrew prefixes). Override with
+                                           # an absolute path if you prefer.
     EMAIL_INTERVAL=14400                   # 4 hours
     # SMART polling & self-tests
     SMART_POLL_INTERVAL=86400              # 1 day
@@ -998,7 +1001,16 @@ alert_email() {
     subject="$1"; body="$2"
     [ -n "${EMAIL_TO:-}" ] || { log_debug "Email disabled (no EMAIL_TO)"; return 0; }
     [ -n "${EMAIL_SENDER:-}" ] || { log_debug "Email disabled (no EMAIL_SENDER)"; return 0; }
-    [ -x "$EMAIL_SENDER" ] || { log_warn "Email sender not executable: $EMAIL_SENDER"; return 0; }
+
+    # Resolve the sender. Accept either an absolute path or a bare name
+    # (e.g. "msmtp"); for the latter we look it up via PATH, which now
+    # includes both Homebrew prefixes (see top-of-script PATH block).
+    case "$EMAIL_SENDER" in
+        /*) sender_exec="$EMAIL_SENDER" ;;
+        *)  sender_exec=$(command -v "$EMAIL_SENDER" 2>/dev/null) ;;
+    esac
+    [ -n "$sender_exec" ] && [ -x "$sender_exec" ] \
+        || { log_warn "Email sender not found or not executable: '$EMAIL_SENDER'"; return 0; }
 
     {
         printf 'From: %s\n' "${EMAIL_FROM}"
@@ -1007,8 +1019,8 @@ alert_email() {
         printf 'Content-Type: text/plain; charset=utf-8\n'
         printf '\n'
         printf '%s\n' "$body"
-    } | "$EMAIL_SENDER" "$EMAIL_TO" 2>/dev/null \
-        || log_warn "Email send failed (check msmtp config and $EMAIL_SENDER --debug)"
+    } | "$sender_exec" "$EMAIL_TO" 2>/dev/null \
+        || log_warn "Email send failed (check msmtp config and '$sender_exec --debug')"
 }
 
 # ----------------------------------------------------------------------
@@ -2229,10 +2241,17 @@ EMAIL_TO=""
 # From address. Must match what your SMTP relay allows.
 EMAIL_FROM="my-appleRAID@localhost"
 
-# Path to a sendmail-compatible sender. msmtp is recommended:
+# Path to (or bare name of) a sendmail-compatible sender. msmtp is
+# recommended:
 #   brew install msmtp
 # Configure ~/.msmtprc per the smartmontools setup we discussed earlier.
-EMAIL_SENDER="/usr/local/bin/msmtp"
+#
+# A bare name (default below) is resolved via PATH; my-appleRAID's
+# top-of-script block extends PATH to include /opt/homebrew/bin and
+# /usr/local/bin so this works in the launchd daemon context too. Set
+# to an absolute path here if you have multiple sender binaries and
+# want to pin one explicitly.
+EMAIL_SENDER="msmtp"
 
 # Minimum time between emails for the SAME ongoing problem.
 # Accepts duration suffixes (see top of file): 60, 60s, 5m, 2h, 1d, 1w.
