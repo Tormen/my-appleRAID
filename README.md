@@ -320,16 +320,38 @@ recipe is:
 sudo diskutil appleRAID remove <member-uuid> <set-uuid>   # release the kernel claim
 sudo diskutil unmountDisk force /dev/diskN                 # belt-and-braces unmount
 [ my-appleRAID wipe N ]                                    # ONLY if SoftRAID metadata present
-sudo diskutil appleRAID repairMirror <set-uuid> /dev/diskN # repartition + add + sync
+sudo diskutil appleRAID add member /dev/diskN <set-uuid>   # repartition + add + START rebuild
 ```
 
 `my-appleRAID repair` runs all of this interactively, with a single
 "yes" confirmation. The pre-wipe step is **conditional**: it fires
 only when `list_softraid_disks` finds SoftRAID metadata on the disk
-(SoftRAID's signature is sticky enough that `repairMirror` can fail
-or produce a confused layout otherwise). For vanilla AppleRAID-
-leftover or fresh disks the wipe is skipped — `repairMirror` does
-its own GPT layout and a 100 MB wipe is wear without benefit.
+(SoftRAID's signature is sticky enough that the GPT-layout step in
+`add member` can fail or produce a confused layout otherwise). For
+vanilla AppleRAID-leftover or fresh disks the wipe is skipped —
+`diskutil` does its own GPT layout and a 100 MB pre-wipe is wear
+without benefit.
+
+**Why `add member` and NOT `repairMirror`.** Empirically (verified on
+real disks April 2026), `diskutil appleRAID repairMirror <set>
+/dev/diskN` adds the new disk as a hot `Spare`, not a Member. With
+`AutoRebuild=No` the Spare sits inert; the kernel only promotes a
+Spare to a Rebuilding member while `AutoRebuild=Yes`. Apple's man
+page describes `repairMirror` as adding-as-member, but the observed
+behavior is "added as Spare", and `diskutil appleRAID list` shows the
+set as `Status: Online` even while the new Spare is doing nothing —
+which is misleading and dangerous (you think the rebuild is running
+but the mirror is still effectively single-member).
+
+`diskutil appleRAID add member <device> <set>` does NOT have that
+problem. It adds the disk as a Member and starts the rebuild as part
+of the same operation, regardless of AutoRebuild. Apple's man page
+explicitly contrasts the two `add` subtypes:
+> "Adding a hot spare to a mirror will enable autorebuilding for that
+>  mirror." (i.e. only the spare path depends on AutoRebuild)
+
+`my-appleRAID repair` therefore uses `add member`, not `repairMirror`,
+in step 3 of the flow above.
 
 **The `AutoRebuild=1 nudge` is NOT a viable shortcut.** An earlier
 version of `my-appleRAID repair` offered a path that flipped

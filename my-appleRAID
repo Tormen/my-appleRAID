@@ -7452,15 +7452,24 @@ cmd_repair() {
         explain "  by hand if you want defensive zeroing."
     fi
 
-    step "Step 3: add disk to mirror (repairMirror)"
-    explain "'diskutil appleRAID repairMirror <set-uuid> <device>' will:"
+    step "Step 3: add disk to mirror (add member)"
+    explain "'diskutil appleRAID add member <device> <set-uuid>' will:"
     explain "  - Partition the new disk to match the existing member layout"
-    explain "  - Add the Apple_RAID partition as a new mirror member"
-    explain "  - Begin rebuilding data onto it"
+    explain "  - Add the Apple_RAID partition as a NEW MEMBER (not a Spare)"
+    explain "  - Begin rebuilding data onto it IMMEDIATELY"
     explain "The mirror stays mounted and usable during the rebuild (online rebuild)."
+    explain ""
+    explain "Why 'add member' and not 'repairMirror' here: empirically,"
+    explain "'diskutil appleRAID repairMirror <set> /dev/diskN' adds the new"
+    explain "disk as a hot SPARE rather than a Member. The kernel only"
+    explain "promotes the Spare to a Rebuilding member while AutoRebuild=1,"
+    explain "so with DEFAULT_AUTO_REBUILD=0 (or any user toggling AR back"
+    explain "off mid-flight) the Spare freezes and the rebuild never starts."
+    explain "'add member' has no such dependency - the rebuild kicks off"
+    explain "as part of the add operation itself."
     echo
-    run sudo diskutil appleRAID repairMirror "$SELECTED_UUID" "$dev" \
-        || die "repairMirror failed"
+    run sudo diskutil appleRAID add member "$dev" "$SELECTED_UUID" \
+        || die "add member failed"
 
     step "Step 4: post-repair status"
     run diskutil appleRAID list "$SELECTED_UUID"
