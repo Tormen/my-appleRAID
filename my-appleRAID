@@ -899,8 +899,18 @@ auto_baseline_clear() {
 # ----------------------------------------------------------------------
 # Baseline files: the snapshot of "what should exist" for REQUIRED_*=all.
 #
-#   $STATE_DIR/baseline-sets    newline-separated RAID set names
-#   $STATE_DIR/baseline-disks   newline-separated disk identifiers (disk2, ...)
+#   $STATE_DIR/baseline-sets    one RAID set name per line
+#   $STATE_DIR/baseline-disks   one stable disk SERIAL per line, with
+#                               the /dev/diskN node + model in a trailing
+#                               '#' comment. The serial is the matchable
+#                               identifier; the comment is a human hint
+#                               (and stale once the disk gets a new node
+#                               number on the next reboot/replug).
+#
+# Why serials, not disk-node names: macOS assigns /dev/diskN at attach
+# time, and the number shuffles freely across reboots, USB hub swaps,
+# and replug order. Tracking by serial keeps "the same physical disk"
+# the same identity regardless of which slot it lands in.
 #
 # Written by 'appleRAID baseline'. If a baseline file doesn't exist
 # when REQUIRED_*=all is active, the 'health' command auto-creates it
@@ -915,10 +925,30 @@ baseline_read_sets() {
     awk 'NF>0 && !/^#/ {print}' "$f"
 }
 
+# Read the disk baseline. Returns one serial per line (the first
+# whitespace-separated token of each non-comment line). Lines whose
+# first token still looks like a /dev/diskN node are flagged as a
+# legacy baseline that needs re-baselining via 'appleRAID baseline
+# --disks'.
 baseline_read_disks() {
     f=$(baseline_disks_file)
     [ -f "$f" ] || return 0
-    awk 'NF>0 && !/^#/ {print}' "$f"
+    awk 'NF>0 && !/^#/ { print $1 }' "$f"
+}
+
+# True if the baseline file appears to be in any pre-tagged format
+# (legacy disk-node names like "disk2", or earlier serial-only entries
+# without a SN:/USB:/VOL: tag). Used to nudge the user to rebaseline
+# after the upgrade that switched to tagged stable identifiers.
+baseline_disks_is_legacy() {
+    f=$(baseline_disks_file)
+    [ -f "$f" ] || return 1
+    first=$(awk 'NF>0 && !/^#/ { print $1; exit }' "$f")
+    [ -n "$first" ] || return 1
+    case "$first" in
+        SN:*|USB:*|VOL:*) return 1 ;;
+        *)                return 0 ;;
+    esac
 }
 
 # Write the currently-existing RAID set *names* to the baseline file.
@@ -934,15 +964,138 @@ baseline_write_sets() {
     } > "$f"
 }
 
-# Write the currently-attached physical disk identifiers to the baseline.
+# Pick the best stable identifier for a physical disk, tagged with its
+# source so we know how to match it back later. Tags:
+#
+#   SN:<serial>      ATA/SATA/NVMe IDENTIFY serial number (preferred).
+#                    Stable across reboots, replugs, hub swaps.
+#   USB:<serial>     Bridge serial reported by the USB enclosure when
+#                    the disk inside it doesn't pass IDENTIFY through.
+#                    Stable across replug, but identifies the bridge,
+#                    not the disk inside - swap a disk inside the
+#                    enclosure and the same id matches the new disk.
+#   VOL:<uuid>       Volume UUID of the first mounted partition (last
+#                    resort). Stable per filesystem; lost on reformat.
+#
+# Empty output means the disk has no stable identifier and cannot be
+# baselined; the caller should skip it with a warning.
+disk_baseline_id() {
+    bsd="${1#/dev/}"
+    [ -n "$bsd" ] || return 1
+
+    # 1. ATA/NVMe serial via the existing disk_serial helper.
+    s=$(disk_serial "$bsd" 2>/dev/null)
+    if [ -n "$s" ]; then
+        echo "SN:$s"
+        return 0
+    fi
+
+    # 2. USB bridge serial. system_profiler SPUSBDataType groups disks
+    #    under their bridge, with the bridge's "Serial Number" appearing
+    #    above the BSD Name(s) it owns. Take the most recent non-trivial
+    #    "Serial Number:" line that precedes "BSD Name: <bsd>".
+    s=$(system_profiler SPUSBDataType 2>/dev/null | awk -v target="$bsd" '
+        /Serial Number:/ {
+            line = $0
+            sub(/^[[:space:]]*Serial Number:[[:space:]]*/, "", line)
+            sub(/[[:space:]]+$/, "", line)
+            # Skip obvious placeholder values that hubs report.
+            if (line ~ /^0+$/ || line == "") next
+            recent = line
+        }
+        /BSD Name:/ {
+            line = $0
+            sub(/^[[:space:]]*BSD Name:[[:space:]]*/, "", line)
+            sub(/[[:space:]]+$/, "", line)
+            if (line == target && recent != "") {
+                print recent
+                exit
+            }
+        }
+    ')
+    if [ -n "$s" ]; then
+        echo "USB:$s"
+        return 0
+    fi
+
+    # 3. Volume UUID of any mounted partition on this disk.
+    s=$(diskutil info "/dev/${bsd}s1" 2>/dev/null \
+        | awk -F': +' '/Volume UUID:/ {print $2; exit}' \
+        | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+    if [ -z "$s" ]; then
+        s=$(diskutil info "/dev/${bsd}s2" 2>/dev/null \
+            | awk -F': +' '/Volume UUID:/ {print $2; exit}' \
+            | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+    fi
+    if [ -n "$s" ]; then
+        echo "VOL:$s"
+        return 0
+    fi
+
+    return 1
+}
+
+# Write the currently-attached physical disks to the baseline file,
+# keyed by their best stable identifier. Format per non-comment line:
+#
+#   <tagged-id>    # <bsd-at-baseline>  <model>
+#
+# tagged-id is one of  SN:<serial> | USB:<bridge-serial> | VOL:<uuid>
+# (see disk_baseline_id). Disks for which none of those is discoverable
+# are skipped with a warning.
 baseline_write_disks() {
     f=$(baseline_disks_file)
     {
         echo "# appleRAID baseline: disks expected to be attached."
         echo "# Written: $(now_iso)"
         echo "# Update with: appleRAID baseline --disks"
-        list_all_physical_disks
+        echo "#"
+        echo "# Format: <tagged-id>  # <bsd-at-baseline>  <size>  <model>"
+        echo "# The tagged-id is the stable identifier we match against."
+        echo "# Tags:"
+        echo "#   SN:  ATA/NVMe IDENTIFY serial - preferred, fully stable"
+        echo "#   USB: USB bridge serial when SN is unavailable - stable"
+        echo "#        across replug, but identifies the bridge not the"
+        echo "#        disk inside, so swapping a disk inside the same"
+        echo "#        enclosure will not be noticed"
+        echo "#   VOL: Volume UUID of first partition - last resort,"
+        echo "#        stable per-filesystem, lost on reformat"
+        echo "# The bsd (/dev/diskN node), size, and model in the comment"
+        echo "# are human hints. The bsd may shuffle on replug; size and"
+        echo "# model are intrinsic to the disk and stay stable."
+        list_all_physical_disks | while IFS= read -r d; do
+            [ -n "$d" ] || continue
+            id=$(disk_baseline_id "$d" 2>/dev/null)
+            model=$(diskutil info "/dev/$d" 2>/dev/null \
+                | awk -F': +' '/Device \/ Media Name:/ {print $2; exit}' \
+                | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+            size=$(diskutil info "/dev/$d" 2>/dev/null \
+                | awk -F': +' '/Disk Size:/ {print $2; exit}' \
+                | awk '{print $1, $2}' \
+                | sed 's/[[:space:]]*$//')
+            if [ -z "$id" ]; then
+                log_warn "Skipping $d in baseline: no stable identifier discoverable (size: ${size:-unknown}, model: ${model:-unknown})"
+                continue
+            fi
+            printf '%-24s # %-7s %-9s %s\n' "$id" "$d" "${size:-?}" "${model:-?}"
+        done
     } > "$f"
+}
+
+# Map a tagged baseline id back to the currently-attached /dev/diskN
+# node, or empty if no current disk matches. Used by the presence
+# check.
+disk_for_baseline_id() {
+    target="$1"
+    [ -n "$target" ] || return 1
+    list_all_physical_disks | while IFS= read -r d; do
+        [ -n "$d" ] || continue
+        cur=$(disk_baseline_id "$d" 2>/dev/null)
+        if [ "$cur" = "$target" ]; then
+            echo "$d"
+            return 0
+        fi
+    done
 }
 
 # ----------------------------------------------------------------------
@@ -1338,8 +1491,16 @@ list_all_physical_disks() {
 # normalized and deduplicated. Used by both the SMART pipeline (which
 # then filters down to present disks) and the presence check (which
 # diffs this list against what's actually attached).
-# Resolve REQUIRED_DISKS into a concrete list of disk names.
-# Handles "all" (read baseline file), "" (empty), or comma-list.
+#
+# Two entry forms are accepted in REQUIRED_DISKS comma-lists:
+#   * disk-node form: "3", "disk3", "/dev/disk3" - normalized to "disk3"
+#     and matched against the current attach order. TRANSIENT - the
+#     same physical disk may appear at a different node after reboot.
+#   * serial form: anything else - passed through verbatim and matched
+#     against attached disks' SMART/system_profiler serial numbers.
+#     STABLE across reboots and replugs.
+#
+# 'all' mode reads the baseline file, which is now serial-keyed.
 resolve_required_disks() {
     case "${REQUIRED_DISKS:-}" in
         ""|none|NONE)
@@ -1351,11 +1512,26 @@ resolve_required_disks() {
                 log_info "No disk baseline yet; creating from current state"
                 baseline_write_disks
             fi
+            if baseline_disks_is_legacy 2>/dev/null; then
+                log_warn "baseline-disks is in legacy disk-node format (e.g. 'disk2')."
+                log_warn "Disk-node names are TRANSIENT and shuffle across reboots/replugs."
+                log_warn "Re-run 'my-appleRAID baseline --disks' to switch to stable serials."
+            fi
             baseline_read_disks
             ;;
         *)
             echo "$REQUIRED_DISKS" | tr ',' '\n' | while read -r spec; do
-                normalize_disk_id "$spec"
+                spec=$(printf '%s' "$spec" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+                [ -n "$spec" ] || continue
+                case "$spec" in
+                    disk[0-9]*|/dev/disk[0-9]*|[0-9]*)
+                        normalize_disk_id "$spec"
+                        ;;
+                    *)
+                        # Treated as a serial number by check_disk_presence.
+                        echo "$spec"
+                        ;;
+                esac
             done
             ;;
     esac
@@ -1473,20 +1649,43 @@ check_disk_presence() {
     required=$(resolve_required_disks)
     [ -n "$required" ] || return 0
 
-    echo "$required" | awk 'NF>0 && !seen[$0]++' | while read -r d; do
-        [ -n "$d" ] || continue
-        if diskutil info "/dev/$d" >/dev/null 2>&1; then
-            # Present - clear any pending grace timer for it.
-            grace_clear "disk" "$d"
-        else
-            # Missing - check grace period.
-            if grace_check "disk" "$d" "$grace"; then
-                h=$(problem_hash "disk-missing" "$d" "not-present")
-                seen_add "$h"
-                handle_problem "disk-missing" "$d" "not-present" "$sev" \
-                    "Expected disk /dev/$d is NOT attached"
-            fi
-        fi
+    # Each required entry is either:
+    #   - A tagged baseline id (SN:..., USB:..., VOL:...) - resolved via
+    #     disk_for_baseline_id, which scans currently-attached disks.
+    #   - A bare disk-node name (disk2, disk3 - from explicit comma-list
+    #     REQUIRED_DISKS) - looked up via diskutil info /dev/<name>.
+    # Bare disk-node entries are TRANSIENT and may match a different
+    # physical disk after replug; they exist here for backward
+    # compatibility with explicit user lists.
+    echo "$required" | awk 'NF>0 && !seen[$0]++' | while read -r r; do
+        [ -n "$r" ] || continue
+        case "$r" in
+            SN:*|USB:*|VOL:*)
+                cur=$(disk_for_baseline_id "$r")
+                if [ -n "$cur" ]; then
+                    grace_clear "disk" "$r"
+                else
+                    if grace_check "disk" "$r" "$grace"; then
+                        h=$(problem_hash "disk-missing" "$r" "not-present")
+                        seen_add "$h"
+                        handle_problem "disk-missing" "$r" "not-present" "$sev" \
+                            "Expected disk with id '$r' is NOT attached"
+                    fi
+                fi
+                ;;
+            *)
+                if diskutil info "/dev/$r" >/dev/null 2>&1; then
+                    grace_clear "disk" "$r"
+                else
+                    if grace_check "disk" "$r" "$grace"; then
+                        h=$(problem_hash "disk-missing" "$r" "not-present")
+                        seen_add "$h"
+                        handle_problem "disk-missing" "$r" "not-present" "$sev" \
+                            "Expected disk /dev/$r is NOT attached"
+                    fi
+                fi
+                ;;
+        esac
     done
 }
 
@@ -1581,17 +1780,25 @@ check_auto_baseline_disks() {
 
     grace="${AUTO_BASELINE_GRACE_PERIOD:-86400}"
     current=$(baseline_read_disks 2>/dev/null)
-    present=$(list_all_physical_disks)
 
-    echo "$present" | awk 'NF>0 && !seen[$0]++' | while read -r d; do
+    # Compare by tagged baseline id, not by /dev/diskN node, so a disk
+    # whose number changed (replug, hub swap) does not get spuriously
+    # auto-baselined as "new".
+    list_all_physical_disks | while IFS= read -r d; do
         [ -n "$d" ] || continue
-        if echo "$current" | grep -qxF "$d"; then
-            auto_baseline_clear "disk" "$d"
+        id=$(disk_baseline_id "$d" 2>/dev/null)
+        if [ -z "$id" ]; then
+            # Untrackable disk (no SN/USB/VOL). Skip silently here;
+            # baseline_write_disks logs a warning when run interactively.
+            continue
+        fi
+        if echo "$current" | grep -qxF "$id"; then
+            auto_baseline_clear "disk" "$id"
         else
-            if auto_baseline_check "disk" "$d" "$grace"; then
-                log_info "Auto-baselining new disk: $d (present >= ${grace}s)"
+            if auto_baseline_check "disk" "$id" "$grace"; then
+                log_info "Auto-baselining new disk: $d ($id, present >= ${grace}s)"
                 baseline_write_disks
-                auto_baseline_clear "disk" "$d"
+                auto_baseline_clear "disk" "$id"
             fi
         fi
     done
@@ -2451,11 +2658,18 @@ EOF
 
     if [ "$do_disks" = "1" ]; then
         step "Updating disk baseline"
-        explain "Snapshotting identifiers of all currently-attached physical disks to:"
+        explain "Snapshotting stable identifiers of all currently-attached"
+        explain "physical disks to:"
         explain "  $(baseline_disks_file)"
         baseline_write_disks
-        info "Baselined disks:"
-        baseline_read_disks | sed 's/^/    /'
+        info "Baselined disks (id, current node, size, model):"
+        # Show the full data lines (skip comment block) so the user can
+        # see at a glance which physical disk each baseline entry points
+        # at, including the size/model hints.
+        f=$(baseline_disks_file)
+        if [ -f "$f" ]; then
+            awk 'NF>0 && !/^#/' "$f" | sed 's/^/    /'
+        fi
     fi
 
     ok "Baseline updated."
