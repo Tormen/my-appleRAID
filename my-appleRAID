@@ -5653,14 +5653,19 @@ gather_appleraid_rows() {
             }
             # Member-state code: simplify multi-word status to a single
             # keyword we map to a letter in ar_member_state_short.
+            # Treat any percentage in the status as Rebuilding too -
+            # diskutil sometimes prints a bare "<n>%" for the rebuilding
+            # member without spelling out the word "Rebuilding"
+            # alongside it (observed during a 0% rebuild on weg).
             mcode = "?"
-            if (mstatus ~ /[Rr]ebuild/) mcode = "Rebuilding"
+            if (mstatus ~ /[Rr]ebuild/ || mstatus ~ /[0-9]+%/) mcode = "Rebuilding"
             else if (mstatus == "Online")   mcode = "Online"
             else if (mstatus == "Missing")  mcode = "Missing"
             else if (mstatus == "Spare")    mcode = "Spare"
             else if (mstatus == "Offline")  mcode = "Offline"
             else if (mstatus == "Failed")   mcode = "Failed"
             else if (mstatus == "Stale")    mcode = "Stale"
+            else if (mstatus == "Standby")  mcode = "Standby"
             else                            mcode = mstatus
             members = (members ? members " " : "") $2 ":" mcode
             next
