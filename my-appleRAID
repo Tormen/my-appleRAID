@@ -5143,9 +5143,16 @@ ${C_BOLD}COMMANDS${C_RESET}
                                            ROT TRIM PROTOCOL
                                 -D         full 'diskutil list' output
   ${C_CYAN}info${C_RESET} [name|uuid] [-V]       Synonym for 'status'.
-  ${C_CYAN}create${C_RESET} <name> <N1> <N2>     Create a new mirror from two disk NUMBERS
+  ${C_CYAN}create${C_RESET} <name> <N1> <N2> [--wipe|--no-wipe]
+                              Create a new APFS mirror from two disk NUMBERS
                               (e.g. '${SCRIPT_NAME} create BackupGold 2 3').
-                              APFS format. Wipes both disks first.
+                              Pre-wipes a disk (first + last 100 MB) ONLY when
+                              SoftRAID metadata is detected on it - SoftRAID's
+                              on-disk signature is sticky and 'diskutil appleRAID
+                              create' will not clear it. For other disks, no
+                              pre-wipe is done; diskutil repartitions them as
+                              part of normal create. --wipe forces the explicit
+                              wipe on both disks; --no-wipe skips it on both.
   ${C_CYAN}blink${C_RESET} [<disk>]                Pulse a disk's activity LED so you can
                               identify which physical drive (or enclosure
                               slot) maps to a /dev/diskN before yanking it.
@@ -6739,7 +6746,20 @@ cmd_verify_wipe() {
 # Subcommand: create
 # ----------------------------------------------------------------------
 cmd_create() {
-    [ $# -ge 3 ] || die "Usage: $SCRIPT_NAME create <name> <disk-num-1> <disk-num-2>"
+    # Optional flags: --wipe / --no-wipe override the auto-detection.
+    force_wipe=""
+    args=""
+    for a in "$@"; do
+        case "$a" in
+            --wipe)    force_wipe=1 ;;
+            --no-wipe) force_wipe=0 ;;
+            *)         args="$args $a" ;;
+        esac
+    done
+    # shellcheck disable=SC2086
+    set -- $args
+
+    [ $# -ge 3 ] || die "Usage: $SCRIPT_NAME create <name> <disk-num-1> <disk-num-2> [--wipe|--no-wipe]"
     name="$1"
     dev1=$(resolve_disk "$2") || die "Invalid disk spec: $2"
     dev2=$(resolve_disk "$3") || die "Invalid disk spec: $3"
@@ -6765,10 +6785,50 @@ cmd_create() {
         warn "Disks have different sizes ($s1 vs $s2 bytes). Mirror will use the smaller capacity."
     fi
 
+    # Decide whether to wipe each disk. Default policy:
+    #   - Wipe ONLY if the disk currently carries SoftRAID metadata.
+    #     SoftRAID's on-disk format is sticky enough that 'diskutil
+    #     appleRAID create' can fail (or worse: succeed with a confused
+    #     layout) when SoftRAID's signature is still present.
+    #   - For everything else (including Apple_RAID_Offline disks from
+    #     a prior AppleRAID set), trust 'diskutil appleRAID create' to
+    #     repartition cleanly. It does this anyway as part of its
+    #     normal flow; a pre-wipe is wear without benefit.
+    #   --wipe / --no-wipe override the auto-decision.
+    softraid_disks=$(list_softraid_disks 2>/dev/null)
+    short1="${dev1#/dev/}"
+    short2="${dev2#/dev/}"
+    is_sr1=0; is_sr2=0
+    echo "$softraid_disks" | grep -qxF "$short1" && is_sr1=1
+    echo "$softraid_disks" | grep -qxF "$short2" && is_sr2=1
+    case "$force_wipe" in
+        1)  wipe1=1; wipe2=1 ;;
+        0)  wipe1=0; wipe2=0 ;;
+        *)  wipe1=$is_sr1; wipe2=$is_sr2 ;;
+    esac
+
     explain "This will:"
-    explain "  1. WIPE both disks (first and last 100 MB) to remove stale metadata."
-    explain "  2. Run 'diskutil appleRAID create mirror $name APFS $dev1 $dev2'."
-    explain "  3. Show the resulting configuration."
+    if [ "$wipe1" = "1" ] || [ "$wipe2" = "1" ]; then
+        explain "  1. WIPE the disk(s) carrying SoftRAID metadata (first + last 100 MB)"
+        explain "     to remove the sticky SoftRAID signature that 'diskutil appleRAID"
+        explain "     create' will not clear on its own:"
+        [ "$wipe1" = "1" ] && explain "       - $dev1 (SoftRAID detected)"
+        [ "$wipe2" = "1" ] && explain "       - $dev2 (SoftRAID detected)"
+        if [ "$wipe1" = "0" ] || [ "$wipe2" = "0" ]; then
+            explain "     The other disk(s) skip the pre-wipe (diskutil will repartition"
+            explain "     them cleanly during create):"
+            [ "$wipe1" = "0" ] && explain "       - $dev1 (no SoftRAID detected)"
+            [ "$wipe2" = "0" ] && explain "       - $dev2 (no SoftRAID detected)"
+        fi
+        explain "  2. Run 'diskutil appleRAID create mirror $name APFS $dev1 $dev2'."
+        explain "  3. Show the resulting configuration."
+    else
+        explain "  1. Run 'diskutil appleRAID create mirror $name APFS $dev1 $dev2'."
+        explain "     (Pre-wipe skipped: no SoftRAID metadata detected on either disk;"
+        explain "      diskutil will repartition the disks itself. Use --wipe to force"
+        explain "      the explicit pre-wipe step.)"
+        explain "  2. Show the resulting configuration."
+    fi
     explain "The new mirror will appear as a virtual /dev/diskN device with an APFS volume named '$name'."
     echo
 
@@ -6778,12 +6838,18 @@ cmd_create() {
         confirm "PROCEED? This erases BOTH disks." || die "Aborted."
     fi
 
-    step "Wipe phase: $dev1"
-    # Call wipe but auto-confirm by echoing yes into it -- cleaner to call internals directly.
-    do_auto_wipe "$dev1"
-
-    step "Wipe phase: $dev2"
-    do_auto_wipe "$dev2"
+    if [ "$wipe1" = "1" ]; then
+        step "Wipe phase: $dev1"
+        do_auto_wipe "$dev1"
+    else
+        step "Skipping pre-wipe: $dev1 (no SoftRAID metadata)"
+    fi
+    if [ "$wipe2" = "1" ]; then
+        step "Wipe phase: $dev2"
+        do_auto_wipe "$dev2"
+    else
+        step "Skipping pre-wipe: $dev2 (no SoftRAID metadata)"
+    fi
 
     step "Creating mirror"
     explain "diskutil will:"
