@@ -4510,11 +4510,15 @@ ${C_BOLD}COMMANDS${C_RESET}
                               Generates read-only I/O - same trick SoftRAID's
                               "Identify" button uses. Without an argument,
                               shows an interactive picker. Ctrl-C to stop.
-  ${C_CYAN}eject${C_RESET} [<disk>]                Spin down + power off a physical disk so
-                              it can be safely disconnected. Natural
-                              follow-up to 'blink'. Without an argument,
-                              shows an interactive picker. Warns + confirms
-                              if the disk is an active RAID member.
+  ${C_CYAN}eject${C_RESET} [<disk>]                Unmount every volume on the disk, spin
+                              it down + power it off so it can be safely
+                              disconnected. Natural follow-up to 'blink'.
+                              Without an argument, shows an interactive
+                              picker. If the disk is an active RAID member,
+                              the kernel claim is released first via
+                              'appleRAID remove' (set goes Degraded);
+                              one confirmation prompt covers the whole
+                              unmount + remove + eject pipeline.
   ${C_CYAN}smart${C_RESET} [<disk>]                Detailed SMART drill-down for one disk:
                               overall health, pre-failure attributes (with
                               non-zero "killer" highlight), self-test log,
@@ -7175,7 +7179,7 @@ _my-appleRAID() {
         'status:Short status summary (Online / Degraded / ...)'
         'watch:Live-refreshing status'
         'blink:Pulse a disk activity LED to identify the physical drive'
-        'eject:Spin down + power off a physical disk so it can be safely disconnected'
+        'eject:Unmount + spin-down + power off a physical disk for safe disconnect'
         'smart:Detailed SMART drill-down for one disk (history + error log + self-tests)'
         'wipe:Zero first + last 100 MB of /dev/diskN'
         'verify-wipe:Check that first + last 100 MB are zeros'
