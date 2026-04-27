@@ -5638,7 +5638,7 @@ gather_appleraid_rows() {
         /^Device Node:[[:space:]]/  { sub(/^Device Node:[[:space:]]*/,""); devnode=$0; next }
         /^-+$/                      { dash_count++; if (have && dash_count==2) in_members=1; next }
         in_members && /^# +DevNode/ { next }
-        in_members && /^[0-9]+[[:space:]]+disk/ {
+        in_members && /^[0-9-]+[[:space:]]+disk/ {
             # Columns: # DevNode UUID Status Size
             # Status may be multi-word, e.g. "0% (rebuilding)" or "Online".
             # Reconstruct everything between $3 (UUID) and $NF (size-bytes)
@@ -6263,10 +6263,15 @@ EOF
 
     echo
     step "Members"
+    # Member rows have format "<idx>  <devnode>  <uuid>  <status>  <size>".
+    # idx is a numeric position (0, 1, ...) for regular members but a
+    # literal '-' for hot Spares - so the regex must accept BOTH forms,
+    # otherwise Spares are silently skipped from the Members table even
+    # when 'diskutil appleRAID list' clearly lists them.
     diskutil appleRAID list "$UUID" 2>/dev/null | awk '
         BEGIN { found=0 }
         /^#[[:space:]]+DevNode/ { found=1; next }
-        found && /^[0-9]+[[:space:]]+disk/ {
+        found && /^[0-9-]+[[:space:]]+disk/ {
             n = split($0, p, /[[:space:]]+/)
             delete q; nq=0
             for (i=1; i<=n; i++) if (p[i] != "") { nq++; q[nq]=p[i] }
