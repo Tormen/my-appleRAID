@@ -492,12 +492,23 @@ cfg_set_defaults() {
     TEMP_CRIT_C=58
     SMART_CHECK_ENABLED=yes                # yes/no: run smartctl -H / -A
     # AppleRAID AutoRebuild enforcement.
-    #   1   (default, recommended) enforce AR=1 on every set the script
-    #       touches via create / health / list.
-    #   0   force AR=0 on every set the script touches.
+    #   0   (default) enforce AR=0 on every set during create / health
+    #       / list. Returning members stay 'Failed' until you manually
+    #       run 'repair' - i.e. you get a HARD ALERT (the set stays
+    #       Degraded with a Failed member visibly until you act).
+    #   1   force AR=1 on every set the script touches. Returning
+    #       members auto-rebuild silently (full block-by-block rebuild,
+    #       hours per TB). The health daemon still emails on each
+    #       transition (Degraded onset / Rebuilding start / progress /
+    #       resolution), so you don't lose visibility - but the set
+    #       quietly self-heals if you don't act.
     #   ""  empty = no enforcement; the script reads/displays AR but
     #       never writes it. Manage manually via 'autorebuild on|off'.
-    DEFAULT_AUTO_REBUILD=1
+    DEFAULT_AUTO_REBUILD=0
+    # How often (seconds) the health daemon re-emails about an ongoing
+    # rebuild. Default 21600s = 6h = 4 emails per day. Other problem
+    # categories use the generic EMAIL_INTERVAL (default 4h).
+    REBUILD_EMAIL_INTERVAL=21600
     # Alarm
     ALARM_SOUND="/System/Library/Sounds/Basso.aiff"
     ALARM_VOLUME=0.8                       # 0.0 - 1.0
@@ -566,6 +577,7 @@ cfg_load() {
     # load time so the rest of the script can treat these as plain ints.
     ALARM_INTERVAL=$(parse_duration "$ALARM_INTERVAL" "ALARM_INTERVAL")
     EMAIL_INTERVAL=$(parse_duration "$EMAIL_INTERVAL" "EMAIL_INTERVAL")
+    REBUILD_EMAIL_INTERVAL=$(parse_duration "${REBUILD_EMAIL_INTERVAL:-21600}" "REBUILD_EMAIL_INTERVAL")
     SMART_POLL_INTERVAL=$(parse_duration "$SMART_POLL_INTERVAL" "SMART_POLL_INTERVAL")
     LAUNCHD_INTERVAL=$(parse_duration "$LAUNCHD_INTERVAL" "LAUNCHD_INTERVAL")
     MISSING_SET_GRACE_PERIOD=$(parse_duration "$MISSING_SET_GRACE_PERIOD" "MISSING_SET_GRACE_PERIOD")
@@ -1025,7 +1037,17 @@ $(diskutil appleRAID list 2>/dev/null)
             new_la="$now"
         fi
 
-        if [ "${since_email:-0}" -ge "${EMAIL_INTERVAL:-14400}" ]; then
+        # Rebuilds get their own re-email cadence (REBUILD_EMAIL_INTERVAL,
+        # default 6h) since they last many hours and EMAIL_INTERVAL's
+        # 4h default would generate too many recurring emails over a
+        # multi-day rebuild. Falls back to EMAIL_INTERVAL for everything
+        # else.
+        case "$kind/$detail" in
+            raid-member/rebuilding) email_interval="${REBUILD_EMAIL_INTERVAL:-21600}" ;;
+            *)                      email_interval="${EMAIL_INTERVAL:-14400}" ;;
+        esac
+
+        if [ "${since_email:-0}" -ge "$email_interval" ]; then
             alert_email "[appleRAID/$sev] (recurring) $summary" \
                 "Problem still present (first seen: $first)
 
@@ -1864,7 +1886,7 @@ cmd_show_config() {
         AUTO_BASELINE_FOR_SETS_ON_HEALTH AUTO_BASELINE_FOR_DISKS_ON_HEALTH \
         AUTO_BASELINE_GRACE_PERIOD \
         TEMP_WARN_C TEMP_CRIT_C SMART_CHECK_ENABLED \
-        DEFAULT_AUTO_REBUILD \
+        DEFAULT_AUTO_REBUILD REBUILD_EMAIL_INTERVAL \
         ALARM_SOUND ALARM_VOLUME ALARM_VOLUME_MODE ALARM_INTERVAL ALARM_ENABLED \
         EMAIL_TO EMAIL_FROM EMAIL_SENDER EMAIL_INTERVAL \
         SMART_POLL_INTERVAL SELFTEST_SHORT_SCHEDULE SELFTEST_LONG_SCHEDULE SELFTEST_HOUR \
@@ -2121,31 +2143,38 @@ SMART_CHECK_ENABLED=yes
 # --- AppleRAID AutoRebuild enforcement -------------------------------
 #
 # Apple's `diskutil appleRAID create` ships every new mirror with
-# `Rebuild: manual` (AutoRebuild=0). With manual rebuild, a member
-# that returns from a transient disconnect sits in `Failed` status
-# until you run `my-appleRAID repair` - which is a full block-by-block
-# rebuild anyway, so deferring it buys you nothing in disk life.
-# Empirical real-disk testing confirms AutoRebuild is the ONLY knob
-# that controls this behavior. SetTimeout has no observable effect
-# on clean physical disconnects.
+# `Rebuild: manual` (AutoRebuild=0). Empirical real-disk testing
+# confirms AutoRebuild is the ONLY knob that affects what happens
+# when a transiently-missing member returns; SetTimeout has no
+# observable effect on clean physical disconnects.
 #
 # DEFAULT_AUTO_REBUILD controls whether my-appleRAID enforces an
 # AutoRebuild value on every set during create / health / list:
 #
-#   1   (recommended) enforce AR=1 on every set the script touches.
-#       Sets created via `my-appleRAID create` are flipped from
-#       Apple's default of 0 right after creation. Health passes
-#       re-apply if a set has drifted. List calls do the same.
-#   0   force AR=0 on every set. Only useful in narrow cases where
-#       you want a hard, persistent alert (the set stays Degraded
-#       until you act) or where you want to control rebuild scheduling
-#       manually.
+#   0   (default) enforce AR=0 on every set. A returning member
+#       stays 'Failed' until you manually run 'my-appleRAID repair'.
+#       Pros: persistent visible alert (the Degraded state and the
+#       Failed member are loudly obvious until you act); explicit
+#       control over when the multi-hour rebuild runs.
+#   1   force AR=1. Returning members auto-rebuild without operator
+#       action. The health daemon still emails on every transition
+#       (Degraded onset, Rebuilding start, progress every 6h,
+#       resolution back to Online), so visibility is preserved -
+#       but the set self-heals if you don't act.
 #   ""  (empty) disable enforcement entirely. The script reads and
 #       displays AR but never writes it. Manage by hand per-set via
 #       `my-appleRAID autorebuild <set> on|off`.
 #
-# Default: 1.
-DEFAULT_AUTO_REBUILD=1
+# Default: 0.
+DEFAULT_AUTO_REBUILD=0
+
+# Re-email interval for an ongoing rebuild. Rebuilds last hours per
+# TB on AppleRAID (no incremental resync), so periodic progress
+# emails are useful. Default 21600 seconds = 6h = 4 emails/day.
+# Set to a smaller value if you want denser progress reports, or
+# to a value >= the typical rebuild duration to get only the
+# start + completion emails.
+REBUILD_EMAIL_INTERVAL=21600
 
 
 # --- Audible alarm ---------------------------------------------------
@@ -6715,13 +6744,22 @@ Usage: $SCRIPT_NAME autorebuild [<set>] [on|off]
 
 <set> can be a UUID or the set's name.
 
-Why AutoRebuild=on (recommended):
+Trade-off:
   Empirical real-disk testing shows AutoRebuild is the ONLY knob that
   controls what happens when a temporarily-missing member returns.
-  With on (automatic): the kernel auto-rebuilds the returning member
-  back to Online (full block-by-block rebuild, takes hours per TB).
-  With off (manual): the returning member stays in 'Failed' status
-  forever until you run '$SCRIPT_NAME repair'.
+    on  (automatic) - kernel auto-rebuilds (Failed -> Rebuilding ->
+                      Online). Full block-by-block rebuild; hours per
+                      TB. The set self-heals; the health daemon still
+                      emails on every transition + every 6h during
+                      the rebuild, so you don't lose visibility.
+    off (manual)    - returning member stays Failed; you must manually
+                      run '$SCRIPT_NAME repair' (which does the same
+                      full rebuild, just at your discretion). Persistent
+                      visible Degraded+Failed state until you act.
+
+The script's default is OFF (DEFAULT_AUTO_REBUILD=0) - hard-alert
+behavior. Flip to ON if you'd rather have silent self-healing while
+trusting the daemon's emails to surface incidents.
 
 Note: SetTimeout (also a per-set parameter) has NO observable runtime
 effect for clean physical disconnects on the enclosures we tested. It
@@ -6770,7 +6808,11 @@ AppleRAID has TWO per-set parameters: AutoRebuild and SetTimeout.
 
 The script's DEFAULT_AUTO_REBUILD config controls automatic enforcement
 of AutoRebuild on every set the script touches (create / health / list
-calls). Default value: 1 (auto-enable AR on every set).
+calls). Default value: 0 (force AR=manual; you get a hard, persistent
+alert when a member fails - the set stays Degraded with a Failed
+member visibly until you run 'repair'). Flip to 1 if you'd rather
+the kernel auto-rebuild silently; the health daemon will still
+email on every transition and every 6h during the rebuild.
 
 EOF
         # Table of every set with current AR.

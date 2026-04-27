@@ -14,15 +14,12 @@ the hard way through controlled testing on real external storage.
 
 ## tl;dr — what to actually configure
 
-| Knob | Recommended | Reason |
+| Knob | my-appleRAID default | Notes |
 |---|---|---|
-| `AutoRebuild` | **`1` (automatic)** for every set | The only effective recovery knob. With `0`, a returning member stays `Failed` until you manually run `repairMirror` — which is a full rebuild anyway. |
-| `SetTimeout` | Leave at Apple's default `30 s` | **No observable effect** on real physical disconnects of these enclosures. Changing it doesn't buy you anything. |
+| `AutoRebuild` | **`0` (manual)** for every set — hard-alert behavior. Set goes Degraded with a Failed member, visibly stays that way until you run `repair`. | Flip to `1` if you'd rather the kernel auto-rebuild silently; the health daemon still emails on every transition and every 6h during the rebuild. |
+| `SetTimeout` | Untouched (Apple's default `30 s`) | **No observable effect** on real physical disconnects of these enclosures. Changing it doesn't buy you anything. `my-appleRAID` only reads + displays this, never writes it. |
 
-`my-appleRAID`'s defaults follow this advice: it auto-enables
-`AutoRebuild=1` on every set it sees, and it does not modify
-`SetTimeout` (only displays it, for diagnostic visibility). The
-behavior is governed by a single config key:
+The behavior is governed by a single config key:
 
 ```sh
 # DEFAULT_AUTO_REBUILD
@@ -362,20 +359,33 @@ mental model.
 
 ## Health monitor (`my-appleRAID health`)
 
-The launchd-driven health monitor acts on user-visible state
-transitions:
+The launchd-driven health monitor emits an email **on every state
+transition**, so even with `AutoRebuild=1` (silent self-heal) you
+never lose visibility into incidents:
 
-- Set goes `Degraded` → alert (sound + email + log).
-- Member becomes `Failed` → alert (this is the "permanent" state
-  where manual recovery is needed).
-- Member becomes `Rebuilding` → info, not an alert (kernel is
-  healing).
+- Set Online → **Degraded** (member missing) — `crit` email + sound
+  on first detection, then `EMAIL_INTERVAL` (default 4 h) recurring.
+- Member → **Failed** (returning member after AR=0 timeout, or hard
+  failure) — `crit` email + sound; same recurring cadence as Degraded.
+- Member → **Rebuilding** — `warn` email on first detection, then
+  `REBUILD_EMAIL_INTERVAL` (default 6 h = 4×/day) recurring while
+  the rebuild is in progress.
+- State clears (member back to Online, set back to Online) — one
+  resolution email (`[appleRAID/OK] Resolved: ...`).
 
-It does **not** rely on `SetTimeout` for any decision. It does
-honor `AutoRebuild`: with `AUTO_ENABLE_AUTOREBUILD=yes` (the
-default), the daemon ensures every monitored set has
-`AutoRebuild=1`, so transient disconnects auto-heal via rebuild
-without operator intervention.
+Why two separate intervals: a multi-day full rebuild on a TB-class
+mirror would generate ~30+ recurring emails at the regular 4 h
+cadence. `REBUILD_EMAIL_INTERVAL=21600` (6 h) keeps progress
+visibility without spamming. Set it to a value larger than the
+typical rebuild duration (e.g. `48h`) if you only want the
+start + completion emails.
+
+The monitor does **not** rely on `SetTimeout` for any decision. It
+honors `DEFAULT_AUTO_REBUILD`: by default `0` (manual rebuild) so
+you get the persistent visible Degraded+Failed state until you
+manually run `repair`. Flip to `1` if you'd rather the kernel
+auto-rebuild silently — the daemon's emails above will still
+surface every transition.
 
 ---
 
