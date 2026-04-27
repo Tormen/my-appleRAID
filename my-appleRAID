@@ -1310,13 +1310,92 @@ $(diskutil appleRAID list 2>/dev/null)
     fi
 }
 
-# Called when a previously-known problem is gone. Sends ONE "all clear"
-# email (if email configured) then removes the state entry.
+# Called when a previously-known problem hash was not seen this run.
+# That doesn't automatically mean the problem is resolved: the hash
+# might be a stale entry from an older code path that generated
+# different hashes for the same condition (e.g. before the SN:/PART:/
+# USB:/VOL: tagging landed). For "disk-missing" / "set-missing" alerts
+# we can verify cheaply: parse the subject out of the saved summary
+# text and re-check it. If the underlying entity is genuinely back
+# we emit RESOLVED + email + delete; if it is still missing we treat
+# the state-DB entry as orphan and prune silently with a STALE log
+# line, so the user does not get a false "all clear".
+#
+# The summary text shapes we recognize (must stay in sync with the
+# alert sites in check_disk_presence / check_set_presence):
+#
+#   Expected disk with id '<id>' is NOT attached
+#   Expected disk /dev/<bsd-or-leftover> is NOT attached
+#   Required RAID set '<name>' is NOT present in diskutil appleRAID list
+#
+# Anything we can't classify gets the previous behavior (announce
+# resolved + email).
 handle_resolved() {
     h="$1"
     line=$(state_get "$h")
     [ -n "$line" ] || return 0
     summary=$(echo "$line" | awk -F'|' '{print $6}')
+
+    still_missing=0
+
+    # disk-missing, tagged-id form.
+    case "$summary" in
+        "Expected disk with id '"*)
+            sub=${summary#Expected disk with id \'}
+            sub=${sub%%\'*}
+            if [ -n "$sub" ]; then
+                if ! cur=$(disk_for_baseline_id "$sub") || [ -z "$cur" ]; then
+                    still_missing=1
+                fi
+            fi
+            ;;
+    esac
+
+    # disk-missing, bare /dev/<x> form. Try both interpretations: a
+    # real bsd-name (transient) AND a legacy buggy form where a tagged
+    # id was concatenated after /dev/ by an older code path.
+    case "$summary" in
+        "Expected disk /dev/"*)
+            sub=${summary#Expected disk /dev/}
+            sub=${sub% is NOT attached}
+            case "$sub" in
+                SN:*|PART:*|USB:*|VOL:*)
+                    if ! cur=$(disk_for_baseline_id "$sub") || [ -z "$cur" ]; then
+                        still_missing=1
+                    fi
+                    ;;
+                *)
+                    diskutil info "/dev/$sub" >/dev/null 2>&1 \
+                        || still_missing=1
+                    ;;
+            esac
+            ;;
+    esac
+
+    # set-missing.
+    case "$summary" in
+        "Required RAID set '"*)
+            sub=${summary#Required RAID set \'}
+            sub=${sub%%\'*}
+            if [ -n "$sub" ]; then
+                present=$(diskutil appleRAID list 2>/dev/null \
+                    | awk -F': +' '/^Name:/ { n=$2; sub(/ +$/,"",n); print n }')
+                echo "$present" | grep -qxF "$sub" || still_missing=1
+            fi
+            ;;
+    esac
+
+    if [ "$still_missing" = "1" ]; then
+        # Orphan / legacy entry: do NOT emit a misleading "RESOLVED"
+        # alert email. Just prune the state row so it stops haunting
+        # us, but log loudly so the user sees what happened. The
+        # current-pass check_*_presence will have already created a
+        # fresh, correctly-keyed alert for the underlying condition.
+        log_warn "STALE STATE entry pruned (underlying problem still present, alert is being re-fired with the current hash format): $summary"
+        state_delete "$h"
+        return 0
+    fi
+
     log_info "RESOLVED: $summary"
     alert_email "[appleRAID/OK] Resolved: $summary" \
         "The following problem is no longer present:
