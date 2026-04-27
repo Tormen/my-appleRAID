@@ -2478,37 +2478,12 @@ cmd_install_daemon() {
     info "Stderr log:   $stderr_log"
     echo
 
-    cat <<EOF
-The following plist will be written:
-
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
-  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>Label</key>
-  <string>$label</string>
-  <key>ProgramArguments</key>
-  <array>
-    <string>$self</string>
-    <string>health</string>
-  </array>
-  <key>StartInterval</key>
-  <integer>$interval</integer>
-  <key>RunAtLoad</key>
-  <true/>
-  <key>StandardOutPath</key>
-  <string>$stdout_log</string>
-  <key>StandardErrorPath</key>
-  <string>$stderr_log</string>
-</dict>
-</plist>
-
-EOF
-    confirm "Install and load this LaunchDaemon (requires sudo)?" || die "Aborted."
-
-    # Write plist via sudo
-    run sudo sh -c "cat > '$plist'" <<EOF
+    # Render the desired plist into a tmpfile so we can compare it with
+    # whatever is already on disk and only show the user what changed.
+    new_tmp=$(mktemp -t my-appleRAID-plist-new.XXXXXX) \
+        || die "mktemp failed for new plist"
+    trap 'rm -f "$new_tmp"' EXIT INT TERM
+    cat > "$new_tmp" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
   "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -2533,10 +2508,59 @@ EOF
 </plist>
 EOF
 
-    run sudo chown root:wheel "$plist"
-    run sudo chmod 644 "$plist"
+    if [ -f "$plist" ]; then
+        if cmp -s "$new_tmp" "$plist" 2>/dev/null; then
+            ok "Existing plist is already up-to-date - no rewrite needed:"
+            info "  $plist"
+            echo
+            confirm "Reload it anyway (unload + load via launchctl)?" || {
+                rm -f "$new_tmp"
+                trap - EXIT INT TERM
+                info "Nothing changed. Done."
+                return 0
+            }
+            # Skip the write; just reload below.
+            do_write=0
+        else
+            warn "Existing plist found at: $plist"
+            info "Diff (existing -> new) is shown below; only the differences will be applied:"
+            echo
+            # diff exits 1 when files differ. Suppress the non-zero
+            # status so the script (under set -u) doesn't trip.
+            diff -u "$plist" "$new_tmp" || true
+            echo
+            confirm "Apply these changes and reload (requires sudo)?" || die "Aborted."
+            do_write=1
+        fi
+    else
+        info "No existing plist at $plist - this is a fresh install."
+        info "Full plist contents to be written:"
+        echo
+        sed 's/^/    /' "$new_tmp"
+        echo
+        confirm "Install and load this LaunchDaemon (requires sudo)?" || die "Aborted."
+        do_write=1
+    fi
 
-    # Load (bootstrap on modern macOS).
+    if [ "$do_write" = "1" ]; then
+        # Write plist via sudo by piping the rendered tmpfile into a
+        # root-owned 'cat'. Using cp would also work; this matches the
+        # heredoc style of the rest of the script.
+        run sudo sh -c "cat > '$plist'" < "$new_tmp"
+        run sudo chown root:wheel "$plist"
+        run sudo chmod 644 "$plist"
+    fi
+
+    rm -f "$new_tmp"
+    trap - EXIT INT TERM
+
+    # Reload: unload first if already registered, then bootstrap.
+    if launchctl list "$label" >/dev/null 2>&1 \
+        || sudo -n launchctl list "$label" >/dev/null 2>&1; then
+        run sudo launchctl bootout system "$plist" 2>/dev/null \
+            || run sudo launchctl unload "$plist" 2>/dev/null \
+            || true
+    fi
     run sudo launchctl bootstrap system "$plist" \
         || run sudo launchctl load -w "$plist" \
         || warn "Could not load the plist automatically. Reboot or run 'sudo launchctl bootstrap system $plist' manually."
