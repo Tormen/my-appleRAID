@@ -59,6 +59,21 @@ fi
 
 SCRIPT_NAME="$(basename "$0")"
 
+# Augment PATH for the launchd context.
+# launchd starts daemons with a minimal PATH (/usr/bin:/bin:/usr/sbin:/sbin)
+# that excludes both Homebrew prefixes - which means smartctl, msmtp,
+# and any other Homebrew-installed tool would be invisible to the
+# health daemon even when present on the box. Append both Homebrew
+# bin dirs (no-op when already in PATH or when the dir doesn't exist).
+for _hbprefix in /opt/homebrew/bin /usr/local/bin; do
+    case ":${PATH:-}:" in
+        *":$_hbprefix:"*) ;;
+        *) [ -d "$_hbprefix" ] && PATH="${PATH:-}${PATH:+:}$_hbprefix" ;;
+    esac
+done
+export PATH
+unset _hbprefix
+
 # ----------------------------------------------------------------------
 # Global verbosity flags.
 # Set by parse_global_flags(), which is called both at the top of main()
