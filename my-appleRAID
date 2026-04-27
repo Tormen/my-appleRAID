@@ -967,15 +967,19 @@ baseline_write_sets() {
 # Pick the best stable identifier for a physical disk, tagged with its
 # source so we know how to match it back later. Tags:
 #
-#   SN:<serial>      ATA/SATA/NVMe IDENTIFY serial number (preferred).
-#                    Stable across reboots, replugs, hub swaps.
-#   USB:<serial>     Bridge serial reported by the USB enclosure when
-#                    the disk inside it doesn't pass IDENTIFY through.
-#                    Stable across replug, but identifies the bridge,
-#                    not the disk inside - swap a disk inside the
-#                    enclosure and the same id matches the new disk.
-#   VOL:<uuid>       Volume UUID of the first mounted partition (last
-#                    resort). Stable per filesystem; lost on reformat.
+#   SN:<serial>             ATA/SATA/NVMe IDENTIFY serial number (preferred).
+#                           Stable across reboots, replugs, hub swaps.
+#   USB:<serial>:<bytes>    Bridge serial PLUS size-in-bytes, used when the
+#                           disk inside doesn't pass IDENTIFY through. The
+#                           size is appended because multi-bay USB
+#                           enclosures share one bridge serial across
+#                           every bay - without size, two different disks
+#                           in the same enclosure would collide on the
+#                           same USB id. Identifies "the disk of this
+#                           size behind this bridge"; ambiguous if two
+#                           identically-sized disks share an enclosure.
+#   VOL:<uuid>              Volume UUID of the first mounted partition (last
+#                           resort). Stable per filesystem; lost on reformat.
 #
 # Empty output means the disk has no stable identifier and cannot be
 # baselined; the caller should skip it with a warning.
@@ -990,10 +994,12 @@ disk_baseline_id() {
         return 0
     fi
 
-    # 2. USB bridge serial. system_profiler SPUSBDataType groups disks
-    #    under their bridge, with the bridge's "Serial Number" appearing
-    #    above the BSD Name(s) it owns. Take the most recent non-trivial
-    #    "Serial Number:" line that precedes "BSD Name: <bsd>".
+    # 2. USB bridge serial + size-in-bytes. system_profiler SPUSBDataType
+    #    groups disks under their bridge, with the bridge's "Serial
+    #    Number" appearing above the BSD Name(s) it owns. Take the most
+    #    recent non-trivial "Serial Number:" line that precedes "BSD
+    #    Name: <bsd>". Size is appended so two different disks in the
+    #    same multi-bay enclosure don't collide on the same USB id.
     s=$(system_profiler SPUSBDataType 2>/dev/null | awk -v target="$bsd" '
         /Serial Number:/ {
             line = $0
@@ -1014,7 +1020,14 @@ disk_baseline_id() {
         }
     ')
     if [ -n "$s" ]; then
-        echo "USB:$s"
+        bytes=$(disk_size_bytes "/dev/$bsd" 2>/dev/null)
+        if [ -n "$bytes" ]; then
+            echo "USB:$s:$bytes"
+        else
+            # Size unreadable - emit unsuffixed (will collide with
+            # any same-bridge sibling but better than nothing).
+            echo "USB:$s"
+        fi
         return 0
     fi
 
@@ -1053,13 +1066,15 @@ baseline_write_disks() {
         echo "# Format: <tagged-id>  # <bsd-at-baseline>  <size>  <model>"
         echo "# The tagged-id is the stable identifier we match against."
         echo "# Tags:"
-        echo "#   SN:  ATA/NVMe IDENTIFY serial - preferred, fully stable"
-        echo "#   USB: USB bridge serial when SN is unavailable - stable"
-        echo "#        across replug, but identifies the bridge not the"
-        echo "#        disk inside, so swapping a disk inside the same"
-        echo "#        enclosure will not be noticed"
-        echo "#   VOL: Volume UUID of first partition - last resort,"
-        echo "#        stable per-filesystem, lost on reformat"
+        echo "#   SN:                ATA/NVMe IDENTIFY serial. Preferred, fully stable."
+        echo "#   USB:<srl>:<bytes>  USB bridge serial + disk size in bytes, used when"
+        echo "#                      SN is unavailable. Size is appended so two disks"
+        echo "#                      in the same multi-bay enclosure don't collide on"
+        echo "#                      the same bridge serial. Stable across replug;"
+        echo "#                      ambiguous only if two identically-sized disks"
+        echo "#                      share the enclosure."
+        echo "#   VOL:               Volume UUID of first partition. Last resort,"
+        echo "#                      stable per-filesystem, lost on reformat."
         echo "# The bsd (/dev/diskN node), size, and model in the comment"
         echo "# are human hints. The bsd may shuffle on replug; size and"
         echo "# model are intrinsic to the disk and stay stable."
