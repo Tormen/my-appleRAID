@@ -438,7 +438,18 @@ raid_count() {
 
 # Pick a RAID set interactively (or return the only one, or fail).
 # Sets global variable SELECTED_UUID.
+#
+# Optional first argument: 'prefer-degraded'. When passed, and there is
+# exactly ONE Degraded/Failed set among multiple, that set is offered
+# as the default - pressing Enter at the prompt accepts it. Used by
+# cmd_repair so the operator doesn't have to retype 'weg' when there's
+# only one obvious thing to repair.
 pick_raid_set() {
+    _prefer_degraded=0
+    case "${1:-}" in
+        prefer-degraded|prefer_degraded) _prefer_degraded=1 ;;
+    esac
+
     n=$(raid_count)
     if [ "$n" -eq 0 ]; then
         die "No AppleRAID sets found."
@@ -448,15 +459,49 @@ pick_raid_set() {
         info "Only one RAID set found; auto-selecting: $SELECTED_UUID"
         return 0
     fi
+
+    # If asked to prefer a Degraded/Failed set, find them now so we
+    # can offer a default at the prompt.
+    _suggested_uuid=""
+    _suggested_name=""
+    _suggested_state=""
+    if [ "$_prefer_degraded" = "1" ]; then
+        _broken=$(for _u in $(raid_list_uuids); do
+            _st=$(raid_status "$_u")
+            case "$_st" in
+                Degraded|Failed) printf '%s|%s\n' "$_u" "$_st" ;;
+            esac
+        done)
+        _broken_count=$(printf '%s\n' "$_broken" | awk 'NF>0' | wc -l | tr -d ' ')
+        if [ "$_broken_count" = "1" ]; then
+            _suggested_uuid=$(printf '%s\n' "$_broken" | awk -F'|' 'NF>0 {print $1; exit}')
+            _suggested_state=$(printf '%s\n' "$_broken" | awk -F'|' 'NF>0 {print $2; exit}')
+            _suggested_name=$(diskutil appleRAID list 2>/dev/null | awk -F': +' -v u="$_suggested_uuid" '
+                /^Name:/       { cur  = $2; sub(/ +$/, "", cur) }
+                /^Unique ID:/  { uid  = $2; sub(/ +$/, "", uid); if (uid == u) { print cur; exit } }
+            ')
+        fi
+    fi
+
     # Multiple: show the compact 'list' summary as the menu (one line per
     # set, instead of the verbose multi-page 'diskutil appleRAID list'
     # dump). Same view the user is used to from 'my-appleRAID list'.
     step "Multiple RAID sets found - please pick one"
     cmd_list
     echo
-    printf 'Enter RAID set name or UUID: '
+    if [ -n "$_suggested_uuid" ]; then
+        printf "Enter RAID set name or UUID [Enter for '%s' (the only %s set)]: " \
+            "${_suggested_name:-$_suggested_uuid}" "$_suggested_state"
+    else
+        printf 'Enter RAID set name or UUID: '
+    fi
     read -r choice
     if [ -z "$choice" ]; then
+        if [ -n "$_suggested_uuid" ]; then
+            SELECTED_UUID="$_suggested_uuid"
+            info "Using suggested: ${_suggested_name:-$_suggested_uuid} ($_suggested_state)"
+            return 0
+        fi
         die "No selection made."
     fi
     # Try as UUID first, then as name.
@@ -7126,7 +7171,7 @@ cmd_repair() {
         [ -z "$uuid" ] && die "No RAID set matches '$arg'."
         SELECTED_UUID="$uuid"
     else
-        pick_raid_set
+        pick_raid_set prefer-degraded
     fi
 
     step "Interactive repair for RAID set $SELECTED_UUID"
