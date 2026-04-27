@@ -2016,6 +2016,44 @@ cmd_create_config() {
 # ======================================================================
 
 
+# ======================================================================
+# !!! REVIEW / SET THESE FIRST !!!
+# ----------------------------------------------------------------------
+# Without the three EMAIL_* keys below, problems are detected and logged
+# but NO email is sent. The audible alarm still fires (if enabled), and
+# the LOG_FILE still records everything, but you will NOT be notified
+# remotely until EMAIL_TO has a real address AND EMAIL_SENDER points at
+# a configured sendmail-compatible binary.
+# ======================================================================
+
+# Recipient. EMPTY (default) DISABLES EMAIL ENTIRELY.
+# Set this to a real address before relying on the daemon for alerts.
+EMAIL_TO=""
+
+# From address. Must match what your SMTP relay allows (most relays
+# reject mail whose envelope sender is not a domain they accept).
+# Default below is a placeholder that will be rejected by every relay.
+EMAIL_FROM="my-appleRAID@localhost"
+
+# Path to (or bare name of) a sendmail-compatible sender. msmtp is
+# recommended:
+#   brew install msmtp
+# Configure ~/.msmtprc with a working SMTP account before email will
+# leave the host.
+#
+# A bare name (default below) is resolved via PATH; my-appleRAID's
+# top-of-script block extends PATH to include /opt/homebrew/bin and
+# /usr/local/bin so this works in the launchd daemon context too. Set
+# to an absolute path here if you have multiple sender binaries and
+# want to pin one explicitly.
+EMAIL_SENDER="msmtp"
+
+# Minimum time between emails for the SAME ongoing problem.
+# Accepts duration suffixes (see top of file): 60, 60s, 5m, 2h, 1d, 1w.
+# Default 4h gives 6 emails/day max per problem.
+EMAIL_INTERVAL=4h
+
+
 # --- RAID monitoring -------------------------------------------------
 
 # Which RAID sets to SMART-monitor and status-check.
@@ -2233,32 +2271,6 @@ ALARM_VOLUME_MODE=boost
 ALARM_INTERVAL=1m
 
 
-# --- Email alerts ----------------------------------------------------
-
-# Recipient. Leave empty to disable email entirely.
-EMAIL_TO=""
-
-# From address. Must match what your SMTP relay allows.
-EMAIL_FROM="my-appleRAID@localhost"
-
-# Path to (or bare name of) a sendmail-compatible sender. msmtp is
-# recommended:
-#   brew install msmtp
-# Configure ~/.msmtprc per the smartmontools setup we discussed earlier.
-#
-# A bare name (default below) is resolved via PATH; my-appleRAID's
-# top-of-script block extends PATH to include /opt/homebrew/bin and
-# /usr/local/bin so this works in the launchd daemon context too. Set
-# to an absolute path here if you have multiple sender binaries and
-# want to pin one explicitly.
-EMAIL_SENDER="msmtp"
-
-# Minimum time between emails for the SAME ongoing problem.
-# Accepts duration suffixes (see top of file): 60, 60s, 5m, 2h, 1d, 1w.
-# Default 4h gives 6 emails/day max per problem.
-EMAIL_INTERVAL=4h
-
-
 # --- SMART polling schedule -----------------------------------------
 
 # How often to run SMART health + attribute checks.
@@ -2341,7 +2353,19 @@ EOF
 
     chmod 644 "$path" 2>/dev/null || true
     ok "Wrote default config to: $path"
-    info "Edit it, then verify with: $SCRIPT_NAME show-config"
+    echo
+    warn "Email alerts are DISABLED until you set the variables below."
+    warn "Without these, the launchd watchdog will detect problems but you"
+    warn "will receive NO email notifications."
+    echo
+    info "Edit $path and set at minimum:"
+    info "  EMAIL_TO       = \"you@example.com\"           # recipient (currently empty -> email off)"
+    info "  EMAIL_FROM     = \"my-appleRAID@yourhost\"     # must match what your SMTP relay allows"
+    info "  EMAIL_SENDER   = \"msmtp\"                     # default; needs 'brew install msmtp'"
+    info "                                                # + ~/.msmtprc with a working SMTP account"
+    echo
+    info "Then verify with: $SCRIPT_NAME show-config"
+    info "And test with:    $SCRIPT_NAME test-alerts"
 }
 
 # ----------------------------------------------------------------------
@@ -7236,7 +7260,7 @@ _my-appleRAID() {
         'status:Short status summary (Online / Degraded / ...)'
         'watch:Live-refreshing status'
         'blink:Pulse a disk activity LED to identify the physical drive'
-        'eject:Unmount + (if RAID member: release from set) + spin-down + power off'
+        'eject:Unmount + spin-down + power off (refuses RAID members; --release to also break from set)'
         'smart:Detailed SMART drill-down for one disk (history + error log + self-tests)'
         'wipe:Zero first + last 100 MB of /dev/diskN'
         'verify-wipe:Check that first + last 100 MB are zeros'
