@@ -1,21 +1,28 @@
 #!/bin/dash
 #
-# appleRAID - Management script for macOS AppleRAID mirror sets
+# my-appleRAID - The Swiss Army knife for disks and RAIDs on macOS.
 #
 # POSIX/dash-compatible. Verbose by default: every destructive or
 # state-changing command is printed before being executed.
 #
 # Feature overview:
-#   - Interactive management of AppleRAID mirror sets (list, create, repair,
-#     test, destroy, wipe-and-add).
-#   - Unattended health monitoring (`appleRAID health`) that integrates with
-#     launchd. Polls RAID set state every minute (cheap) and runs SMART
-#     checks once per day (cheap on power / spin-up wear).
+#   - Disks: list, identify (LED blink), safe-eject, SMART drill-down,
+#     wipe / verify-wipe, hot-add replacement.
+#   - AppleRAID: list, status, create (mirror/stripe/concat), guided
+#     repair of degraded sets, rename, destroy, AutoRebuild policy
+#     management, non-destructive test of a set.
+#   - SoftRAID interop: migrate a SoftRAID mirror to AppleRAID,
+#     release a SoftRAID volume, pre/post-flight uninstall checks.
+#   - Unattended health monitoring (`my-appleRAID health`) integrated
+#     with launchd. Polls RAID set state every minute (cheap) and runs
+#     SMART checks once per day (cheap on power / spin-up wear).
 #   - On problems: plays an audible alarm (configurable volume strategy),
 #     logs, and sends rate-limited email via msmtp.
 #   - State-change aware: only re-alarms/re-emails on configurable intervals
 #     so a failed drive doesn't produce 1440 emails per day.
 #   - Self-tests: schedulable SMART short/long self-tests via smartctl -t.
+#   - Surfaces what macOS hides: AppleRAID-AutoRebuild and
+#     AppleRAID-SetTimeout (diskutil does not expose these at all).
 #
 # Config search path (first readable file wins):
 #   $MY_APPLERAID_CONFIG        (env var, for testing)
@@ -4558,7 +4565,8 @@ If you received this, the email alert chain is working."
 # ----------------------------------------------------------------------
 cmd_help() {
     cat <<EOF
-${C_BOLD}${SCRIPT_NAME}${C_RESET} - AppleRAID management helper for macOS
+${C_BOLD}${SCRIPT_NAME}${C_RESET} - The Swiss Army knife for disks and RAIDs on macOS
+                 (AppleRAID + SoftRAID interop, SMART, launchd watchdog)
 
 ${C_BOLD}USAGE${C_RESET}
   ${SCRIPT_NAME} [-V | -D] <command> [arguments]

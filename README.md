@@ -1,8 +1,35 @@
 # my-appleRAID
 
-A management helper for **macOS AppleRAID** (mirror, stripe, concat) that
-wraps the low-level `diskutil appleRAID` interface in safer, friendlier
-verbs and adds a launchd-driven health monitor.
+**The Swiss Army knife for disks and RAIDs on macOS.**
+
+One single-file POSIX/dash script that pulls together everything you
+actually want when you live with external drives and software RAIDs
+on a Mac:
+
+- **Disks** — list, identify (LED blink), spin-down + safe-eject,
+  per-disk SMART drill-down (history + temperature + error log +
+  self-tests), wipe / verify-wipe, hot-add a replacement.
+- **AppleRAID** — list, status, create (mirror / stripe / concat),
+  guided repair of a degraded set with size-based replacement guess,
+  rename, destroy, AutoRebuild policy management, non-destructive
+  test of a set.
+- **SoftRAID interop** — migrate a SoftRAID mirror to AppleRAID,
+  release a SoftRAID volume, pre/post-flight checks for uninstalling
+  SoftRAID.
+- **Always-on watchdog** — a launchd-driven `health` monitor that
+  catches "set went Degraded", "member returned but won't auto-rebuild",
+  "drive disappeared", "SMART attribute crossed threshold",
+  "temperature crit", and emails you (rate-limited) + plays an
+  audible alarm.
+- **One-shot config** — `my-appleRAID create-config <path>` writes a
+  fully-commented config; the only fields you really must edit are
+  the email-recipient ones, highlighted at the top.
+
+It wraps the low-level `diskutil appleRAID`, `diskutil`, `smartctl`,
+`ioreg`, and `launchctl` interfaces in safer, friendlier verbs — and
+makes the things macOS hides (e.g. `AppleRAID-AutoRebuild` and
+`AppleRAID-SetTimeout`, which `diskutil` does not surface at all)
+actually visible and controllable.
 
 The script itself documents every flag via `my-appleRAID --help` and
 per-command `my-appleRAID <cmd> --help`. **This README is the empirical
