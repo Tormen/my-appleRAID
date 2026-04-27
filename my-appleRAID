@@ -6266,6 +6266,104 @@ EOF
     printf '  %-15s %s\n' "Volume FS:"    "$fs"
     printf '  %-15s /dev/%s\n' "RAID device:" "${dev:-?}"
 
+    # If a rebuild is in flight, show progress + ETA. Two pieces of
+    # information come out of 'diskutil appleRAID list <set>':
+    #   - the highest member percentage (the rebuild is per-member but
+    #     we just track the leading edge for the ETA)
+    #   - the set's total size in bytes (set-level Size: line, the
+    #     parenthesized byte count)
+    # ETA is computed as bytes_remaining / sustained-rate-band, where
+    # the band is the empirical 200-300 MB/s seen on healthy SATA
+    # mirrors. Plus we record the (timestamp, percentage) pair to
+    # $STATE_DIR/rebuild-<uuid> across runs so subsequent invocations
+    # can also report a measured rate that's specific to THIS rebuild
+    # on THIS hardware.
+    rebuild_info=$(diskutil appleRAID list "$UUID" 2>/dev/null | awk '
+        /^Size:[[:space:]]/ {
+            n = split($0, p, /[()]/)
+            if (n >= 2) {
+                gsub(/[^0-9]/, "", p[2])
+                size_bytes = p[2]
+            }
+        }
+        /^[0-9-]+[[:space:]]+disk/ {
+            for (i = 4; i < NF; i++) {
+                if (match($i, /^[0-9]+(\.[0-9]+)?%$/)) {
+                    pct = $i + 0
+                    if (pct > best_pct) best_pct = pct
+                }
+            }
+        }
+        END {
+            if (best_pct > 0 || best_pct == 0) {
+                printf "%s|%s\n", size_bytes+0, best_pct+0
+            }
+        }
+    ')
+    rebuild_size_b=$(echo "$rebuild_info" | awk -F'|' '{print $1}')
+    rebuild_pct_now=$(echo "$rebuild_info" | awk -F'|' '{print $2}')
+
+    if [ -n "$rebuild_pct_now" ] && [ "$rebuild_pct_now" != "0" ] 2>/dev/null \
+       || ( [ "$state" = "Degraded" ] || [ "$state" = "Rebuilding" ] ) \
+          && diskutil appleRAID list "$UUID" 2>/dev/null \
+             | awk '/^[0-9-]+[[:space:]]+disk/' \
+             | grep -qiE '[Rr]ebuild|[0-9]+%'; then
+
+        if [ -n "$rebuild_size_b" ] && [ "$rebuild_size_b" -gt 0 ] 2>/dev/null; then
+            # Bytes already done / remaining
+            done_b=$(awk -v s="$rebuild_size_b" -v p="${rebuild_pct_now:-0}" \
+                'BEGIN { printf "%.0f", s * p / 100 }')
+            rem_b=$(awk -v s="$rebuild_size_b" -v d="$done_b" \
+                'BEGIN { printf "%.0f", s - d }')
+
+            # ETA from sustained rate band 200-300 MB/s.
+            eta_fast_h=$(awk -v b="$rem_b" \
+                'BEGIN { printf "%.1f", b / (300 * 1024 * 1024 * 3600) }')
+            eta_slow_h=$(awk -v b="$rem_b" \
+                'BEGIN { printf "%.1f", b / (200 * 1024 * 1024 * 3600) }')
+
+            # Measured rate: compare with last (timestamp, pct) sample.
+            # Stored in $STATE_DIR if state_init has set it; otherwise
+            # /tmp fallback so the feature works without a state dir.
+            sample_dir="${STATE_DIR:-/tmp}"
+            sample_file="${sample_dir}/rebuild-${UUID}"
+            now_ts=$(date +%s)
+            measured_line=""
+            if [ -r "$sample_file" ]; then
+                prev=$(cat "$sample_file" 2>/dev/null)
+                prev_ts=$(echo "$prev" | awk -F'|' '{print $1}')
+                prev_pct=$(echo "$prev" | awk -F'|' '{print $2}')
+                if [ -n "$prev_ts" ] && [ -n "$prev_pct" ]; then
+                    dt=$(( now_ts - prev_ts ))
+                    dpct=$(awk -v a="$rebuild_pct_now" -v b="$prev_pct" \
+                        'BEGIN { printf "%.4f", a - b }')
+                    if [ "$dt" -ge 30 ] \
+                       && awk -v d="$dpct" 'BEGIN { exit !(d > 0) }'; then
+                        # bytes per second observed:
+                        bytes_per_s=$(awk -v s="$rebuild_size_b" -v d="$dpct" -v t="$dt" \
+                            'BEGIN { printf "%.0f", s * (d / 100) / t }')
+                        if [ "$bytes_per_s" -gt 0 ] 2>/dev/null; then
+                            mbs=$(awk -v b="$bytes_per_s" \
+                                'BEGIN { printf "%.0f", b / (1024 * 1024) }')
+                            eta_meas_h=$(awk -v b="$rem_b" -v r="$bytes_per_s" \
+                                'BEGIN { printf "%.1f", b / (r * 3600) }')
+                            measured_line="  (measured: ${mbs} MB/s over ${dt}s -> ETA ~${eta_meas_h}h)"
+                        fi
+                    fi
+                fi
+            fi
+            # Always update the sample file (atomic-ish via mv).
+            tmp_file="${sample_file}.tmp"
+            printf '%s|%s\n' "$now_ts" "$rebuild_pct_now" > "$tmp_file" 2>/dev/null \
+                && mv "$tmp_file" "$sample_file" 2>/dev/null
+
+            printf '\n'
+            printf '  %-15s %s%% complete\n' "Rebuild:"   "${rebuild_pct_now}"
+            printf '  %-15s ~%sh to ~%sh remaining (at 200-300 MB/s)%s\n' \
+                "Rebuild ETA:" "$eta_fast_h" "$eta_slow_h" "$measured_line"
+        fi
+    fi
+
     echo
     step "Members"
     # Member rows have format "<idx>  <devnode>  <uuid>  <status>  <size>".
