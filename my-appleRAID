@@ -946,8 +946,8 @@ baseline_disks_is_legacy() {
     first=$(awk 'NF>0 && !/^#/ { print $1; exit }' "$f")
     [ -n "$first" ] || return 1
     case "$first" in
-        SN:*|USB:*|VOL:*) return 1 ;;
-        *)                return 0 ;;
+        SN:*|PART:*|USB:*|VOL:*) return 1 ;;
+        *)                       return 0 ;;
     esac
 }
 
@@ -965,21 +965,29 @@ baseline_write_sets() {
 }
 
 # Pick the best stable identifier for a physical disk, tagged with its
-# source so we know how to match it back later. Tags:
+# source so we know how to match it back later. Tags, in priority order:
 #
-#   SN:<serial>             ATA/SATA/NVMe IDENTIFY serial number (preferred).
-#                           Stable across reboots, replugs, hub swaps.
-#   USB:<serial>:<bytes>    Bridge serial PLUS size-in-bytes, used when the
-#                           disk inside doesn't pass IDENTIFY through. The
-#                           size is appended because multi-bay USB
-#                           enclosures share one bridge serial across
-#                           every bay - without size, two different disks
-#                           in the same enclosure would collide on the
-#                           same USB id. Identifies "the disk of this
-#                           size behind this bridge"; ambiguous if two
-#                           identically-sized disks share an enclosure.
-#   VOL:<uuid>              Volume UUID of the first mounted partition (last
-#                           resort). Stable per filesystem; lost on reformat.
+#   SN:<serial>             ATA/SATA/NVMe IDENTIFY serial number.
+#                           Strongest: stable across reboots, replugs,
+#                           hub swaps, AND reformats - the serial is
+#                           baked into the drive firmware.
+#   PART:<gpt-uuid>         GPT partition entry GUID of the disk's main
+#                           data partition (first non-EFI, non-Apple_Boot
+#                           partition). Baked into the partition table
+#                           on disk, so it travels with the disk across
+#                           reboots, replugs, and hub swaps. Lost only
+#                           on a full reformat (partition table rewrite).
+#                           Used when SN is unavailable - typically
+#                           USB-SAT bridges that don't pass IDENTIFY
+#                           through.
+#   USB:<srl>:<bytes>       Bridge serial PLUS size-in-bytes. Used only
+#                           if the disk has no GPT data partition (raw,
+#                           wiped, or non-GPT scheme). Stable across
+#                           replug; ambiguous if two identically-sized
+#                           disks share the same multi-bay enclosure.
+#   VOL:<uuid>              Volume UUID of the first mounted partition.
+#                           Last resort - lost on volume recreation
+#                           even when the GPT survives.
 #
 # Empty output means the disk has no stable identifier and cannot be
 # baselined; the caller should skip it with a warning.
@@ -994,7 +1002,35 @@ disk_baseline_id() {
         return 0
     fi
 
-    # 2. USB bridge serial + size-in-bytes. system_profiler SPUSBDataType
+    # 2. GPT partition entry GUID of the disk's main data partition.
+    #    The GUID is baked into the partition table at format time and
+    #    travels with the disk regardless of which port it lands on.
+    #    We pick the first partition that isn't a macOS-template EFI
+    #    or Apple_Boot, and isn't the whole-disk "scheme" pseudo-entry.
+    main_part=$(diskutil list "/dev/$bsd" 2>/dev/null | awk '
+        NR > 2 && /^[[:space:]]+[0-9]+:/ {
+            ident = $NF
+            ptype = $2
+            if (ptype == "EFI") next
+            if (ptype ~ /^Apple_Boot/) next
+            if (ptype ~ /partition_scheme$/) next
+            if (ident ~ /^disk[0-9]+s[0-9]+$/) {
+                print ident
+                exit
+            }
+        }
+    ')
+    if [ -n "$main_part" ]; then
+        s=$(diskutil info "/dev/$main_part" 2>/dev/null \
+            | awk -F': +' '/Disk \/ Partition UUID:/ {print $2; exit}' \
+            | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+        if [ -n "$s" ]; then
+            echo "PART:$s"
+            return 0
+        fi
+    fi
+
+    # 3. USB bridge serial + size-in-bytes. system_profiler SPUSBDataType
     #    groups disks under their bridge, with the bridge's "Serial
     #    Number" appearing above the BSD Name(s) it owns. Take the most
     #    recent non-trivial "Serial Number:" line that precedes "BSD
@@ -1067,14 +1103,17 @@ baseline_write_disks() {
         echo "# The tagged-id is the stable identifier we match against."
         echo "# Tags:"
         echo "#   SN:                ATA/NVMe IDENTIFY serial. Preferred, fully stable."
-        echo "#   USB:<srl>:<bytes>  USB bridge serial + disk size in bytes, used when"
-        echo "#                      SN is unavailable. Size is appended so two disks"
-        echo "#                      in the same multi-bay enclosure don't collide on"
-        echo "#                      the same bridge serial. Stable across replug;"
-        echo "#                      ambiguous only if two identically-sized disks"
-        echo "#                      share the enclosure."
+        echo "#   PART:              GPT partition entry GUID of the disk's main data"
+        echo "#                      partition (first non-EFI, non-Apple_Boot). Baked"
+        echo "#                      into the partition table on disk; survives reboot,"
+        echo "#                      replug, hub swap. Lost only on full reformat."
+        echo "#   USB:<srl>:<bytes>  USB bridge serial + disk size in bytes. Used only"
+        echo "#                      when neither SN nor PART is available (raw or"
+        echo "#                      non-GPT disks behind a USB bridge). Size is"
+        echo "#                      appended so two disks in a multi-bay enclosure"
+        echo "#                      don't collide on the same bridge serial."
         echo "#   VOL:               Volume UUID of first partition. Last resort,"
-        echo "#                      stable per-filesystem, lost on reformat."
+        echo "#                      stable per-filesystem, lost on volume recreation."
         echo "# The bsd (/dev/diskN node), size, and model in the comment"
         echo "# are human hints. The bsd may shuffle on replug; size and"
         echo "# model are intrinsic to the disk and stay stable."
