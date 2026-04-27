@@ -367,6 +367,24 @@ the leftover metadata, and re-adds the disk as a fresh member
 which the kernel definitely *will* rebuild. It's also the
 documented Apple flow (man page + Apple-Community thread #7650392).
 
+**Important: `repairMirror` adds a Spare, not a Member — `AutoRebuild=1`
+is required to promote it.** Apple's man page is precise about this
+("Adds a hot spare device to a (pre-existing) mirror set"), but the
+implication is easy to miss: after `repairMirror /dev/diskN` the new
+disk shows up as `Spare` (not `Rebuilding`), and the kernel only
+promotes it to a `Rebuilding` member while `AutoRebuild=Yes`. With
+`AutoRebuild=No`, the Spare sits inert; the mirror stays a single-
+member set with one orphan Spare attached, and `diskutil appleRAID
+list` will misleadingly report it as `Status: Online`.
+
+**Consequence for `DEFAULT_AUTO_REBUILD=0` users:** if the health
+daemon's `enforce_default_ar_for_uuid` runs between `repairMirror`
+finishing and the kernel finishing the Spare-to-Rebuilding promotion,
+it will silently abort the rebuild. `my-appleRAID` therefore skips
+the AR=1→0 enforcement flip whenever ANY member is in a `Spare`,
+`Stale`, or `Rebuilding` state; the next health pass re-evaluates
+once the rebuild has completed and the set is fully Online.
+
 ### 13. `diskutil eject` of an active RAID member
 
 Plain `diskutil eject /dev/diskN` **fails** for a disk that's still

@@ -377,6 +377,43 @@ enforce_default_ar_for_uuid() {
         log_debug "  $uuid: AutoRebuild already $target (no change)"
         return 0
     fi
+
+    # Skip enforcement when flipping AR=0 would abort an in-flight or
+    # pending rebuild. Specifically:
+    #
+    #   - 'diskutil appleRAID repairMirror' adds the new disk as a hot
+    #     SPARE; the kernel only promotes that Spare to a Rebuilding
+    #     member while AutoRebuild=1. If we flip back to 0 before the
+    #     promotion completes, the Spare freezes and the mirror stays
+    #     incomplete forever (empirically observed on 'weg' rebuild).
+    #
+    #   - A member already in 'Rebuilding' state means a rebuild is
+    #     actively running; AutoRebuild gates STARTING new ones, not
+    #     finishing ones already in progress, but flipping mid-flight
+    #     gives the kernel one more reason to be confused.
+    #
+    # When we want to flip AR=0 (target=0) and any member is in such a
+    # state, log the reason and leave the current AR alone. The next
+    # health pass will re-evaluate; once the rebuild finishes and all
+    # members are Online, enforcement will then succeed normally.
+    if [ "$target" = "0" ]; then
+        members_status=$(diskutil appleRAID list "$uuid" 2>/dev/null \
+            | awk '/^[0-9-][[:space:]]+disk/ {
+                # Status occupies columns 4..N-1 (size is last); collect
+                # every word from $4 onward except $NF.
+                s = ""
+                for (i = 4; i < NF; i++) s = (s ? s " " : "") $i
+                print s
+            }')
+        _has_in_flight=$(echo "$members_status" | awk '
+            /Rebuild|Spare|Stale|[0-9]+%/ { print "yes"; exit }
+        ')
+        if [ "$_has_in_flight" = "yes" ]; then
+            log_info "  $uuid: AR=$current; skipping flip to 0 (Spare/Rebuilding member present - flipping now would abort the rebuild)"
+            return 0
+        fi
+    fi
+
     log_info "Enforcing AutoRebuild=$target on $uuid (was: ${current:-<unknown>})"
     if sudo diskutil appleRAID update AutoRebuild "$target" "$uuid" >/dev/null 2>&1; then
         return 0
