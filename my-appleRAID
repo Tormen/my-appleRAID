@@ -7023,17 +7023,27 @@ _repair_guess_replacement() {
     target_size="$1"
     selected_set_name="$2"
 
-    # Build "disk -> set name" mapping for current RAIDs.
+    # Build "disk -> set name -> member status" mapping for current
+    # RAIDs. The status (Online / Rebuilding / Failed / Stale / Spare)
+    # is what tells us whether a member is a repair candidate or just
+    # the surviving healthy half of a degraded set.
+    # The diskutil appleRAID list member rows look like:
+    #   #  DevNode   UUID                                   Status     Size
+    #   0  disk6s2   2A2F42A7-BD1E-48C4-ACAE-5A3CCF03924A   Online     16000556662784
     raid_map=$(diskutil appleRAID list 2>/dev/null | awk -F': +' '
         /^Name:/ { setname = $2; sub(/[[:space:]]+$/, "", setname) }
         /^[[:space:]]*[0-9]+[[:space:]]+disk[0-9]+/ {
             n = split($0, p, /[[:space:]]+/)
-            j = 0
+            j = 0; devnode = ""; mstatus = ""
             for (i = 1; i <= n; i++) {
-                if (p[i] != "") { j++; if (j==2) { devnode = p[i]; break } }
+                if (p[i] != "") {
+                    j++
+                    if (j == 2) devnode = p[i]
+                    if (j == 4) mstatus = p[i]
+                }
             }
             base = devnode; sub(/s[0-9]+$/, "", base)
-            print base "|" setname
+            print base "|" setname "|" mstatus
         }
     ')
 
@@ -7063,6 +7073,8 @@ _repair_guess_replacement() {
 
         my_set=$(printf '%s\n' "$raid_map" \
                  | awk -F'|' -v d="$d" '$1==d {print $2; exit}')
+        my_status=$(printf '%s\n' "$raid_map" \
+                 | awk -F'|' -v d="$d" '$1==d {print $3; exit}')
 
         score=0; reason=""
         if [ -z "$my_set" ]; then
@@ -7072,7 +7084,19 @@ _repair_guess_replacement() {
                 score=60; reason="larger free disk"
             fi
         elif [ "$my_set" = "$selected_set_name" ]; then
-            score=95; reason="returning member of '$selected_set_name'"
+            # Surviving healthy members are NOT repair candidates - they
+            # are the half that's working. Only members whose status
+            # indicates trouble (Failed / Stale / Spare / Rebuilding /
+            # anything not Online) are candidates for the repair flow.
+            case "$my_status" in
+                Online)
+                    continue
+                    ;;
+                *)
+                    score=95
+                    reason="returning member of '$selected_set_name' (status: ${my_status:-unknown})"
+                    ;;
+            esac
         else
             continue
         fi
