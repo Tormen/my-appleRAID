@@ -4965,9 +4965,9 @@ _render_apple_row() {
         manual|false|0|no)         ar_text="manual" ;;
     esac
 
-    printf 'AppleRAID  %-4s %s %-6s %-5s %-9s %-9s %-22s %s [%s]%s\n' \
-        "$short_level" "$state_disp" "$ar_text" "$fs" "$size_str" "$free_str" "$mount" \
-        "$name" "$short_members" "$flags_str"
+    printf '%-22s AppleRAID  %-4s %s %-6s %-5s %-9s %-9s %-22s [%s]%s\n' \
+        "$name" "$short_level" "$state_disp" "$ar_text" "$fs" "$size_str" "$free_str" "$mount" \
+        "$short_members" "$flags_str"
 }
 
 _render_soft_row() {
@@ -4994,9 +4994,9 @@ _render_soft_row() {
         Failed|Offline|Missing) state_disp="${C_RED}${state_padded}${C_RESET}"    ;;
         *)                      state_disp="$state_padded" ;;
     esac
-    printf 'SoftRAID   %-4s %s %-6s %-5s %-9s %-9s %-22s %s [%s]%s\n' \
-        "$short_level" "$state_disp" "-" "$fs" "$size_str" "$free_str" "$mount" \
-        "$name" "$members" "$flags_str"
+    printf '%-22s SoftRAID   %-4s %s %-6s %-5s %-9s %-9s %-22s [%s]%s\n' \
+        "$name" "$short_level" "$state_disp" "-" "$fs" "$size_str" "$free_str" "$mount" \
+        "$members" "$flags_str"
 }
 
 # Print the unified compact summary (the new default 'list' output).
@@ -5009,8 +5009,8 @@ print_raid_summary() {
         return
     fi
 
-    printf '%s%-10s %-4s %-13s %-6s %-5s %-9s %-9s %-22s %s%s\n' \
-        "${C_BOLD}" "SOURCE" "LVL" "STATE" "AR" "FS" "SIZE" "FREE" "MOUNT" "NAME [MEMBERS]" "${C_RESET}"
+    printf '%s%-22s %-10s %-4s %-13s %-6s %-5s %-9s %-9s %-22s %s%s\n' \
+        "${C_BOLD}" "NAME" "SOURCE" "LVL" "STATE" "AR" "FS" "SIZE" "FREE" "MOUNT" "[MEMBERS]" "${C_RESET}"
 
     if [ -n "$apple_rows" ]; then
         printf '%s\n' "$apple_rows" | while IFS= read -r row; do
