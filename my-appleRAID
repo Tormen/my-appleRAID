@@ -4073,6 +4073,73 @@ smart_cmd() {
     esac
 }
 
+# Compact one-line SMART summary for a single whole-disk identifier
+# (e.g. "disk7"). Designed to be called inline from cmd_status's per-
+# member loop so the user doesn't have to run `smart <disk>` separately
+# for each mirror member.
+#
+# Output examples:
+#   SMART: OK  temp=36C  POH=63685h  realloc=0  pending=0  uncorr=0  crc=0
+#   SMART: unavailable (smartctl not installed)
+#   SMART: unsupported on this enclosure
+#
+# Non-zero killer attributes (5/197/198/199) are highlighted in red so
+# they jump out in a status table. The dtype probe is cached via
+# smart_dtype_for, so subsequent calls on the same enclosure are fast.
+smart_summary_line() {
+    d="$1"
+    [ -n "$d" ] || { echo "SMART: (no device)"; return; }
+    if ! command -v smartctl >/dev/null 2>&1; then
+        echo "SMART: unavailable (smartctl not installed)"; return
+    fi
+    if ! diskutil info "/dev/$d" >/dev/null 2>&1; then
+        echo "SMART: unavailable (/dev/$d not present)"; return
+    fi
+    dtype=$(smart_dtype_for "$d")
+    if [ -z "$dtype" ] || [ "$dtype" = "none" ]; then
+        echo "SMART: unsupported on this enclosure"; return
+    fi
+    sc=$(smart_cmd "$d")
+
+    health=$($sc -H "/dev/$d" 2>/dev/null | awk -F': *' '
+        /SMART overall-health/ { print $2; exit }
+        /SMART Health Status/  { print $2; exit }')
+    health=$(echo "$health" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+    case "$health" in
+        PASSED|OK)  hd="${C_GREEN}OK${C_RESET}" ;;
+        '')         hd="?" ;;
+        *)          hd="${C_RED}${health}${C_RESET}" ;;
+    esac
+
+    attrs=$($sc -A "/dev/$d" 2>/dev/null)
+    poh=$(echo "$attrs" | awk '
+        /^[[:space:]]*9[[:space:]]+Power_On_Hours/ {print $10; exit}
+        /^Power On Hours:/                          {v=$NF; gsub(/,/,"",v); print v; exit}')
+    temp=$(echo "$attrs" | awk '/^[[:space:]]*(194|190)[[:space:]]+Temperature/ {print $10; exit}')
+    realloc=$(echo "$attrs" | awk '/^[[:space:]]*5[[:space:]]+Reallocated_Sector/ {print $10; exit}')
+    pending=$(echo "$attrs" | awk '/^[[:space:]]*197[[:space:]]+Current_Pending/ {print $10; exit}')
+    uncorr=$(echo  "$attrs" | awk '/^[[:space:]]*198[[:space:]]+Offline_Uncorr/  {print $10; exit}')
+    crc=$(echo     "$attrs" | awk '/^[[:space:]]*199[[:space:]]+UDMA_CRC/        {print $10; exit}')
+
+    fmt_kill() {
+        # $1=label, $2=value (string). Empty => "?"; "0" => plain; non-zero => red.
+        case "${2:-}" in
+            "")    printf '%s=?' "$1" ;;
+            0)     printf '%s=0' "$1" ;;
+            *)     printf '%s%s=%s%s' "${C_RED}" "$1" "$2" "${C_RESET}" ;;
+        esac
+    }
+
+    out="SMART: $hd"
+    [ -n "$temp" ] && out="$out  temp=${temp}C"
+    [ -n "$poh" ]  && out="$out  POH=${poh}h"
+    out="$out  $(fmt_kill realloc "$realloc")"
+    out="$out  $(fmt_kill pending "$pending")"
+    out="$out  $(fmt_kill uncorr  "$uncorr")"
+    out="$out  $(fmt_kill crc     "$crc")"
+    echo "$out"
+}
+
 # ----------------------------------------------------------------------
 # SMART drill-down: print a comprehensive per-disk health readout.
 # Used by `cmd_smart` (interactive standalone) and `cmd_health --disk`
@@ -5403,6 +5470,10 @@ EOF
         esac
         printf '  [%s] %-9s %s  parent=/dev/%-7s loc=%-9s size=%-9s model=%s\n' \
             "$idx" "$devnode" "$ms" "$parent" "${loc:-?}" "${psize:-?}" "${model:-?}"
+        # Inline SMART one-liner so the user doesn't need to invoke
+        # 'smart <disk>' separately for each member.
+        smart_line=$(smart_summary_line "$parent")
+        [ -n "$smart_line" ] && printf '       %s\n' "$smart_line"
     done
 
     if [ "$VERBOSE" = "1" ]; then
