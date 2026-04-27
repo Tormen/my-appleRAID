@@ -7326,7 +7326,16 @@ cmd_repair() {
                     echo
                     explain "AppleRAID has NO incremental resync (no write-intent bitmap), so"
                     explain "any re-add of this member triggers a FULL block-level rebuild."
-                    explain "  Estimated time: ~14 hours per 10 TB at sustained ~200 MB/s."
+                    # Size-aware estimate (200-300 MB/s sustained band).
+                    _est_size=$(disk_size_bytes "$dev" 2>/dev/null)
+                    if [ -n "$_est_size" ] && [ "$_est_size" -gt 0 ] 2>/dev/null; then
+                        _est_h_fast=$(awk -v b="$_est_size" 'BEGIN { printf "%.1f", b / (300 * 1024 * 1024 * 3600) }')
+                        _est_h_slow=$(awk -v b="$_est_size" 'BEGIN { printf "%.1f", b / (200 * 1024 * 1024 * 3600) }')
+                        _est_tb=$(awk -v b="$_est_size" 'BEGIN { printf "%.1f", b / (1024 * 1024 * 1024 * 1024) }')
+                        explain "  Estimated time for this ${_est_tb} TB mirror at 200-300 MB/s: ~${_est_h_fast}h to ~${_est_h_slow}h."
+                    else
+                        explain "  Estimated time at sustained 200-300 MB/s: ~1 hour per 1 TB."
+                    fi
                     explain "  The mirror stays mounted and usable during the rebuild."
                     echo
                     explain "AppleRAID still has the kernel claim on this slot, so we must"
@@ -7420,9 +7429,34 @@ cmd_repair() {
     run diskutil appleRAID list "$SELECTED_UUID"
     echo
     ok "Repair started. Monitor with:  $SCRIPT_NAME watch $SELECTED_UUID"
-    info "Rebuild time depends on how much data is on the mirror."
-    info "  - Empty mirror: seconds."
-    info "  - Full 26 TB mirror at ~250 MB/s: ~24-30 hours."
+
+    # Print a size-aware rebuild-time estimate. The empirical sustained
+    # rate for AppleRAID Mirror rebuild on healthy SATA drives is ~200
+    # MB/s; we report a fast/slow band (200-300 MB/s) so the user has a
+    # reasonable +/- envelope. Falls back to the generic generic message
+    # if we can't parse the size.
+    _rebuild_size_bytes=""
+    if [ -n "${raid_member_size:-}" ]; then
+        _rebuild_size_bytes="$raid_member_size"
+    elif [ -n "${new_size:-}" ]; then
+        _rebuild_size_bytes="$new_size"
+    fi
+    if [ -n "$_rebuild_size_bytes" ] && [ "$_rebuild_size_bytes" -gt 0 ] 2>/dev/null; then
+        # Hours = bytes / (rate-bytes-per-second * 3600). Use awk so we
+        # get fractional hours without depending on bc.
+        _h_fast=$(awk -v b="$_rebuild_size_bytes" 'BEGIN { printf "%.1f", b / (300 * 1024 * 1024 * 3600) }')
+        _h_slow=$(awk -v b="$_rebuild_size_bytes" 'BEGIN { printf "%.1f", b / (200 * 1024 * 1024 * 3600) }')
+        _tb=$(awk -v b="$_rebuild_size_bytes" 'BEGIN { printf "%.1f", b / (1024 * 1024 * 1024 * 1024) }')
+        info "Rebuild estimate for this ${_tb} TB mirror:"
+        info "  - Empty (most blocks zero): seconds to a few minutes."
+        info "  - Full mirror at sustained 200-300 MB/s: ~${_h_fast}h to ~${_h_slow}h."
+        info "  Actual time scales with the data on disk; the kernel still"
+        info "  reads every block of the survivor regardless of fill level."
+    else
+        info "Rebuild time depends on how much data is on the mirror."
+        info "  - Empty mirror: seconds."
+        info "  - Full mirror at sustained ~250 MB/s: ~1 hour per 1 TB."
+    fi
 }
 
 # ----------------------------------------------------------------------
