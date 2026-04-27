@@ -16,7 +16,7 @@ the hard way through controlled testing on real external storage.
 
 | Knob | my-appleRAID default | Notes |
 |---|---|---|
-| `AutoRebuild` | **`0` (manual)** for every set — hard-alert behavior. Set goes Degraded with a Failed member, visibly stays that way until you run `repair`. | Flip to `1` if you'd rather the kernel auto-rebuild silently; the health daemon still emails on every transition and every 6h during the rebuild. |
+| `AutoRebuild` | **`0` (manual)** for every set — full operator control. The set stays Degraded with a Failed member until you investigate and explicitly start the rebuild via `repair`. **Motivation: any rebuild is a multi-hour, full-disk-read operation that should be a deliberate decision** — was the cable loose, or is the disk truly bad? Is the surviving member healthy enough to drive a rebuild without surfacing latent bad sectors? Did *anything else* on the host glitch at the same time? Auto-rebuild on every reconnect denies you the chance to ask these questions. | Flip to `1` if you'd rather the kernel auto-rebuild silently; the health daemon still emails on every transition and every 6h during the rebuild. |
 | `SetTimeout` | Untouched (Apple's default `30 s`) | **No observable effect** on real physical disconnects of these enclosures. Changing it doesn't buy you anything. `my-appleRAID` only reads + displays this, never writes it. |
 
 The behavior is governed by a single config key:
@@ -26,19 +26,27 @@ The behavior is governed by a single config key:
 #   Controls whether my-appleRAID enforces an AutoRebuild value on
 #   every set during CREATE, HEALTH, and LIST calls.
 #
-#     1   (default, recommended) — set AR=1 on every set the script
-#         touches. Sets created via `my-appleRAID create` are flipped
-#         from Apple's default of 0 to 1 right after creation. Health
-#         passes ensure no set has drifted off. List calls print the
-#         current value and re-apply if drifted.
-#     0   force AR=0 on every set the script touches. Same enforcement
-#         points; opposite target value. Useful only for the narrow
-#         "I want hard alerts / explicit control" cases below.
-#     ""  (empty) disable enforcement entirely. The script reads and
-#         displays whatever AR each set currently has, but never
-#         writes the field. Use this if you want to manage AR by
-#         hand per-set via `my-appleRAID autorebuild <set> on|off`.
-DEFAULT_AUTO_REBUILD=1
+#     0   (default) force AutoRebuild=0 on every set the script
+#         touches. A returning member stays 'Failed' until you
+#         manually run 'my-appleRAID repair'. Motivation: any
+#         rebuild is a multi-hour, full-disk-read operation that
+#         should be a deliberate decision (was the cable loose?
+#         is the disk truly bad? is the survivor healthy enough to
+#         drive a rebuild without surfacing latent bad sectors?).
+#         Auto-rebuild on every reconnect denies you the chance to
+#         ask these questions.
+#     1   force AutoRebuild=1 on every set. Returning members
+#         auto-rebuild silently. The health daemon still emails on
+#         every transition (Degraded onset / Rebuilding start /
+#         progress every 6h / resolution), so visibility is
+#         preserved - but the kernel will start the rebuild without
+#         your input.
+#     ""  (empty) disable enforcement entirely. The script reads
+#         and displays whatever AutoRebuild value each set
+#         currently has, but never writes the field. Use this if
+#         you want to manage AutoRebuild by hand per-set via
+#         `my-appleRAID autorebuild <set> on|off`.
+DEFAULT_AUTO_REBUILD=0
 ```
 
 Enforcement points:
@@ -50,36 +58,52 @@ Enforcement points:
   empty). Triggered by the launchd daemon, so the enforcement is
   silent and continuous.
 - **`list`** — every `my-appleRAID list` invocation checks each set's
-  current AR against `DEFAULT_AUTO_REBUILD` and re-applies if drifted
+  current AutoRebuild against `DEFAULT_AUTO_REBUILD` and re-applies if drifted
   (skipped if empty). May prompt for `sudo` if a write is needed.
 
 ---
 
-## "Why would I ever want `AutoRebuild=0`?"
+## Why is the default `AutoRebuild=0`?
 
-Short answer: **you usually wouldn't**, and the script's default is `1`.
+A rebuild on AppleRAID is a **full block-by-block copy of the
+entire member partition** (no incremental resync — see section 3
+below). On a TB-class drive that's many hours of sustained I/O on
+both the returning disk and the survivor, with the mirror in
+`Degraded` state the entire time. **It is not a casual operation.**
+Auto-rebuild on every reconnect lets the kernel start that work
+without giving you a chance to ask:
 
-Long answer — narrow cases where `0` makes sense:
+1. **Is the cable loose, or is the disk truly bad?** If a USB or
+   Thunderbolt cable wiggle caused the disconnect, plugging it
+   back in and immediately initiating a multi-hour rebuild is a
+   sledgehammer for what could be a 3-second fix.
+2. **Is the surviving member healthy enough to drive a rebuild?**
+   A rebuild reads every block of the survivor; latent bad sectors
+   that have never been read in the lifetime of the mirror will
+   surface NOW, potentially turning a one-disk problem into a
+   two-disk problem. Run `my-appleRAID smart` on the survivor first.
+3. **Did anything else on the host glitch at the same time?**
+   Power supply hiccup, kernel panic, unrelated controller reset?
+   You may want to investigate before stressing both disks for
+   hours.
+4. **Should the returning disk be repaired, or replaced?** If a
+   drive is flapping or has prior-failure SMART signs, you'd
+   rather swap in a known-good drive than rebuild onto the
+   suspect one.
 
-1. **You want a hard alert that requires action.** With `AutoRebuild=0`,
-   a returning member sits in `Failed` status until you act. The set
-   stays `Degraded`. That's a persistent, visible alert. With
-   `AutoRebuild=1`, the rebuild starts automatically and the set is
-   back to `Online` after a few hours — silent self-healing, but you
-   may miss the fact that there was an incident at all.
-2. **You want explicit control over when a rebuild runs.** A full
-   rebuild on a multi-TB mirror is hours of sustained I/O on both
-   members and degrades read/write performance for everything else
-   on the host. With `0`, you can defer the rebuild to off-hours
-   (e.g. start it manually overnight via `my-appleRAID repair`).
-3. **You suspect the returning member itself is bad.** If a disk is
-   flapping, you may not want the kernel to keep re-rebuilding onto
-   a dying drive. With `0`, you decide whether to repair it back in
-   or replace it with a known-good disk via `my-appleRAID repair`.
+`my-appleRAID`'s default of `AutoRebuild=0` keeps the set in a
+**persistent visible Degraded state** with the missing/Failed
+member loudly displayed in `list` and `status`, plus emails from
+the health daemon, until *you* explicitly run `repair`. The price
+of self-healing convenience is too high relative to the size of
+the question "should this rebuild run?" — so the default favors
+control.
 
-For ordinary home / SOHO use, none of these outweigh the
-self-healing benefit of `AutoRebuild=1`. That's the script's default
-recommendation.
+If you want auto-heal anyway (e.g. an unattended off-site mirror
+where the rebuild's I/O cost is negligible compared to the
+operator's response time), set `DEFAULT_AUTO_REBUILD=1`. The
+health daemon's transition emails (Degraded onset, Rebuilding
+start, 6 h progress, resolution) will still surface every incident.
 
 ---
 
@@ -146,9 +170,9 @@ content is necessarily stale. Because AppleRAID has **no
 write-intent bitmap**, the kernel cannot know which blocks
 diverged — so on reattach it must either:
 
-- Mark the returning member `Failed` (AR=0) and require a full
+- Mark the returning member `Failed` (AutoRebuild=0) and require a full
   `repairMirror` rebuild to bring it back, OR
-- Auto-trigger that full rebuild itself (AR=1).
+- Auto-trigger that full rebuild itself (AutoRebuild=1).
 
 **There is no incremental resync mechanism in AppleRAID.** Compare:
 mdadm has write-intent-bitmap → fast partial resync; ZFS has
@@ -204,8 +228,8 @@ this automatically.)
 | `Online` | plist + ioreg | Healthy, actively serving the mirror |
 | `<missing>` (null in plist) | plist | Disk just disappeared; kernel is still adjusting (transient) |
 | `Standby` | ioreg | Kernel-internal stub state for a slot whose disk is gone (corresponds to `<missing>` in plist) |
-| `Failed` | plist | Disk reattached after timeout with AR=0 — permanent until manual `repairMirror` |
-| `Rebuilding` | plist (with `<N>% (rebuilding)` text in the human-readable list) | AR=1 triggered a rebuild; full rebuild in progress |
+| `Failed` | plist | Disk reattached after timeout with AutoRebuild=0 — permanent until manual `repairMirror` |
+| `Rebuilding` | plist (with `<N>% (rebuilding)` text in the human-readable list) | AutoRebuild=1 triggered a rebuild; full rebuild in progress |
 
 The plist and ioreg can disagree during transitions (plist says
 `Failed`, ioreg says `Standby` for the same member). `my-appleRAID`
@@ -288,7 +312,7 @@ warning that removing a member degrades the set).
 If you only want to **temporarily disconnect** a member (e.g. test
 a cable), do **not** use `eject` — just physically yank the cable.
 The set will go `Degraded`, the volume stays mounted, writes go to
-the survivor, and on reconnect AR=1 will rebuild while AR=0 leaves
+the survivor, and on reconnect AutoRebuild=1 will rebuild while AutoRebuild=0 leaves
 it `Failed`.
 
 ### 14. Identifying physical members
@@ -365,7 +389,7 @@ never lose visibility into incidents:
 
 - Set Online → **Degraded** (member missing) — `crit` email + sound
   on first detection, then `EMAIL_INTERVAL` (default 4 h) recurring.
-- Member → **Failed** (returning member after AR=0 timeout, or hard
+- Member → **Failed** (returning member after AutoRebuild=0 timeout, or hard
   failure) — `crit` email + sound; same recurring cadence as Degraded.
 - Member → **Rebuilding** — `warn` email on first detection, then
   `REBUILD_EMAIL_INTERVAL` (default 6 h = 4×/day) recurring while

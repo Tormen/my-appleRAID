@@ -492,18 +492,19 @@ cfg_set_defaults() {
     TEMP_CRIT_C=58
     SMART_CHECK_ENABLED=yes                # yes/no: run smartctl -H / -A
     # AppleRAID AutoRebuild enforcement.
-    #   0   (default) enforce AR=0 on every set during create / health
+    #   0   (default) enforce AutoRebuild=0 on every set during create / health
     #       / list. Returning members stay 'Failed' until you manually
     #       run 'repair' - i.e. you get a HARD ALERT (the set stays
     #       Degraded with a Failed member visibly until you act).
-    #   1   force AR=1 on every set the script touches. Returning
+    #   1   force AutoRebuild=1 on every set the script touches. Returning
     #       members auto-rebuild silently (full block-by-block rebuild,
     #       hours per TB). The health daemon still emails on each
     #       transition (Degraded onset / Rebuilding start / progress /
     #       resolution), so you don't lose visibility - but the set
     #       quietly self-heals if you don't act.
-    #   ""  empty = no enforcement; the script reads/displays AR but
-    #       never writes it. Manage manually via 'autorebuild on|off'.
+    #   ""  empty = no enforcement; the script reads/displays
+    #       AutoRebuild but never writes it. Manage manually via
+    #       'autorebuild on|off'.
     DEFAULT_AUTO_REBUILD=0
     # How often (seconds) the health daemon re-emails about an ongoing
     # rebuild. Default 21600s = 6h = 4 emails per day. Other problem
@@ -1761,7 +1762,7 @@ cmd_health() {
 
     # Enforce DEFAULT_AUTO_REBUILD policy on every monitored set.
     # Skipped if config is empty. Silent when no drift; logs an info
-    # line when it actually flips a set's AR.
+    # line when it actually flips a set's AutoRebuild.
     if [ -n "${DEFAULT_AUTO_REBUILD:-}" ]; then
         for u in $(resolve_monitored_sets 2>/dev/null); do
             enforce_default_ar_for_uuid "$u" || true
@@ -2151,19 +2152,19 @@ SMART_CHECK_ENABLED=yes
 # DEFAULT_AUTO_REBUILD controls whether my-appleRAID enforces an
 # AutoRebuild value on every set during create / health / list:
 #
-#   0   (default) enforce AR=0 on every set. A returning member
+#   0   (default) enforce AutoRebuild=0 on every set. A returning member
 #       stays 'Failed' until you manually run 'my-appleRAID repair'.
 #       Pros: persistent visible alert (the Degraded state and the
 #       Failed member are loudly obvious until you act); explicit
 #       control over when the multi-hour rebuild runs.
-#   1   force AR=1. Returning members auto-rebuild without operator
+#   1   force AutoRebuild=1. Returning members auto-rebuild without operator
 #       action. The health daemon still emails on every transition
 #       (Degraded onset, Rebuilding start, progress every 6h,
 #       resolution back to Online), so visibility is preserved -
 #       but the set self-heals if you don't act.
 #   ""  (empty) disable enforcement entirely. The script reads and
-#       displays AR but never writes it. Manage by hand per-set via
-#       `my-appleRAID autorebuild <set> on|off`.
+#       displays AutoRebuild but never writes it. Manage by hand
+#       per-set via `my-appleRAID autorebuild <set> on|off`.
 #
 # Default: 0.
 DEFAULT_AUTO_REBUILD=0
@@ -4547,7 +4548,7 @@ ${C_BOLD}COMMANDS${C_RESET}
                               name shown in 'diskutil appleRAID list' - not
                               the file system volume inside.
   ${C_CYAN}autorebuild${C_RESET} [<set>] [on|off]   Manage AppleRAID's AutoRebuild policy.
-                              No-args: explainer + table of all sets w/ AR.
+                              No-args: explainer + table of all sets with their AutoRebuild policy.
                               <set>: prompt to flip current value.
                               <set> on|off: non-interactive flip.
                               The DEFAULT_AUTO_REBUILD config (default 1)
@@ -5061,7 +5062,7 @@ print_raid_summary() {
 
     echo
     explain "Member states: O=Online R=Rebuilding F=Failed S=Standby M=Missing P=Spare X=Offline ?=Unknown"
-    explain "AR column: AppleRAID Rebuild policy (auto/manual). Flags: SG=Safeguard enabled (SoftRAID)."
+    explain "AR column: AppleRAID AutoRebuild policy (auto/manual). Flags: SG=Safeguard enabled (SoftRAID)."
     if softraid_tool_available; then
         printf 'Totals: %s AppleRAID set(s) (%s degraded), %s SoftRAID volume(s) (%s degraded).\n' \
             "${n_apple:-0}" "$n_apple_degraded" "${n_soft:-0}" "$n_soft_degraded"
@@ -6714,7 +6715,7 @@ EOF
 # you run `repair`.
 #
 # Usage:
-#   autorebuild                    explainer + table of all sets w/ AR
+#   autorebuild                    explainer + table of all sets with their AutoRebuild policy
 #   autorebuild <set>              show current state for one set;
 #                                  prompt yes/no to flip
 #   autorebuild <set> on|off       non-interactive flip
@@ -6736,8 +6737,8 @@ cmd_autorebuild() {
 Usage: $SCRIPT_NAME autorebuild [<set>] [on|off]
 
   (no args)             Print an explainer about AutoRebuild + show every
-                        set's current AR setting. No prompts, read-only.
-  <set>                 Show the named set's current AR; prompt yes/no to
+                        set's current AutoRebuild setting. No prompts, read-only.
+  <set>                 Show the named set's current AutoRebuild; prompt yes/no to
                         flip it. Requires sudo for the update.
   <set> on              Set AutoRebuild=automatic non-interactively.
   <set> off             Set AutoRebuild=manual non-interactively.
@@ -6808,16 +6809,16 @@ AppleRAID has TWO per-set parameters: AutoRebuild and SetTimeout.
 
 The script's DEFAULT_AUTO_REBUILD config controls automatic enforcement
 of AutoRebuild on every set the script touches (create / health / list
-calls). Default value: 0 (force AR=manual; you get a hard, persistent
+calls). Default value: 0 (force AutoRebuild=manual; you get a hard, persistent
 alert when a member fails - the set stays Degraded with a Failed
 member visibly until you run 'repair'). Flip to 1 if you'd rather
 the kernel auto-rebuild silently; the health daemon will still
 email on every transition and every 6h during the rebuild.
 
 EOF
-        # Table of every set with current AR.
-        printf '%s%-8s %-22s %-36s %-7s%s\n' \
-            "${C_BOLD}" "STATUS" "NAME" "UUID" "AR" "${C_RESET}"
+        # Table of every set with current AutoRebuild.
+        printf '%s%-22s %-8s %-36s %-12s%s\n' \
+            "${C_BOLD}" "NAME" "STATUS" "UUID" "AutoRebuild" "${C_RESET}"
         for u in $(raid_list_uuids 2>/dev/null); do
             n=$(diskutil appleRAID list "$u" 2>/dev/null \
                 | awk -F': +' '/^Name:/ {v=$2; sub(/[[:space:]]+$/,"",v); print v; exit}')
@@ -6828,13 +6829,13 @@ EOF
                 0) ar="manual" ;;
                 *) ar="?"      ;;
             esac
-            printf '  %-8s %-22s %-36s %-7s\n' "$st" "$n" "$u" "$ar"
+            printf '  %-22s %-8s %-36s %-12s\n' "$n" "$st" "$u" "$ar"
         done
         echo
         if [ -n "${DEFAULT_AUTO_REBUILD:-}" ]; then
             info "Effective DEFAULT_AUTO_REBUILD config: $DEFAULT_AUTO_REBUILD (sets that drift will be re-applied on next list/health run)."
         else
-            info "DEFAULT_AUTO_REBUILD is empty - no automatic enforcement; sets will keep whatever AR they have."
+            info "DEFAULT_AUTO_REBUILD is empty - no automatic enforcement; sets will keep whatever AutoRebuild value they have."
         fi
         return 0
     fi
