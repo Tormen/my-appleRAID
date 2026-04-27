@@ -2023,6 +2023,12 @@ cmd_health() {
     fi
 
     cfg_load
+    # cfg_load sources the config file which resets LOG_LEVEL back to
+    # whatever the user has there (default "info"). If -V/-D was passed
+    # on the CLI, re-escalate now so debug logging wins over the config.
+    if [ "$VERBOSE" = "1" ] || [ "$DEBUG" = "1" ]; then
+        LOG_LEVEL=debug
+    fi
     state_init
     seen_init
     # Trap so we always clean up the temp seen-file.
@@ -2053,22 +2059,52 @@ cmd_health() {
     log_debug "Config loaded from: $LOADED_CONFIG"
     log_debug "Monitoring sets: $MONITOR_SETS"
 
+    # Step-by-step narration when run interactively with -V / -D (or -v).
+    # The launchd daemon path runs without these flags so its log stays
+    # quiet; only the human-invoked `health -V` walks through each check.
+    _verbose_health=0
+    if [ "$VERBOSE" = "1" ] || [ "$DEBUG" = "1" ]; then
+        _verbose_health=1
+    fi
+
+    [ "$_verbose_health" = "1" ] && step "Health pass starting"
+    if [ "$_verbose_health" = "1" ]; then
+        info "Config file:    ${LOADED_CONFIG:-<none>}"
+        info "State dir:      ${STATE_DIR:-<none>}"
+        info "Log file:       ${LOG_FILE:-<stderr only>}"
+        info "Email enabled:  $([ -n "${EMAIL_TO:-}" ] && echo "yes -> $EMAIL_TO" || echo "no (EMAIL_TO empty)")"
+        info "Alarm enabled:  ${ALARM_ENABLED:-yes}"
+        info "Dry run:        $([ "$dry" = "1" ] && echo "yes" || echo "no")"
+        info "Force (--once): $([ "$force" = "1" ] && echo "yes (rate limits bypassed)" || echo "no")"
+        echo
+    fi
+
+    [ "$_verbose_health" = "1" ] && step "Check 1/8: RAID set state (Online / Degraded / Rebuilding / Failed)"
     check_raid_sets
 
     # Enforce DEFAULT_AUTO_REBUILD policy on every monitored set.
     # Skipped if config is empty. Silent when no drift; logs an info
     # line when it actually flips a set's AutoRebuild.
     if [ -n "${DEFAULT_AUTO_REBUILD:-}" ]; then
+        [ "$_verbose_health" = "1" ] && step "Check 2/8: Enforce DEFAULT_AUTO_REBUILD=$DEFAULT_AUTO_REBUILD on every monitored set"
         for u in $(resolve_monitored_sets 2>/dev/null); do
             enforce_default_ar_for_uuid "$u" || true
         done
+    else
+        [ "$_verbose_health" = "1" ] && step "Check 2/8: AutoRebuild enforcement DISABLED (DEFAULT_AUTO_REBUILD is empty)"
     fi
 
+    [ "$_verbose_health" = "1" ] && step "Check 3/8: Auto-baseline sets (add long-present sets to baseline)"
     check_auto_baseline_sets
+    [ "$_verbose_health" = "1" ] && step "Check 4/8: Auto-baseline disks (add long-present disks to baseline)"
     check_auto_baseline_disks
+    [ "$_verbose_health" = "1" ] && step "Check 5/8: RAID set presence (every set in REQUIRED_SETS still present?)"
     check_set_presence
+    [ "$_verbose_health" = "1" ] && step "Check 6/8: Disk presence (every disk in REQUIRED_DISKS still attached?)"
     check_disk_presence
+    [ "$_verbose_health" = "1" ] && step "Check 7/8: SMART attributes + temperature (rate-limited by SMART_POLL_INTERVAL)"
     check_smart
+    [ "$_verbose_health" = "1" ] && step "Check 8/8: Scheduled SMART self-tests (short / long per SELFTEST_*_SCHEDULE)"
     run_selftests
 
     # Detect resolved problems: anything in state file not seen this run.
