@@ -1254,6 +1254,8 @@ handle_problem() {
     if [ -z "$existing" ]; then
         # NEW problem
         log_error "NEW $sev: $summary"
+        [ -n "${HEALTH_RUN_LOG:-}" ] && \
+            printf 'new|%s|%s\n' "$sev" "$summary" >> "$HEALTH_RUN_LOG"
         [ "$sev" = "crit" ] && alert_sound
         alert_email "[appleRAID/$sev] $summary" \
             "New problem detected at $now
@@ -1268,6 +1270,8 @@ $(diskutil appleRAID list 2>/dev/null)
         state_put "$h" "$sev" "$now" "$now" "$now" "$summary"
     else
         # ONGOING problem - apply rate limits
+        [ -n "${HEALTH_RUN_LOG:-}" ] && \
+            printf 'ongoing|%s|%s\n' "$sev" "$summary" >> "$HEALTH_RUN_LOG"
         first=$(echo  "$existing" | awk -F'|' '{print $3}')
         la=$(echo     "$existing" | awk -F'|' '{print $4}')
         le=$(echo     "$existing" | awk -F'|' '{print $5}')
@@ -1392,11 +1396,15 @@ handle_resolved() {
         # current-pass check_*_presence will have already created a
         # fresh, correctly-keyed alert for the underlying condition.
         log_warn "STALE STATE entry pruned (underlying problem still present, alert is being re-fired with the current hash format): $summary"
+        [ -n "${HEALTH_RUN_LOG:-}" ] && \
+            printf 'stale||%s\n' "$summary" >> "$HEALTH_RUN_LOG"
         state_delete "$h"
         return 0
     fi
 
     log_info "RESOLVED: $summary"
+    [ -n "${HEALTH_RUN_LOG:-}" ] && \
+        printf 'resolved||%s\n' "$summary" >> "$HEALTH_RUN_LOG"
     alert_email "[appleRAID/OK] Resolved: $summary" \
         "The following problem is no longer present:
 
@@ -2179,8 +2187,16 @@ cmd_health() {
     fi
     state_init
     seen_init
-    # Trap so we always clean up the temp seen-file.
-    trap 'seen_cleanup' EXIT INT TERM
+
+    # Per-run event log. handle_problem and handle_resolved append to
+    # this file (via the HEALTH_RUN_LOG env var) so the end-of-run
+    # SUMMARY block can count what happened this pass without re-
+    # parsing the state DB. Cleaned up by the trap below.
+    HEALTH_RUN_LOG=$(mktemp -t my-appleRAID-runlog.XXXXXX) || HEALTH_RUN_LOG=""
+    export HEALTH_RUN_LOG
+
+    # Trap so we always clean up the temp seen-file + run-log.
+    trap 'seen_cleanup; [ -n "$HEALTH_RUN_LOG" ] && rm -f "$HEALTH_RUN_LOG"' EXIT INT TERM
 
     dry=0
     force=0
@@ -2264,14 +2280,56 @@ cmd_health() {
 
     # Exit code reflects worst severity still present.
     worst=0
+    crit_count=0
+    warn_count=0
     for h in $(state_list_hashes); do
         sev=$(state_field "$h" 2)
         case "$sev" in
-            crit) worst=2 ;;
-            warn) [ "$worst" -lt 1 ] && worst=1 ;;
+            crit) worst=2; crit_count=$((crit_count + 1)) ;;
+            warn) [ "$worst" -lt 1 ] && worst=1; warn_count=$((warn_count + 1)) ;;
         esac
     done
     log_debug "Health check complete. Exit=$worst"
+
+    # End-of-run SUMMARY. Always shown, regardless of -V, so daemon
+    # callers and humans both see a one-block recap. Reads the per-run
+    # event log for new/ongoing/resolved/stale counts and combines
+    # with the state-DB tallies above for currently-open problems.
+    new_crit=0; new_warn=0; ongoing=0; resolved_n=0; stale_n=0
+    if [ -n "${HEALTH_RUN_LOG:-}" ] && [ -r "$HEALTH_RUN_LOG" ]; then
+        new_crit=$(awk -F'|' '$1=="new"      && $2=="crit"' "$HEALTH_RUN_LOG" | wc -l | tr -d ' ')
+        new_warn=$(awk -F'|' '$1=="new"      && $2=="warn"' "$HEALTH_RUN_LOG" | wc -l | tr -d ' ')
+        ongoing=$( awk -F'|' '$1=="ongoing"'                "$HEALTH_RUN_LOG" | wc -l | tr -d ' ')
+        resolved_n=$(awk -F'|' '$1=="resolved"'             "$HEALTH_RUN_LOG" | wc -l | tr -d ' ')
+        stale_n=$(awk -F'|' '$1=="stale"'                   "$HEALTH_RUN_LOG" | wc -l | tr -d ' ')
+    fi
+    case "$worst" in
+        0) _exit_label="OK (no problems)" ;;
+        1) _exit_label="WARN (warn-level problems present)" ;;
+        2) _exit_label="CRIT (crit-level problems present)" ;;
+        *) _exit_label="?" ;;
+    esac
+    echo
+    step "SUMMARY"
+    info "  Currently open problems:     $((crit_count + warn_count))  (crit=$crit_count, warn=$warn_count)"
+    info "  New this run:                $((new_crit + new_warn))  (crit=$new_crit, warn=$new_warn)"
+    info "  Ongoing this run:            $ongoing  (already known, rate-limit applied)"
+    info "  Resolved this run:           $resolved_n  (sent 'all clear' email + cleared state)"
+    if [ "$stale_n" -gt 0 ]; then
+        info "  Stale state pruned:          $stale_n  (legacy hashes; underlying issue re-fired with current keys)"
+    fi
+    info "  Exit code:                   $worst  ($_exit_label)"
+    info "    0 = clean, 1 = warn-level open, 2 = crit-level open."
+    if [ "$crit_count" -gt 0 ] || [ "$warn_count" -gt 0 ]; then
+        echo
+        info "  Open problems:"
+        for h in $(state_list_hashes); do
+            sev=$(state_field "$h" 2)
+            sum=$(state_field "$h" 6)
+            printf '    [%s] %s\n' "$sev" "$sum"
+        done
+    fi
+    echo
 
     # --- Prominent end-of-run SMART-missing warning ---
     # If smartctl was discovered missing during this run, emit a visible
