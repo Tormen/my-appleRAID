@@ -513,6 +513,12 @@ for e in d:
 #                                 read-current-first).
 # Logs at info level when a change is made; silent when already in sync.
 # Returns 0 on success or no-op, 1 on update failure.
+# Per-set override file. Written by 'autorebuild <set> on|off' to
+# record an explicit user choice that the daemon's enforcement must
+# respect. Cleared by 'autorebuild <set> reset' (or by the user
+# manually rm-ing the file).
+ar_override_file() { echo "${STATE_DIR}/ar-override-$1"; }
+
 enforce_default_ar_for_uuid() {
     uuid="$1"
     [ -n "$uuid" ] || return 0
@@ -525,6 +531,15 @@ enforce_default_ar_for_uuid() {
             return 0
             ;;
     esac
+    # User-explicit override: if 'autorebuild <set> on|off' wrote an
+    # override file for this set, respect it - the daemon must NOT
+    # silently revert what the user explicitly chose. The user can
+    # remove the override with 'autorebuild <set> reset'.
+    _ovr_file=$(ar_override_file "$uuid")
+    if [ -f "$_ovr_file" ]; then
+        log_debug "  $uuid: skipping enforcement - per-set override in effect (run 'autorebuild $uuid reset' to clear)"
+        return 0
+    fi
     current=$(raid_ar_get "$uuid")
     if [ "$current" = "$target" ]; then
         log_debug "  $uuid: AutoRebuild already $target (no change)"
@@ -8258,6 +8273,20 @@ ARGUMENTS
   <mode>            One of (case-insensitive):
                       on  | automatic | auto | 1   ->  AutoRebuild=1
                       off | manual    | man  | 0   ->  AutoRebuild=0
+                      reset | default                 clear per-set override
+                                                      (re-enable DEFAULT_AUTO_REBUILD
+                                                      enforcement for this set)
+
+PER-SET OVERRIDE
+  Setting <mode> on or off records a per-set override file in the state
+  directory. This is what stops the health daemon's DEFAULT_AUTO_REBUILD
+  enforcement from silently reverting your explicit choice on the next
+  pass. The override stays in effect until you run
+
+      $SCRIPT_NAME autorebuild <set> reset
+
+  ('autorebuild' with no args shows an OVERRIDE column in its table so
+  you can see at a glance which sets are user-pinned vs daemon-managed.)
 
 EXAMPLES
   $SCRIPT_NAME autorebuild                  # this help + table of all sets
@@ -8267,6 +8296,7 @@ EXAMPLES
   $SCRIPT_NAME autorebuild weg 1            # numeric form
   $SCRIPT_NAME autorebuild 0 weg            # numeric, args swapped
   $SCRIPT_NAME autorebuild backup off
+  $SCRIPT_NAME autorebuild weg reset        # clear weg's override
 
 TRADE-OFF
   Empirical real-disk testing shows AutoRebuild is the ONLY knob that
@@ -8309,6 +8339,9 @@ cmd_autorebuild() {
             # for off/on so the user can use whichever feels natural.
             on|ON|automatic|AUTOMATIC|auto|AUTO|1)         arg_mode="on"  ;;
             off|OFF|manual|MANUAL|man|MAN|0)               arg_mode="off" ;;
+            # 'reset' clears any per-set user override so the daemon's
+            # DEFAULT_AUTO_REBUILD enforcement applies again.
+            reset|RESET|default|DEFAULT)                   arg_mode="reset" ;;
             -*) warn "Unknown option: $1" ;;
             *)
                 if [ -z "$arg_set" ]; then arg_set="$1"
@@ -8326,9 +8359,9 @@ cmd_autorebuild() {
     if [ -z "$arg_set" ]; then
         _autorebuild_help
         echo
-        # Table of every set with current AutoRebuild.
-        printf '%s%-22s %-8s %-36s %-12s%s\n' \
-            "${C_BOLD}" "NAME" "STATUS" "UUID" "AutoRebuild" "${C_RESET}"
+        # Table of every set with current AutoRebuild + override flag.
+        printf '%s%-22s %-8s %-36s %-12s %-10s%s\n' \
+            "${C_BOLD}" "NAME" "STATUS" "UUID" "AutoRebuild" "OVERRIDE" "${C_RESET}"
         for u in $(raid_list_uuids 2>/dev/null); do
             n=$(diskutil appleRAID list "$u" 2>/dev/null \
                 | awk -F': +' '/^Name:/ {v=$2; sub(/[[:space:]]+$/,"",v); print v; exit}')
@@ -8339,13 +8372,19 @@ cmd_autorebuild() {
                 0) ar="manual" ;;
                 *) ar="?"      ;;
             esac
-            printf '  %-22s %-8s %-36s %-12s\n' "$n" "$st" "$u" "$ar"
+            ovr_marker="-"
+            [ -f "$(ar_override_file "$u")" ] && ovr_marker="user-set"
+            printf '  %-22s %-8s %-36s %-12s %-10s\n' \
+                "$n" "$st" "$u" "$ar" "$ovr_marker"
         done
         echo
         if [ -n "${DEFAULT_AUTO_REBUILD:-}" ]; then
-            info "Effective DEFAULT_AUTO_REBUILD config: $DEFAULT_AUTO_REBUILD (sets that drift will be re-applied on next list/health run)."
+            info "Effective DEFAULT_AUTO_REBUILD config: $DEFAULT_AUTO_REBUILD"
+            info "  Sets without an OVERRIDE will be re-applied on the next list/health run."
+            info "  Sets with OVERRIDE='user-set' keep their explicit value (the daemon will"
+            info "  not revert it). Run 'autorebuild <set> reset' to clear an override."
         else
-            info "DEFAULT_AUTO_REBUILD is empty - no automatic enforcement; sets will keep whatever AutoRebuild value they have."
+            info "DEFAULT_AUTO_REBUILD is empty - no automatic enforcement; sets keep their AutoRebuild as-is."
         fi
         return 0
     fi
@@ -8364,10 +8403,28 @@ cmd_autorebuild() {
     cur_word="manual"
     [ "$cur" = "1" ] && cur_word="auto"
 
+    # 'reset' clears the per-set override so the daemon's
+    # DEFAULT_AUTO_REBUILD enforcement applies again to this set.
+    if [ "$arg_mode" = "reset" ]; then
+        ovr=$(ar_override_file "$uuid")
+        if [ -f "$ovr" ]; then
+            run rm -f "$ovr" \
+                || die "Failed to remove override file: $ovr"
+            ok "Per-set AutoRebuild override cleared on '$name'."
+            info "DEFAULT_AUTO_REBUILD enforcement will re-apply on the next list/health pass."
+        else
+            info "No per-set override is set on '$name' (nothing to clear)."
+        fi
+        return 0
+    fi
+
     # Per-set mode without explicit on/off: show + prompt.
     if [ -z "$arg_mode" ]; then
         step "AutoRebuild for set '$name' ($uuid)"
         info "Current value: $cur_word ($cur)"
+        if [ -f "$(ar_override_file "$uuid")" ]; then
+            info "Per-set override is currently in effect (daemon will not revert)."
+        fi
         echo
         if [ "$cur_word" = "manual" ]; then
             confirm "Switch to AUTOMATIC (recommended)?" || { info "No change."; return 0; }
@@ -8382,11 +8439,21 @@ cmd_autorebuild() {
     case "$(printf '%s' "$arg_mode" | tr '[:upper:]' '[:lower:]')" in
         on)  target=1; word="automatic" ;;
         off) target=0; word="manual"    ;;
-        *)   die "Unknown mode '$arg_mode' (expected on or off)" ;;
+        *)   die "Unknown mode '$arg_mode' (expected on, off, or reset)" ;;
     esac
 
+    # Persist the user's explicit choice as a per-set override BEFORE
+    # the diskutil call. This way, even if the daemon's next pass
+    # sneaks in between this update and the user's next inspection,
+    # it sees the override and skips the revert. Make sure STATE_DIR
+    # exists first so the touch won't silently fail when the daemon
+    # has never run.
+    mkdir -p "${STATE_DIR:-/tmp}" 2>/dev/null || true
+    printf '%s\n' "$target" > "$(ar_override_file "$uuid")" 2>/dev/null \
+        || warn "Could not write override file at $(ar_override_file "$uuid") - daemon may revert this change on the next pass."
+
     if [ "$cur" = "$target" ]; then
-        ok "AutoRebuild already $word on '$name'. No change."
+        ok "AutoRebuild already $word on '$name'. (Override file refreshed.)"
         return 0
     fi
 
@@ -8397,6 +8464,9 @@ cmd_autorebuild() {
         [ "$new" = "1" ] && new_word="auto"
         if [ "$new" = "$target" ]; then
             ok "AutoRebuild is now $word on '$name'."
+            info "Per-set override recorded ($(ar_override_file "$uuid"))."
+            info "  Daemon will respect this until you run:"
+            info "    $SCRIPT_NAME autorebuild $name reset"
         else
             warn "diskutil reported success but ioreg shows AutoRebuild=$new_word."
         fi
