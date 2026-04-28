@@ -8240,22 +8240,15 @@ EOF
 # physical-disconnect behavior. See README "Empirically-verified
 # AppleRAID behavior" section. SetTimeout is displayed read-only in
 # `status`.)
-cmd_autorebuild() {
-    eval "$(parse_global_flags "$@")"
-
-    arg_set=""
-    arg_mode=""
-    while [ $# -gt 0 ]; do
-        case "$1" in
-            -h|--help)
-                cat <<EOF
+_autorebuild_help() {
+    cat <<EOF
 Usage: $SCRIPT_NAME autorebuild [<set>] [<mode>]
        $SCRIPT_NAME autorebuild [<mode>] [<set>]
 
-  (no args)         Print an explainer about AutoRebuild + show every
-                    set's current AutoRebuild value. Read-only, no prompts.
-  <set>             Show the named set's current AutoRebuild; prompt yes/no
-                    to flip it. Requires sudo for the update.
+  (no args)         Print this help text + show every set's current
+                    AutoRebuild value (table at the bottom). Read-only.
+  <set>             Show the named set's current AutoRebuild; prompt
+                    yes/no to flip it. Requires sudo for the update.
   <set> <mode>      Set AutoRebuild non-interactively.
   <mode> <set>      Same; the two positional args are order-independent.
 
@@ -8267,7 +8260,7 @@ ARGUMENTS
                       off | manual    | man  | 0   ->  AutoRebuild=0
 
 EXAMPLES
-  $SCRIPT_NAME autorebuild                  # explainer + table of all sets
+  $SCRIPT_NAME autorebuild                  # this help + table of all sets
   $SCRIPT_NAME autorebuild weg              # show + interactive prompt
   $SCRIPT_NAME autorebuild weg on           # set weg's AR to automatic (1)
   $SCRIPT_NAME autorebuild on weg           # same, args swapped
@@ -8298,6 +8291,17 @@ NOTE
   is intentionally not managed by this command. Apple's default is 30s;
   see '$SCRIPT_NAME status <set>' for the current value.
 EOF
+}
+
+cmd_autorebuild() {
+    eval "$(parse_global_flags "$@")"
+
+    arg_set=""
+    arg_mode=""
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -h|--help)
+                _autorebuild_help
                 return 0
                 ;;
             -V|--verbose|-D|--debug) ;;
@@ -8316,40 +8320,12 @@ EOF
 
     cfg_load 2>/dev/null
 
-    # No-args mode: explainer + table of all sets.
+    # No-args mode: print the same help text the user gets from
+    # 'my-appleRAID autorebuild --help', then append the per-set
+    # table at the bottom. Single source of truth for the wording.
     if [ -z "$arg_set" ]; then
-        cat <<'EOF'
-
-=== AutoRebuild explainer ===
-
-AppleRAID has TWO per-set parameters: AutoRebuild and SetTimeout.
-
-* AutoRebuild (this command):
-    automatic (1) - When a temporarily-missing member returns, the
-                    kernel auto-starts a FULL rebuild on it. The
-                    member transitions Failed -> Rebuilding -> Online.
-                    Takes hours per TB (block-by-block; AppleRAID
-                    has no incremental resync mechanism).
-    manual    (0) - The returning member stays in 'Failed' status
-                    until you run '$SCRIPT_NAME repair' manually.
-
-* SetTimeout (NOT managed by this command, displayed in 'status'):
-    The kernel's "patience window" before declaring a missing member
-    failed. Apple's default is 30s. EMPIRICAL FINDING: changing this
-    has NO observable effect on clean physical disconnects of the
-    enclosures we've tested - the kernel transitions to Degraded
-    immediately and a returning member is treated as failed
-    regardless of how long it was missing. We don't write this field.
-
-The script's DEFAULT_AUTO_REBUILD config controls automatic enforcement
-of AutoRebuild on every set the script touches (create / health / list
-calls). Default value: 0 (force AutoRebuild=manual; you get a hard, persistent
-alert when a member fails - the set stays Degraded with a Failed
-member visibly until you run 'repair'). Flip to 1 if you'd rather
-the kernel auto-rebuild silently; the health daemon will still
-email on every transition and every 6h during the rebuild.
-
-EOF
+        _autorebuild_help
+        echo
         # Table of every set with current AutoRebuild.
         printf '%s%-22s %-8s %-36s %-12s%s\n' \
             "${C_BOLD}" "NAME" "STATUS" "UUID" "AutoRebuild" "${C_RESET}"
