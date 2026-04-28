@@ -6757,19 +6757,35 @@ EOF
 # Subcommand: watch
 # ----------------------------------------------------------------------
 cmd_watch() {
+    target=""
+    target_label=""
     if [ $# -ge 1 ]; then
-        target="$1"
-    else
-        target=""
+        arg="$1"
+        # 'diskutil appleRAID list <name>' rejects names; only UUIDs
+        # work for the per-set view. Resolve name -> UUID up front.
+        for u in $(raid_list_uuids 2>/dev/null); do
+            [ "$u" = "$arg" ] && target="$u" && break
+        done
+        [ -z "$target" ] && target=$(raid_name_to_uuid "$arg")
+        if [ -z "$target" ]; then
+            die "No RAID set matches '$arg'."
+        fi
+        target_label="$arg"
     fi
     info "Refreshing every 10 seconds. Press Ctrl-C to stop."
     sleep 1
     while true; do
         clear 2>/dev/null || printf '\033[2J\033[H'
-        printf '%s[%s] AppleRAID status%s\n' "${C_BOLD}" "$(date '+%Y-%m-%d %H:%M:%S')" "${C_RESET}"
+        if [ -n "$target" ]; then
+            printf '%s[%s] AppleRAID status: %s%s\n' \
+                "${C_BOLD}" "$(date '+%Y-%m-%d %H:%M:%S')" "$target_label" "${C_RESET}"
+        else
+            printf '%s[%s] AppleRAID status%s\n' \
+                "${C_BOLD}" "$(date '+%Y-%m-%d %H:%M:%S')" "${C_RESET}"
+        fi
         echo
         if [ -n "$target" ]; then
-            diskutil appleRAID list "$target" 2>&1 || diskutil appleRAID list 2>&1
+            diskutil appleRAID list "$target" 2>&1
         else
             diskutil appleRAID list 2>&1
         fi
@@ -7983,10 +7999,21 @@ cmd_repair() {
     run sudo diskutil appleRAID add member "$dev" "$SELECTED_UUID" \
         || die "add member failed"
 
+    # Post-repair: friendly compact view of the just-repaired set.
+    # Raw 'diskutil appleRAID list <uuid>' dump gated behind -V.
     step "Step 4: post-repair status"
-    run diskutil appleRAID list "$SELECTED_UUID"
+    _post_name=$(diskutil appleRAID list "$SELECTED_UUID" 2>/dev/null \
+        | awk -F': +' '/^Name:/ {v=$2; sub(/[[:space:]]+$/,"",v); print v; exit}')
+    if [ -n "$_post_name" ]; then
+        cmd_list "$_post_name"
+    fi
+    if [ "$VERBOSE" = "1" ]; then
+        echo
+        step "Verbose: diskutil appleRAID list $SELECTED_UUID"
+        run diskutil appleRAID list "$SELECTED_UUID"
+    fi
     echo
-    ok "Repair started. Monitor with:  $SCRIPT_NAME watch $SELECTED_UUID"
+    ok "Repair started. Monitor with:  $SCRIPT_NAME watch ${_post_name:-$SELECTED_UUID}"
 
     # Print a size-aware rebuild-time estimate. The empirical sustained
     # rate for AppleRAID Mirror rebuild on healthy SATA drives is ~200
@@ -8649,8 +8676,19 @@ EOF
         fi
     fi
 
+    # Post-rename: friendly compact view of just the renamed set.
+    # Raw diskutil dump gated behind -V.
     step "Post-rename state"
-    run diskutil appleRAID list "$SELECTED_UUID"
+    _new_name=$(diskutil appleRAID list "$SELECTED_UUID" 2>/dev/null \
+        | awk -F': +' '/^Name:/ {v=$2; sub(/[[:space:]]+$/,"",v); print v; exit}')
+    if [ -n "$_new_name" ]; then
+        cmd_list "$_new_name"
+    fi
+    if [ "$VERBOSE" = "1" ]; then
+        echo
+        step "Verbose: diskutil appleRAID list $SELECTED_UUID"
+        run diskutil appleRAID list "$SELECTED_UUID"
+    fi
 
     # Keep baseline in sync if REQUIRED_SETS=all / auto-baseline is on.
     # Without this, the health daemon would alert for a missing set
@@ -8685,8 +8723,23 @@ cmd_destroy() {
         pick_raid_set
     fi
 
-    step "DESTROY RAID set $SELECTED_UUID"
-    run diskutil appleRAID list "$SELECTED_UUID"
+    # Pre-destroy: friendly compact view of the set about to be
+    # destroyed, by name. Raw 'diskutil appleRAID list <uuid>' dump
+    # gated behind -V so the screen isn't filled with a single set's
+    # extended info before the user even confirms.
+    _name=$(diskutil appleRAID list "$SELECTED_UUID" 2>/dev/null \
+        | awk -F': +' '/^Name:/ {v=$2; sub(/[[:space:]]+$/,"",v); print v; exit}')
+    step "DESTROY RAID set${_name:+ '$_name'} ($SELECTED_UUID)"
+    if [ -n "$_name" ]; then
+        cmd_list "$_name"
+    else
+        cmd_list
+    fi
+    if [ "$VERBOSE" = "1" ]; then
+        echo
+        step "Verbose: diskutil appleRAID list $SELECTED_UUID"
+        run diskutil appleRAID list "$SELECTED_UUID"
+    fi
     echo
     warn "This will delete the RAID set and make the data inaccessible."
     warn "The member disks will become plain disks again (you can reformat/reuse them)."
@@ -8699,9 +8752,21 @@ cmd_destroy() {
     run sudo diskutil appleRAID delete "$SELECTED_UUID" \
         || die "RAID deletion failed"
 
+    # Post-destroy: show the compact summary of remaining sets by
+    # default. Full 'diskutil appleRAID list' + 'diskutil list' dumps
+    # are gated behind -V (they're long enough to bury the rest of
+    # the output, and the destroyed set is gone from both anyway).
     step "Post-destroy state"
-    run diskutil appleRAID list || true
-    run diskutil list
+    cmd_list
+
+    if [ "$VERBOSE" = "1" ]; then
+        echo
+        step "Verbose: full diskutil appleRAID list"
+        run diskutil appleRAID list || true
+        echo
+        step "Verbose: full diskutil list"
+        run diskutil list
+    fi
 
     ok "RAID set $SELECTED_UUID destroyed."
 
