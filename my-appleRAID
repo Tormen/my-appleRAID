@@ -8249,18 +8249,33 @@ cmd_autorebuild() {
         case "$1" in
             -h|--help)
                 cat <<EOF
-Usage: $SCRIPT_NAME autorebuild [<set>] [on|off]
+Usage: $SCRIPT_NAME autorebuild [<set>] [<mode>]
+       $SCRIPT_NAME autorebuild [<mode>] [<set>]
 
-  (no args)             Print an explainer about AutoRebuild + show every
-                        set's current AutoRebuild setting. No prompts, read-only.
-  <set>                 Show the named set's current AutoRebuild; prompt yes/no to
-                        flip it. Requires sudo for the update.
-  <set> on              Set AutoRebuild=automatic non-interactively.
-  <set> off             Set AutoRebuild=manual non-interactively.
+  (no args)         Print an explainer about AutoRebuild + show every
+                    set's current AutoRebuild value. Read-only, no prompts.
+  <set>             Show the named set's current AutoRebuild; prompt yes/no
+                    to flip it. Requires sudo for the update.
+  <set> <mode>      Set AutoRebuild non-interactively.
+  <mode> <set>      Same; the two positional args are order-independent.
 
-<set> can be a UUID or the set's name.
+ARGUMENTS
+  <set>             A RAID set's name (e.g. 'weg', 'backup') or its UUID.
+                    Tip: tab-completion + 'list' to find names quickly.
+  <mode>            One of (case-insensitive):
+                      on  | automatic | auto | 1   ->  AutoRebuild=1
+                      off | manual    | man  | 0   ->  AutoRebuild=0
 
-Trade-off:
+EXAMPLES
+  $SCRIPT_NAME autorebuild                  # explainer + table of all sets
+  $SCRIPT_NAME autorebuild weg              # show + interactive prompt
+  $SCRIPT_NAME autorebuild weg on           # set weg's AR to automatic (1)
+  $SCRIPT_NAME autorebuild on weg           # same, args swapped
+  $SCRIPT_NAME autorebuild weg 1            # numeric form
+  $SCRIPT_NAME autorebuild 0 weg            # numeric, args swapped
+  $SCRIPT_NAME autorebuild backup off
+
+TRADE-OFF
   Empirical real-disk testing shows AutoRebuild is the ONLY knob that
   controls what happens when a temporarily-missing member returns.
     on  (automatic) - kernel auto-rebuilds (Failed -> Rebuilding ->
@@ -8273,19 +8288,23 @@ Trade-off:
                       full rebuild, just at your discretion). Persistent
                       visible Degraded+Failed state until you act.
 
-The script's default is OFF (DEFAULT_AUTO_REBUILD=0) - hard-alert
-behavior. Flip to ON if you'd rather have silent self-healing while
-trusting the daemon's emails to surface incidents.
+  The script's default is OFF (DEFAULT_AUTO_REBUILD=0) - hard-alert
+  behavior. Flip to ON if you'd rather have silent self-healing while
+  trusting the daemon's emails to surface incidents.
 
-Note: SetTimeout (also a per-set parameter) has NO observable runtime
-effect for clean physical disconnects on the enclosures we tested. It
-is intentionally not managed by this command. Apple's default is 30s;
-see '$SCRIPT_NAME status <set>' for the current value.
+NOTE
+  SetTimeout (the other per-set parameter) has NO observable runtime
+  effect for clean physical disconnects on the enclosures we tested. It
+  is intentionally not managed by this command. Apple's default is 30s;
+  see '$SCRIPT_NAME status <set>' for the current value.
 EOF
                 return 0
                 ;;
             -V|--verbose|-D|--debug) ;;
-            on|off|ON|OFF) arg_mode="$1" ;;
+            # Mode synonyms (case-insensitive). 0/1 forms are aliases
+            # for off/on so the user can use whichever feels natural.
+            on|ON|automatic|AUTOMATIC|auto|AUTO|1)         arg_mode="on"  ;;
+            off|OFF|manual|MANUAL|man|MAN|0)               arg_mode="off" ;;
             -*) warn "Unknown option: $1" ;;
             *)
                 if [ -z "$arg_set" ]; then arg_set="$1"
