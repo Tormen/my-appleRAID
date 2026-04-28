@@ -7424,6 +7424,8 @@ cmd_create() {
 
     if [ "${_PRECONFIRMED:-0}" = "1" ]; then
         info "Pre-confirmed by caller (e.g. migrate-softraid); skipping inner confirmation."
+    elif [ "$force" = "1" ]; then
+        info "--force already confirmed the destructive release step; skipping redundant confirmation."
     else
         confirm "PROCEED? This erases BOTH disks." || die "Aborted."
     fi
