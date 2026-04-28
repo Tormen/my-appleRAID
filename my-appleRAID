@@ -5501,6 +5501,14 @@ ${C_BOLD}COMMANDS${C_RESET}
                               REFUSES (the kernel claim blocks it). Pass
                               --release to ALSO break it from the set
                               (DESTRUCTIVE: set goes Degraded).
+  ${C_CYAN}release${C_RESET} <disk> [<disk>...]    Release one or more disks from the AppleRAID
+                              set(s) that currently claim them, WITHOUT
+                              ejecting. Same underlying logic as
+                              'eject --release' and 'create --force':
+                              if other members survive, the set stays
+                              alive (Degraded); if all members are
+                              released, the set is deleted. Confirms
+                              before any destructive action.
   ${C_CYAN}smart${C_RESET} [<disk>]                Detailed SMART drill-down for one disk:
                               overall health, pre-failure attributes (with
                               non-zero "killer" highlight), self-test log,
@@ -6971,44 +6979,21 @@ EOF
         die "$dev is an INTERNAL disk - refusing to eject (would take down macOS)."
     fi
 
-    # Detect if this disk is a member of an existing AppleRAID set, and
-    # if so capture the set name + UUID, member UUID, and member partition
-    # node (e.g. disk7s2). We need all four to call
-    # 'diskutil appleRAID remove <member-uuid> <set-uuid>', which is the
-    # only way to release the disk: AppleRAID claims members at the
-    # kernel level so 'diskutil eject' fails while membership is live.
-    raid_info=$(diskutil appleRAID list 2>/dev/null | awk -F': +' -v d="$short" '
-        /^Name:/         { setname = $2; sub(/[[:space:]]+$/, "", setname) }
-        /^Unique ID:/    { setuuid = $2; sub(/[[:space:]]+$/, "", setuuid) }
-        /^[[:space:]]*[0-9]+[[:space:]]+disk[0-9]+/ {
-            n = split($0, p, /[[:space:]]+/)
-            j = 0
-            for (i = 1; i <= n; i++) {
-                if (p[i] != "") {
-                    j++
-                    if (j == 2) devnode = p[i]
-                    if (j == 3) muuid   = p[i]
-                }
-            }
-            base = devnode; sub(/s[0-9]+$/, "", base)
-            if (base == d) {
-                printf "%s|%s|%s|%s\n", setname, setuuid, muuid, devnode
-                exit
-            }
-        }
-    ')
-    raid_set_name=$(   echo "$raid_info" | cut -d'|' -f1)
-    raid_set_uuid=$(   echo "$raid_info" | cut -d'|' -f2)
-    raid_member_uuid=$(echo "$raid_info" | cut -d'|' -f3)
-    raid_member_part=$(echo "$raid_info" | cut -d'|' -f4)
+    # Quick membership check: is $dev a member of any AppleRAID set?
+    is_raid_member=0
+    if diskutil appleRAID list 2>/dev/null \
+         | awk '/^[0-9-]+[ \t]+disk/ {print $2}' \
+         | sed 's/s[0-9]*$//' \
+         | grep -qx "$short"; then
+        is_raid_member=1
+    fi
 
     step "Eject plan for $dev"
     describe_disk "$dev"
     release_from_raid=0
-    if [ -n "$raid_set_name" ]; then
+    if [ "$is_raid_member" = "1" ]; then
         if [ "$do_release" = "0" ]; then
-            err "$dev is an active member of AppleRAID set '$raid_set_name'"
-            err "  ($raid_member_part, member-uuid $raid_member_uuid)."
+            err "$dev is an active member of an AppleRAID set."
             echo
             explain "Plain eject won't work: AppleRAID claims member disks at the"
             explain "kernel level, so 'diskutil eject' fails while the membership"
@@ -7026,21 +7011,10 @@ EOF
             explain "    this disk later requires a full rebuild via 'repair'."
             die "Aborted - 'eject' alone won't release a RAID member."
         fi
-        warn "$dev is a member of AppleRAID set '$raid_set_name'."
-        warn "  Set UUID:    $raid_set_uuid"
-        warn "  Member:      $raid_member_part  ($raid_member_uuid)"
-        echo
-        explain "--release was specified, so we'll release the kernel claim before"
-        explain "ejecting. Plan if you confirm:"
-        explain "  1. sudo diskutil unmountDisk force $dev"
-        explain "  2. sudo diskutil appleRAID remove $raid_member_uuid $raid_set_uuid"
-        explain "     (set '$raid_set_name' goes DEGRADED here)"
-        explain "  3. diskutil eject $dev"
-        explain ""
-        explain "After swapping the disk, rebuild with:  $SCRIPT_NAME repair $raid_set_name"
-        echo
-        confirm "Release $dev from set '$raid_set_name' (set will go Degraded) and eject?" \
-            || die "Aborted."
+        # Delegate the release step to the shared helper used by
+        # 'cmd_release' and 'cmd_create --force'. Same plan + confirm
+        # logic across all three entry points.
+        release_disks_from_existing_raids "$dev"
         release_from_raid=1
     fi
 
@@ -7048,20 +7022,9 @@ EOF
     run sudo diskutil unmountDisk force "$dev" \
         || warn "unmountDisk returned non-zero (may be already unmounted)"
 
-    if [ "$release_from_raid" = "1" ]; then
-        step "Removing $raid_member_part from AppleRAID set '$raid_set_name'"
-        explain "'diskutil appleRAID remove <member-uuid> <set-uuid>' releases the disk"
-        explain "from the kernel-level RAID claim. Set goes DEGRADED."
-        if ! run sudo diskutil appleRAID remove "$raid_member_uuid" "$raid_set_uuid"; then
-            err "appleRAID remove failed."
-            explain "Possible reasons:"
-            explain "  - The set is currently rebuilding; wait for it to finish."
-            explain "  - macOS refused to remove the last viable member of the set."
-            explain "  - The member UUID changed since this run started. Verify with:"
-            explain "      diskutil appleRAID list $raid_set_uuid"
-            exit 1
-        fi
-    fi
+    # The release helper above (when --release was passed) has already
+    # done the diskutil-appleRAID-remove step; we don't need a separate
+    # release block before the spin-down.
 
     # Issue STANDBY IMMEDIATE via smartctl. macOS 'diskutil eject' is
     # unreliable about spinning the platter down: it returns success
@@ -7101,17 +7064,17 @@ EOF
         ok "$dev ejected. Safe to disconnect."
         if [ "$release_from_raid" = "1" ]; then
             echo
-            info "Set '$raid_set_name' is now DEGRADED."
-            info "After connecting a replacement (or this same disk back),"
-            info "rebuild with:  $SCRIPT_NAME repair $raid_set_name"
+            info "The disk has been released from its AppleRAID set."
+            info "After connecting a replacement (or the same disk back),"
+            info "rebuild with:  $SCRIPT_NAME repair <set>"
         fi
     else
         err "diskutil eject failed for $dev."
         explain "Possible reasons:"
         explain "  - A process is still holding files open on a volume on $dev."
         explain "    Try: lsof +D /Volumes/<name>  (or 'sudo lsof' for system processes)"
-        if [ -n "$raid_set_name" ] && [ "$release_from_raid" != "1" ]; then
-            explain "  - $dev is still a member of AppleRAID set '$raid_set_name'."
+        if [ "$is_raid_member" = "1" ] && [ "$release_from_raid" != "1" ]; then
+            explain "  - $dev is still a member of an AppleRAID set."
             explain "    To release + eject, run:  $SCRIPT_NAME eject $short --release"
             explain "    (DESTRUCTIVE: the set will go Degraded.)"
         fi
@@ -7120,6 +7083,91 @@ EOF
         explain "  - macOS refused due to a pending I/O operation. Wait a few seconds and retry."
         exit 1
     fi
+}
+
+# ----------------------------------------------------------------------
+# Subcommand: release
+# ----------------------------------------------------------------------
+# Release one or more disks from any AppleRAID set that currently
+# claims them, WITHOUT ejecting / unmounting the disk. Thin wrapper
+# around the same release_disks_from_existing_raids helper used by
+# 'cmd_create --force' and 'cmd_eject --release', so all three entry
+# points share semantics:
+#
+#   - If the set has OTHER members (not all are targets): just remove
+#     the target member; set stays alive (Degraded with the survivors).
+#   - If all members of the set are targets: delete the set.
+#
+# Confirms before any destructive action.
+cmd_release() {
+    eval "$(parse_global_flags "$@")"
+
+    args=""
+    for a in "$@"; do
+        case "$a" in
+            -h|--help)
+                cat <<EOF
+Usage: $SCRIPT_NAME release <disk> [<disk>...]
+
+Release one or more disks from the AppleRAID set(s) that currently
+claim them. The disks become free for any other use; the set stays
+alive (Degraded) for any members that were NOT released, and is
+deleted only if every one of its members was released.
+
+This is the underlying step used by:
+  - 'eject <disk> --release'   (release + unmount + spin-down + eject)
+  - 'create <name> <N1> <N2> --force'  (release + create new mirror)
+
+DESTRUCTIVE: the data on the released disk's side of the mirror is
+lost. Data on the surviving members is preserved.
+
+EXAMPLES
+  $SCRIPT_NAME release 7
+  $SCRIPT_NAME release disk7
+  $SCRIPT_NAME release /dev/disk7
+  $SCRIPT_NAME release 7 8           # release both
+EOF
+                return 0
+                ;;
+            -V|--verbose|-D|--debug) ;;
+            -*) warn "Unknown option: $a" ;;
+            *)  args="$args $a" ;;
+        esac
+    done
+    # shellcheck disable=SC2086
+    set -- $args
+
+    [ $# -ge 1 ] || die "Usage: $SCRIPT_NAME release <disk> [<disk>...]"
+
+    devs=""
+    for arg in "$@"; do
+        d=$(resolve_disk "$arg") || die "Invalid disk spec: $arg"
+        assert_whole_disk "$d"
+        devs="$devs $d"
+    done
+
+    # Pre-check: do any of these actually need releasing? If not,
+    # exit early with an explanatory message instead of a confusing
+    # silent no-op.
+    any_member=0
+    for d in $devs; do
+        short="${d#/dev/}"
+        if diskutil appleRAID list 2>/dev/null \
+            | awk '/^[0-9-]+[ \t]+disk/ {print $2}' \
+            | sed 's/s[0-9]*$//' \
+            | grep -qx "$short"; then
+            any_member=1
+            break
+        fi
+    done
+    if [ "$any_member" = "0" ]; then
+        info "None of the specified disks are members of an AppleRAID set."
+        info "Nothing to release."
+        return 0
+    fi
+
+    # shellcheck disable=SC2086
+    release_disks_from_existing_raids $devs
 }
 
 # ----------------------------------------------------------------------
@@ -8596,6 +8644,7 @@ _my-appleRAID() {
         'watch:Live-refreshing status'
         'blink:Pulse a disk activity LED to identify the physical drive'
         'eject:Unmount + spin-down + power off (refuses RAID members; --release to also break from set)'
+        'release:Release one or more disks from their AppleRAID set without ejecting'
         'smart:Detailed SMART drill-down for one disk (history + error log + self-tests)'
         'wipe:Zero first + last 100 MB of /dev/diskN'
         'verify-wipe:Check that first + last 100 MB are zeros'
@@ -8665,8 +8714,13 @@ _my-appleRAID() {
                         '--release[Also break the disk out of its AppleRAID set (DESTRUCTIVE: set goes Degraded)]' \
                         '*: :_message "disk number (e.g. 3 for /dev/disk3)"'
                     ;;
+                release)
+                    _message 'disk number(s) - one or more (e.g. 3 7)'
+                    ;;
                 create)
-                    _message 'name <N1> <N2>'
+                    _arguments \
+                        '--force[Release target disks from any AppleRAID set that currently claims them, before creating]' \
+                        '*: :_message "name <N1> <N2>"'
                     ;;
                 create-config)
                     _files
@@ -8804,7 +8858,7 @@ main() {
         case "$2" in
             -h|--help)
                 case "$1" in
-                    list|disks|status|info|blink|eject|smart|autorebuild|test|rename|baseline|migrate-softraid|release-softraid)
+                    list|disks|status|info|blink|eject|release|smart|autorebuild|test|rename|baseline|migrate-softraid|release-softraid)
                         # Pass through: subcommand handles --help itself.
                         ;;
                     *)
@@ -8830,6 +8884,7 @@ main() {
         watch)              cmd_watch "$@" ;;
         blink)              cmd_blink "$@" ;;
         eject)              cmd_eject "$@" ;;
+        release)            cmd_release "$@" ;;
         smart)              cmd_smart "$@" ;;
         wipe)               cmd_wipe "$@" ;;
         verify-wipe)        cmd_verify_wipe "$@" ;;
