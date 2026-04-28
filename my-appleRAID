@@ -254,11 +254,164 @@ assert_safe_target() {
     # Check if this disk is already a RAID member of any existing set.
     # diskutil appleRAID list reports member DevNodes like 'disk2s2' - we match disk2.
     if diskutil appleRAID list 2>/dev/null \
-         | awk '/^[0-9]+[ \t]+disk/ {print $2}' \
+         | awk '/^[0-9-]+[ \t]+disk/ {print $2}' \
          | sed 's/s[0-9]*$//' \
          | grep -qx "$short"; then
-        die "$dev is currently a member of an existing AppleRAID set. Destroy that set first."
+        # Look up the set name for the diagnostic.
+        _set_name=$(diskutil appleRAID list 2>/dev/null | awk -v d="$short" '
+            /^Name:/      { sub(/^Name:[[:space:]]+/, ""); n = $0; sub(/[[:space:]]+$/, "", n) }
+            /^[0-9-]+[[:space:]]+disk[0-9]+/ {
+                k = split($0, p, /[[:space:]]+/)
+                j = 0
+                for (i = 1; i <= k; i++) if (p[i] != "") { j++; if (j == 2) bsd = p[i] }
+                base = bsd; sub(/s[0-9]+$/, "", base)
+                if (base == d) { print n; exit }
+            }
+        ')
+        err "$dev is currently a member of an existing AppleRAID set${_set_name:+ '$_set_name'}."
+        explain "Two ways to proceed:"
+        explain "  - Destroy the set first:  $SCRIPT_NAME destroy${_set_name:+ '$_set_name'}"
+        explain "  - Re-run 'create' with --force, which will release just the target"
+        explain "    disk(s) from their set and keep the set alive (Degraded with the"
+        explain "    remaining members), or destroy the set only if all of its members"
+        explain "    are among the targets. After a confirmation prompt:"
+        explain "      $SCRIPT_NAME create <name> <N1> <N2> --force"
+        die "Aborted - target disk in use by another set."
     fi
+}
+
+# Free target disks from any AppleRAID set that currently claims them.
+# Called by 'cmd_create' when --force is passed.
+#
+# Two cases per set the target disks belong to:
+#
+#   - Set has OTHER members that are NOT being targeted: just REMOVE
+#     the target disk(s) via 'diskutil appleRAID remove'. The set stays
+#     alive (Degraded with the remaining members) - their data is
+#     preserved. Less destructive.
+#
+#   - All members of the set are target disks (no survivors): DELETE
+#     the entire set via 'diskutil appleRAID delete'. There's no
+#     remaining member to keep the set alive, so 'remove' would just
+#     end up empty. Same end result, cleaner.
+#
+# Both paths are still destructive on the released disks themselves
+# (their Apple_RAID partition is freed; data on the released-disk side
+# of the mirror is lost). The confirmation prompt makes that explicit.
+release_disks_from_existing_raids() {
+    raid_list_text=$(diskutil appleRAID list 2>/dev/null) || return 0
+    [ -n "$raid_list_text" ] || return 0
+
+    # For each target disk, find the (set-uuid, set-name, member-uuid)
+    # tuple identifying its slot in the set. Build a newline-separated
+    # list of "dev|set_uuid|set_name|member_uuid".
+    targets_in_raids=""
+    for _dev in "$@"; do
+        _short="${_dev#/dev/}"
+        _hit=$(printf '%s\n' "$raid_list_text" | awk -v d="$_short" '
+            /^Name:/         { sub(/^Name:[[:space:]]+/, ""); name = $0; sub(/[[:space:]]+$/, "", name) }
+            /^Unique ID:/    { sub(/^Unique ID:[[:space:]]+/, ""); uuid = $0; sub(/[[:space:]]+$/, "", uuid) }
+            /^[0-9-]+[[:space:]]+disk[0-9]+/ {
+                k = split($0, p, /[[:space:]]+/)
+                j = 0
+                for (i = 1; i <= k; i++) if (p[i] != "") {
+                    j++
+                    if (j == 2) bsd   = p[i]
+                    if (j == 3) muuid = p[i]
+                }
+                base = bsd; sub(/s[0-9]+$/, "", base)
+                if (base == d) { printf "%s|%s|%s\n", uuid, name, muuid; exit }
+            }
+        ')
+        if [ -n "$_hit" ]; then
+            targets_in_raids="${targets_in_raids}${_dev}|${_hit}
+"
+        fi
+    done
+    [ -n "$targets_in_raids" ] || return 0
+
+    # How many members each affected set has TOTAL, so we can decide
+    # delete-vs-remove per set.
+    set_total_count=$(printf '%s\n' "$raid_list_text" | awk '
+        /^Unique ID:/ { sub(/^Unique ID:[[:space:]]+/, ""); uuid = $0; sub(/[[:space:]]+$/, "", uuid); cnt[uuid] = 0 }
+        /^[0-9-]+[[:space:]]+disk[0-9]+/ { if (uuid != "") cnt[uuid]++ }
+        END { for (u in cnt) print cnt[u] " " u }
+    ')
+
+    # How many of each set's members are target disks.
+    set_target_count=$(printf '%s\n' "$targets_in_raids" \
+        | awk -F'|' 'NF>0 {print $2}' | sort | uniq -c \
+        | awk '{print $1, $2}')
+
+    # Classify per row: remove vs delete.
+    members_to_remove=""
+    sets_to_delete=""
+    while IFS='|' read -r _dev _suuid _sname _muuid; do
+        [ -n "$_dev" ] || continue
+        _tcount=$(printf '%s\n' "$set_target_count" | awk -v u="$_suuid" '$2==u {print $1; exit}')
+        _ncount=$(printf '%s\n' "$set_total_count"  | awk -v u="$_suuid" '$2==u {print $1; exit}')
+        if [ -n "$_tcount" ] && [ -n "$_ncount" ] \
+           && [ "$_tcount" -ge "$_ncount" ] 2>/dev/null; then
+            # No survivors will remain - delete the set.
+            _entry="${_suuid}|${_sname}"
+            if ! printf '%s' "$sets_to_delete" | grep -qxF "$_entry"; then
+                sets_to_delete="${sets_to_delete}${_entry}
+"
+            fi
+        else
+            # Survivors remain - remove just this member.
+            members_to_remove="${members_to_remove}${_dev}|${_suuid}|${_sname}|${_muuid}
+"
+        fi
+    done <<EOF
+$targets_in_raids
+EOF
+
+    # Plan + confirm.
+    warn "--force: existing AppleRAID configuration will be modified:"
+    if [ -n "$members_to_remove" ]; then
+        warn "  Disks to be REMOVED from their set (set stays alive, becomes Degraded):"
+        while IFS='|' read -r _d _u _n _m; do
+            [ -n "$_d" ] || continue
+            warn "    - $_d  (member $_m of set '$_n')"
+        done <<EOF
+$members_to_remove
+EOF
+    fi
+    if [ -n "$sets_to_delete" ]; then
+        warn "  Sets to be DESTROYED entirely (all members are among the targets):"
+        while IFS='|' read -r _u _n; do
+            [ -n "$_u" ] || continue
+            warn "    - '$_n' ($_u)"
+        done <<EOF
+$sets_to_delete
+EOF
+    fi
+    echo
+    explain "Data on the released disks themselves will be lost; data on any"
+    explain "surviving members of degraded-but-kept sets is PRESERVED."
+    confirm "PROCEED?" || die "Aborted."
+
+    # Execute: removes first, then deletes.
+    while IFS='|' read -r _d _u _n _m; do
+        [ -n "$_d" ] || continue
+        step "Removing $_d (member $_m) from set '$_n'"
+        run sudo diskutil appleRAID remove "$_m" "$_u" \
+            || die "Failed to remove $_d from '$_n' - cannot proceed."
+        ok "$_d released; set '$_n' is now Degraded but alive."
+    done <<EOF
+$members_to_remove
+EOF
+
+    while IFS='|' read -r _u _n; do
+        [ -n "$_u" ] || continue
+        step "Destroying set '$_n' ($_u) - no surviving members"
+        run sudo diskutil appleRAID delete "$_u" \
+            || die "Failed to delete '$_n' - cannot proceed."
+        ok "Set '$_n' destroyed."
+    done <<EOF
+$sets_to_delete
+EOF
 }
 
 # Print a one-line summary for a disk.
@@ -5317,16 +5470,23 @@ ${C_BOLD}COMMANDS${C_RESET}
                                            ROT TRIM PROTOCOL
                                 -D         full 'diskutil list' output
   ${C_CYAN}info${C_RESET} [name|uuid] [-V]       Synonym for 'status'.
-  ${C_CYAN}create${C_RESET} <name> <N1> <N2> [--wipe|--no-wipe]
+  ${C_CYAN}create${C_RESET} <name> <N1> <N2> [--force]
                               Create a new APFS mirror from two disk NUMBERS
                               (e.g. '${SCRIPT_NAME} create BackupGold 2 3').
                               Pre-wipes a disk (first + last 100 MB) ONLY when
-                              SoftRAID metadata is detected on it - SoftRAID's
-                              on-disk signature is sticky and 'diskutil appleRAID
-                              create' will not clear it. For other disks, no
-                              pre-wipe is done; diskutil repartitions them as
-                              part of normal create. --wipe forces the explicit
-                              wipe on both disks; --no-wipe skips it on both.
+                              SoftRAID metadata is detected on it (auto, per
+                              disk - SoftRAID's signature is sticky and
+                              'diskutil appleRAID create' will not clear it).
+                              For other disks, no pre-wipe; diskutil repartitions
+                              them as part of normal create.
+                                --force  Release the target disk(s) from any
+                                         AppleRAID set that currently claims
+                                         them. Per disk: 'remove' the member
+                                         (set stays Degraded with surviving
+                                         members), or 'delete' the entire set
+                                         only if all of its members are among
+                                         the targets. Confirms before any
+                                         destructive action.
   ${C_CYAN}blink${C_RESET} [<disk>]                Pulse a disk's activity LED so you can
                               identify which physical drive (or enclosure
                               slot) maps to a /dev/diskN before yanking it.
@@ -7120,20 +7280,21 @@ cmd_verify_wipe() {
 # Subcommand: create
 # ----------------------------------------------------------------------
 cmd_create() {
-    # Optional flags: --wipe / --no-wipe override the auto-detection.
-    force_wipe=""
+    # Optional flag: --force destroys any existing AppleRAID set that
+    # currently claims one of the target disks, freeing the disk for
+    # use as a member of the NEW set.
+    force=0
     args=""
     for a in "$@"; do
         case "$a" in
-            --wipe)    force_wipe=1 ;;
-            --no-wipe) force_wipe=0 ;;
+            --force)   force=1 ;;
             *)         args="$args $a" ;;
         esac
     done
     # shellcheck disable=SC2086
     set -- $args
 
-    [ $# -ge 3 ] || die "Usage: $SCRIPT_NAME create <name> <disk-num-1> <disk-num-2> [--wipe|--no-wipe]"
+    [ $# -ge 3 ] || die "Usage: $SCRIPT_NAME create <name> <disk-num-1> <disk-num-2> [--force]"
     name="$1"
     dev1=$(resolve_disk "$2") || die "Invalid disk spec: $2"
     dev2=$(resolve_disk "$3") || die "Invalid disk spec: $3"
@@ -7142,6 +7303,12 @@ cmd_create() {
 
     assert_whole_disk "$dev1"
     assert_whole_disk "$dev2"
+    if [ "$force" = "1" ]; then
+        # Free either disk from the AppleRAID set that currently
+        # claims it, BEFORE assert_safe_target runs (otherwise
+        # assert_safe_target would die on the membership check).
+        release_disks_from_existing_raids "$dev1" "$dev2"
+    fi
     assert_safe_target "$dev1"
     assert_safe_target "$dev2"
 
@@ -7159,27 +7326,29 @@ cmd_create() {
         warn "Disks have different sizes ($s1 vs $s2 bytes). Mirror will use the smaller capacity."
     fi
 
-    # Decide whether to wipe each disk. Default policy:
-    #   - Wipe ONLY if the disk currently carries SoftRAID metadata.
-    #     SoftRAID's on-disk format is sticky enough that 'diskutil
-    #     appleRAID create' can fail (or worse: succeed with a confused
-    #     layout) when SoftRAID's signature is still present.
-    #   - For everything else (including Apple_RAID_Offline disks from
-    #     a prior AppleRAID set), trust 'diskutil appleRAID create' to
-    #     repartition cleanly. It does this anyway as part of its
-    #     normal flow; a pre-wipe is wear without benefit.
-    #   --wipe / --no-wipe override the auto-decision.
-    softraid_disks=$(list_softraid_disks 2>/dev/null)
+    # Decide whether to wipe each disk - per disk, automatically.
+    #
+    # Policy: pre-wipe ONLY if the disk currently carries SoftRAID
+    # metadata. SoftRAID's on-disk signature is sticky enough that
+    # 'diskutil appleRAID create' can fail or produce a confused
+    # layout when it's still present. For everything else (including
+    # Apple_RAID_Offline disks from a prior AppleRAID set), trust
+    # 'diskutil appleRAID create' to repartition cleanly - it does
+    # this anyway as part of its normal flow, so a pre-wipe is wear
+    # without benefit.
+    #
+    # Detection uses 'list_softraid_physical_members' which checks
+    # both 'diskutil info' for the SoftRAID string AND the GPT for
+    # SoftRAID's data-partition UUID (FA709C7E-...). The GPT signature
+    # survives even SoftRAID uninstall + 'Delete Secrets', so this
+    # detection catches drives that ONCE were SoftRAID members even
+    # if SoftRAID is no longer installed on the host.
+    softraid_disks=$(list_softraid_physical_members 2>/dev/null)
     short1="${dev1#/dev/}"
     short2="${dev2#/dev/}"
-    is_sr1=0; is_sr2=0
-    echo "$softraid_disks" | grep -qxF "$short1" && is_sr1=1
-    echo "$softraid_disks" | grep -qxF "$short2" && is_sr2=1
-    case "$force_wipe" in
-        1)  wipe1=1; wipe2=1 ;;
-        0)  wipe1=0; wipe2=0 ;;
-        *)  wipe1=$is_sr1; wipe2=$is_sr2 ;;
-    esac
+    wipe1=0; wipe2=0
+    echo "$softraid_disks" | grep -qxF "$short1" && wipe1=1
+    echo "$softraid_disks" | grep -qxF "$short2" && wipe2=1
 
     explain "This will:"
     if [ "$wipe1" = "1" ] || [ "$wipe2" = "1" ]; then
@@ -7199,8 +7368,7 @@ cmd_create() {
     else
         explain "  1. Run 'diskutil appleRAID create mirror $name APFS $dev1 $dev2'."
         explain "     (Pre-wipe skipped: no SoftRAID metadata detected on either disk;"
-        explain "      diskutil will repartition the disks itself. Use --wipe to force"
-        explain "      the explicit pre-wipe step.)"
+        explain "      diskutil will repartition the disks itself.)"
         explain "  2. Show the resulting configuration."
     fi
     explain "The new mirror will appear as a virtual /dev/diskN device with an APFS volume named '$name'."
