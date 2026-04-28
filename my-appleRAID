@@ -7453,11 +7453,25 @@ cmd_create() {
     run sudo diskutil appleRAID create mirror "$name" APFS "$dev1" "$dev2" \
         || die "diskutil appleRAID create failed"
 
-    step "New RAID layout"
-    run diskutil appleRAID list
+    # Default: show focused views - only the NEW RAID set, and only
+    # the layout of its TWO member disks. The full 'diskutil appleRAID
+    # list' (all sets) and 'diskutil list' (all disks) views are
+    # noisy after a create when only the new set is interesting; -V
+    # restores them for the rare case the user wants the full picture.
+    step "New RAID layout: '$name'"
+    run diskutil appleRAID list "$name"
 
-    step "Full disk layout"
-    run diskutil list
+    step "Member disk layout: $dev1 + $dev2"
+    run diskutil list "$dev1" "$dev2"
+
+    if [ "$VERBOSE" = "1" ]; then
+        echo
+        step "Verbose: all RAID sets"
+        run diskutil appleRAID list
+        echo
+        step "Verbose: full disk layout"
+        run diskutil list
+    fi
 
     ok "Mirror '$name' created successfully."
 
