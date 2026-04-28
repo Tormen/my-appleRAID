@@ -6030,8 +6030,20 @@ _render_soft_row() {
 
 # Print the unified compact summary (the new default 'list' output).
 print_raid_summary() {
+    name_filter="${1:-}"
     apple_rows=$(gather_appleraid_rows)
     soft_rows=$(gather_softraid_rows)
+
+    # Optional name filter: keep only rows whose name (field 9 for both
+    # Apple and Soft row formats) matches the requested set name.
+    if [ -n "$name_filter" ]; then
+        apple_rows=$(printf '%s\n' "$apple_rows" | awk -F'|' -v n="$name_filter" 'NF && $9==n')
+        soft_rows=$( printf '%s\n' "$soft_rows"  | awk -F'|' -v n="$name_filter" 'NF && $9==n')
+        if [ -z "$apple_rows" ] && [ -z "$soft_rows" ]; then
+            warn "No AppleRAID set or SoftRAID volume named '$name_filter' found."
+            return 1
+        fi
+    fi
 
     if [ -z "$apple_rows" ] && [ -z "$soft_rows" ]; then
         info "No AppleRAID sets and no SoftRAID volumes found on this host."
@@ -6107,23 +6119,33 @@ cmd_list_verbose_dump() {
 cmd_list() {
     eval "$(parse_global_flags "$@")"
 
+    name_filter=""
     for a in "$@"; do
         case "$a" in
             -h|--help)
                 cat <<EOF
-Usage: $SCRIPT_NAME list [-V]
+Usage: $SCRIPT_NAME list [<name>] [-V]
 
 Print a compact one-line-per-RAID summary covering both AppleRAID sets
 and SoftRAID volumes. Each row shows the source (AppleRAID/SoftRAID),
 RAID level, state, filesystem, size + free, mount point, the volume
 name, and inline member status codes.
 
+ARGUMENTS
+  <name>           Optional. If given, restrict the output to the one
+                   matching set/volume by name. Useful right after
+                   'create' to confirm just the new set.
+
+OPTIONS
   -V, --verbose    Also print the full 'diskutil appleRAID list' dump
                    FIRST (the legacy 'list' output), followed by the
                    compact summary.
 EOF
                 return 0
                 ;;
+            -V|--verbose|-D|--debug) ;;
+            -*) warn "Unknown option: $a" ;;
+            *)  [ -z "$name_filter" ] && name_filter="$a" ;;
         esac
     done
 
@@ -6145,8 +6167,12 @@ EOF
         done
     fi
 
-    step "RAID summary"
-    print_raid_summary
+    if [ -n "$name_filter" ]; then
+        step "RAID summary: '$name_filter'"
+    else
+        step "RAID summary"
+    fi
+    print_raid_summary "$name_filter"
 }
 
 # ----------------------------------------------------------------------
@@ -7453,16 +7479,21 @@ cmd_create() {
     run sudo diskutil appleRAID create mirror "$name" APFS "$dev1" "$dev2" \
         || die "diskutil appleRAID create failed"
 
-    # Default: show focused views - only the NEW RAID set, and only
-    # the layout of its TWO member disks. The full 'diskutil appleRAID
-    # list' (all sets) and 'diskutil list' (all disks) views are
-    # noisy after a create when only the new set is interesting; -V
-    # restores them for the rare case the user wants the full picture.
-    step "New RAID layout: '$name'"
-    run diskutil appleRAID list "$name"
+    # Default: show focused views - only the NEW RAID set (using
+    # 'cmd_list <name>' which renders the same friendly compact
+    # summary the user is used to from 'my-appleRAID list', filtered
+    # to just the new set) and only the layout of the TWO member
+    # disks. The full all-sets / all-disks dumps are noisy after a
+    # create when only the new set is interesting; -V restores them
+    # for the rare case the user wants the full picture.
+    cmd_list "$name"
 
-    step "Member disk layout: $dev1 + $dev2"
-    run diskutil list "$dev1" "$dev2"
+    echo
+    step "Member disk layout"
+    # diskutil list takes ONE filter at a time, so call it per disk.
+    run diskutil list "$dev1"
+    echo
+    run diskutil list "$dev2"
 
     if [ "$VERBOSE" = "1" ]; then
         echo
