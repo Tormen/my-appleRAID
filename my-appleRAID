@@ -5734,6 +5734,12 @@ _smart_compare_two() {
     fi
 
     echo
+    # Pre-header line: print the actual bsd names (e.g. 'disk7' /
+    # 'disk8') directly above the 'Drive A' / 'Drive B' label columns,
+    # so the user can see at a glance which physical disk each column
+    # refers to without scrolling back up to the header block.
+    printf '%-4s %-25s %12s %12s\n' \
+        "" "" "$bsd_a" "$bsd_b"
     printf '%s%-4s %-25s %12s %12s   %s%s\n' \
         "${C_BOLD}" "ID" "Attribute" "Drive A" "Drive B" "Delta / note" "${C_RESET}"
 
