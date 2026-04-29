@@ -5301,7 +5301,14 @@ smart_summary_line() {
 
     out="SMART: $hd"
     [ -n "$temp" ] && out="$out  temp=${temp}C"
-    [ -n "$poh" ]  && out="$out  POH=${poh}h"
+    if [ -n "$poh" ]; then
+        # POH (Power_On_Hours) is the canonical raw attribute; we
+        # show it as both the raw value and a years-rounded AGE so
+        # the user can read 'how old is this drive' at a glance
+        # without doing the /8760 division in their head.
+        age_y=$(awk -v h="$poh" 'BEGIN { printf "%.1f", h / 8760 }')
+        out="$out  POH=${poh}h  age=${age_y}y"
+    fi
     out="$out  $(fmt_kill realloc "$realloc")"
     out="$out  $(fmt_kill pending "$pending")"
     out="$out  $(fmt_kill uncorr  "$uncorr")"
@@ -5568,6 +5575,267 @@ _smart_drilldown_one() {
     explain "Short test:  sudo $sc -t short $dev   (~2 min, online; quick electronics + media sample)"
     explain "Long  test:  sudo $sc -t long  $dev   (hours, full surface scan)"
     explain "Results land in 'smart $d' section 3/4 once the test completes."
+}
+
+# ----------------------------------------------------------------------
+# Side-by-side SMART comparison of two physical disks. Designed to
+# answer 'which one would you discard'. Renders a per-attribute table,
+# computes deltas, highlights the discriminating signals (the four
+# 'killer' attributes 5/197/198/199; load-cycle wear; helium level;
+# SMART overall-health), and ends with a one-line verdict.
+#
+# Methodology - a drive is the loser if ANY of these is true, in
+# order of priority:
+#   1) Overall health != PASSED
+#   2) Any killer attribute (5/197/198/199) raw value > 0
+#   3) Helium level (22) significantly lower
+#   4) Load-cycle count (193) significantly higher (>= 20% delta)
+#   5) Power-on-hours (9) significantly higher (>= 20% delta)
+# Otherwise: 'no clear loser'.
+# ----------------------------------------------------------------------
+_smart_compare_two() {
+    bsd_a="$1"; bsd_b="$2"
+    devA="/dev/$bsd_a"
+    devB="/dev/$bsd_b"
+
+    if ! command -v smartctl >/dev/null 2>&1; then
+        die "smartctl not installed.  Fix:  brew install smartmontools"
+    fi
+    diskutil info "$devA" >/dev/null 2>&1 || die "Device not found: $devA"
+    diskutil info "$devB" >/dev/null 2>&1 || die "Device not found: $devB"
+
+    cfg_load
+    _ensure_state_dir_writable
+
+    # Resolve smartctl command + dtype per disk.
+    scA=$(smart_cmd "$bsd_a")
+    scB=$(smart_cmd "$bsd_b")
+    [ "$scA" = "smartctl" ] && [ -z "$(smart_dtype_for "$bsd_a")" ] \
+        && die "/dev/$bsd_a does not respond to SMART (no working -d type)."
+    [ "$scB" = "smartctl" ] && [ -z "$(smart_dtype_for "$bsd_b")" ] \
+        && die "/dev/$bsd_b does not respond to SMART (no working -d type)."
+
+    # Capture raw smartctl outputs.
+    infoA=$($scA -i "$devA" 2>/dev/null)
+    infoB=$($scB -i "$devB" 2>/dev/null)
+    healthA_raw=$($scA -H "$devA" 2>/dev/null)
+    healthB_raw=$($scB -H "$devB" 2>/dev/null)
+    attrA=$($scA -A "$devA" 2>/dev/null)
+    attrB=$($scB -A "$devB" 2>/dev/null)
+
+    # Helpers for parsing.
+    _info_field() {
+        # $1 = info dump, $2 = label substring (e.g. "Device Model")
+        echo "$1" | awk -F': *' -v lbl="$2" 'index($1, lbl) {
+            sub(/^[[:space:]]+/, "", $2); sub(/[[:space:]]+$/, "", $2); print $2; exit
+        }'
+    }
+    _attr_raw() {
+        # $1 = attr dump, $2 = numeric attribute id
+        # Returns the RAW_VALUE column (first numeric token in the
+        # smartctl raw column). Empty if id is not present.
+        echo "$1" | awk -v id="$2" '$1 == id {
+            # raw is column 10 in the standard layout, but the value
+            # may include a parenthesized note (e.g. "35 (Min/Max ...)").
+            # Take the first numeric token.
+            for (i = 10; i <= NF; i++) {
+                if (match($i, /^[0-9]+$/)) { print $i; exit }
+            }
+            exit
+        }'
+    }
+    _health_word() {
+        # $1 = health dump
+        echo "$1" | awk -F': *' '
+            /SMART overall-health/ { print $NF; exit }
+            /SMART Health Status/  { print $NF; exit }
+        '
+    }
+
+    # Identity.
+    modelA=$(_info_field "$infoA" "Device Model")
+    [ -z "$modelA" ] && modelA=$(_info_field "$infoA" "Model Family")
+    modelB=$(_info_field "$infoB" "Device Model")
+    [ -z "$modelB" ] && modelB=$(_info_field "$infoB" "Model Family")
+    serialA=$(_info_field "$infoA" "Serial Number")
+    serialB=$(_info_field "$infoB" "Serial Number")
+    healthA=$(_health_word "$healthA_raw"); healthA=${healthA:-?}
+    healthB=$(_health_word "$healthB_raw"); healthB=${healthB:-?}
+
+    step "SMART comparison: $devA  vs  $devB"
+    info "Drive A: ${modelA:-?}  serial=${serialA:-?}  $devA"
+    info "Drive B: ${modelB:-?}  serial=${serialB:-?}  $devB"
+    info "Overall health:  A=$healthA   B=$healthB"
+
+    # Age.
+    pohA=$(_attr_raw "$attrA" 9)
+    pohB=$(_attr_raw "$attrB" 9)
+    if [ -n "$pohA" ] && [ -n "$pohB" ]; then
+        ageA_y=$(awk -v h="$pohA" 'BEGIN { printf "%.2f", h / 8760 }')
+        ageB_y=$(awk -v h="$pohB" 'BEGIN { printf "%.2f", h / 8760 }')
+        info "Age:             A=${pohA}h (${ageA_y} years)   B=${pohB}h (${ageB_y} years)"
+    fi
+
+    echo
+    printf '%s%-4s %-25s %12s %12s   %s%s\n' \
+        "${C_BOLD}" "ID" "Attribute" "Drive A" "Drive B" "Delta / note" "${C_RESET}"
+
+    # Per-attribute rows. Format:
+    #   ID  Name                       Drive A   Drive B    delta / note
+    _row() {
+        # $1 id, $2 label, $3 a, $4 b, $5 note
+        printf '%-4s %-25s %12s %12s   %s\n' "$1" "$2" "${3:-?}" "${4:-?}" "$5"
+    }
+
+    # Killer attributes. Any non-zero is bad.
+    for spec in '5:Reallocated_Sector_Ct' \
+                '197:Current_Pending_Sector' \
+                '198:Offline_Uncorrectable' \
+                '199:UDMA_CRC_Error_Count'; do
+        id=${spec%%:*}; name=${spec#*:}
+        a=$(_attr_raw "$attrA" "$id")
+        b=$(_attr_raw "$attrB" "$id")
+        a_bad=0; b_bad=0
+        [ -n "$a" ] && [ "$a" -gt 0 ] 2>/dev/null && a_bad=1
+        [ -n "$b" ] && [ "$b" -gt 0 ] 2>/dev/null && b_bad=1
+        note="ok (both)"
+        if [ "$a_bad" = "1" ] && [ "$b_bad" = "0" ]; then note="A non-zero - DISCARD A"; fi
+        if [ "$b_bad" = "1" ] && [ "$a_bad" = "0" ]; then note="B non-zero - DISCARD B"; fi
+        if [ "$a_bad" = "1" ] && [ "$b_bad" = "1" ]; then note="BOTH non-zero - both suspect"; fi
+        _row "$id" "$name" "$a" "$b" "$note"
+    done
+
+    # Wear / age signals with delta % computed.
+    for spec in '4:Start_Stop_Count' \
+                '12:Power_Cycle_Count' \
+                '192:Power-Off_Retract_Count' \
+                '193:Load_Cycle_Count' \
+                '9:Power_On_Hours'; do
+        id=${spec%%:*}; name=${spec#*:}
+        a=$(_attr_raw "$attrA" "$id")
+        b=$(_attr_raw "$attrB" "$id")
+        delta_note=""
+        if [ -n "$a" ] && [ -n "$b" ] && [ "$a" -gt 0 ] 2>/dev/null && [ "$b" -gt 0 ] 2>/dev/null; then
+            # delta = (max - min) / min * 100
+            if [ "$a" -ge "$b" ]; then
+                delta=$(awk -v hi="$a" -v lo="$b" 'BEGIN { printf "%.0f", (hi - lo) * 100 / lo }')
+                higher="A"
+            else
+                delta=$(awk -v hi="$b" -v lo="$a" 'BEGIN { printf "%.0f", (hi - lo) * 100 / lo }')
+                higher="B"
+            fi
+            if [ "$delta" -ge 5 ] 2>/dev/null; then
+                delta_note="$higher higher by ${delta}%"
+            else
+                delta_note="similar"
+            fi
+        fi
+        _row "$id" "$name" "$a" "$b" "$delta_note"
+    done
+
+    # Helium level (HE-series). Lower is worse.
+    heA=$(_attr_raw "$attrA" 22)
+    heB=$(_attr_raw "$attrB" 22)
+    he_note=""
+    if [ -n "$heA" ] && [ -n "$heB" ]; then
+        if [ "$heA" -lt "$heB" ] 2>/dev/null; then he_note="A lower - leak suspect"
+        elif [ "$heB" -lt "$heA" ] 2>/dev/null; then he_note="B lower - leak suspect"
+        else he_note="equal"
+        fi
+    fi
+    _row 22 "Helium_Level" "$heA" "$heB" "$he_note"
+
+    # Temperature.
+    tA=$(_attr_raw "$attrA" 194)
+    tB=$(_attr_raw "$attrB" 194)
+    _row 194 "Temperature_Celsius" "$tA" "$tB" ""
+
+    echo
+
+    # Verdict logic.
+    verdict=""
+    reason=""
+
+    # 1) Overall health.
+    case "$healthA" in PASSED|OK|"") :;; *) verdict="A"; reason="overall health '$healthA' is not PASSED"; esac
+    case "$healthB" in PASSED|OK|"") :;; *) [ -z "$verdict" ] && verdict="B" && reason="overall health '$healthB' is not PASSED";; esac
+
+    # 2) Killer attrs (any non-zero on one but not the other).
+    if [ -z "$verdict" ]; then
+        for id in 5 197 198 199; do
+            a=$(_attr_raw "$attrA" "$id")
+            b=$(_attr_raw "$attrB" "$id")
+            a_bad=0; b_bad=0
+            [ -n "$a" ] && [ "$a" -gt 0 ] 2>/dev/null && a_bad=1
+            [ -n "$b" ] && [ "$b" -gt 0 ] 2>/dev/null && b_bad=1
+            if [ "$a_bad" = "1" ] && [ "$b_bad" = "0" ]; then
+                verdict="A"; reason="attribute $id is non-zero on A only (raw=$a)"; break
+            fi
+            if [ "$b_bad" = "1" ] && [ "$a_bad" = "0" ]; then
+                verdict="B"; reason="attribute $id is non-zero on B only (raw=$b)"; break
+            fi
+        done
+    fi
+
+    # 3) Helium level.
+    if [ -z "$verdict" ] && [ -n "$heA" ] && [ -n "$heB" ]; then
+        if [ "$heA" -lt "$heB" ] 2>/dev/null; then
+            verdict="A"; reason="lower helium level (A=$heA vs B=$heB)"
+        elif [ "$heB" -lt "$heA" ] 2>/dev/null; then
+            verdict="B"; reason="lower helium level (B=$heB vs A=$heA)"
+        fi
+    fi
+
+    # 4) Load cycle count delta >= 20%.
+    if [ -z "$verdict" ]; then
+        lA=$(_attr_raw "$attrA" 193)
+        lB=$(_attr_raw "$attrB" 193)
+        if [ -n "$lA" ] && [ -n "$lB" ] && [ "$lA" -gt 0 ] 2>/dev/null && [ "$lB" -gt 0 ] 2>/dev/null; then
+            if [ "$lA" -ge "$lB" ]; then
+                d=$(awk -v hi="$lA" -v lo="$lB" 'BEGIN { printf "%.0f", (hi - lo) * 100 / lo }')
+                if [ "$d" -ge 20 ] 2>/dev/null; then
+                    verdict="A"; reason="head-park wear: A has ${d}% more load cycles than B ($lA vs $lB)"
+                fi
+            else
+                d=$(awk -v hi="$lB" -v lo="$lA" 'BEGIN { printf "%.0f", (hi - lo) * 100 / lo }')
+                if [ "$d" -ge 20 ] 2>/dev/null; then
+                    verdict="B"; reason="head-park wear: B has ${d}% more load cycles than A ($lB vs $lA)"
+                fi
+            fi
+        fi
+    fi
+
+    # 5) Power-on hours delta >= 20%.
+    if [ -z "$verdict" ] && [ -n "$pohA" ] && [ -n "$pohB" ] \
+       && [ "$pohA" -gt 0 ] 2>/dev/null && [ "$pohB" -gt 0 ] 2>/dev/null; then
+        if [ "$pohA" -ge "$pohB" ]; then
+            d=$(awk -v hi="$pohA" -v lo="$pohB" 'BEGIN { printf "%.0f", (hi - lo) * 100 / lo }')
+            if [ "$d" -ge 20 ] 2>/dev/null; then
+                verdict="A"; reason="A is ${d}% older than B (POH $pohA vs $pohB)"
+            fi
+        else
+            d=$(awk -v hi="$pohB" -v lo="$pohA" 'BEGIN { printf "%.0f", (hi - lo) * 100 / lo }')
+            if [ "$d" -ge 20 ] 2>/dev/null; then
+                verdict="B"; reason="B is ${d}% older than A (POH $pohB vs $pohA)"
+            fi
+        fi
+    fi
+
+    if [ -n "$verdict" ]; then
+        if [ "$verdict" = "A" ]; then
+            warn "VERDICT: if you must retire one, prefer DRIVE A ($devA, ${modelA:-?})"
+        else
+            warn "VERDICT: if you must retire one, prefer DRIVE B ($devB, ${modelB:-?})"
+        fi
+        warn "  Reason: $reason"
+    else
+        info "VERDICT: no clear loser - both drives look healthy on the metrics compared."
+        info "  Both passed killer attributes, helium, load cycles, and age delta thresholds."
+    fi
+    echo
+    explain "Note: this comparison only reads existing SMART attributes; it does not"
+    explain "run any test. For deeper inspection use '$SCRIPT_NAME smart <disk>' on"
+    explain "either drive (full attribute dump + self-test log + error log)."
 }
 
 # ----------------------------------------------------------------------
@@ -6461,10 +6729,10 @@ EOF
 
     # Header
     if [ "$VERBOSE" = "1" ]; then
-        printf '  %-8s %-9s %-4s %9s  %-24s  %-18s %5s %-6s %-4s %-4s %-10s %s\n' \
-            "DEV" "LOC" "KIND" "SIZE" "MODEL" "SERIAL" "TEMP" "SMART" "ROT" "TRIM" "PROTOCOL" "ROLE"
-        printf '  %-8s %-9s %-4s %9s  %-24s  %-18s %5s %-6s %-4s %-4s %-10s %s\n' \
-            "---" "---" "----" "----" "-----" "------" "----" "-----" "---" "----" "--------" "----"
+        printf '  %-8s %-9s %-4s %9s  %-24s  %-18s %5s %-6s %-4s %-5s %-4s %-10s %s\n' \
+            "DEV" "LOC" "KIND" "SIZE" "MODEL" "SERIAL" "TEMP" "SMART" "ROT" "AGE" "TRIM" "PROTOCOL" "ROLE"
+        printf '  %-8s %-9s %-4s %9s  %-24s  %-18s %5s %-6s %-4s %-5s %-4s %-10s %s\n' \
+            "---" "---" "----" "----" "-----" "------" "----" "-----" "---" "---" "----" "--------" "----"
     else
         printf '  %-8s %-9s %-4s %9s  %-28s %s\n' \
             "DEV" "LOC" "KIND" "SIZE" "MODEL" "ROLE"
@@ -6545,7 +6813,7 @@ EOF
             proto_short=$(echo "$protocol" | cut -c1-10)
             [ -z "$proto_short" ] && proto_short="-"
 
-            temp="-"; smart="-"; rot="-"
+            temp="-"; smart="-"; rot="-"; age="-"
             if command -v smartctl >/dev/null 2>&1 && [ "$virtual" != "Yes" ]; then
                 # IMPORTANT: every $(...) below inherits stdin from the
                 # enclosing `while read -r d` loop's pipe. smartctl reads
@@ -6570,6 +6838,13 @@ EOF
                     /^[[:space:]]*(194|190)[[:space:]]+Temperature/ { print $10 "C"; exit }
                 ')
                 [ -z "$temp" ] && temp="-"
+                # AGE: Power_On_Hours (attr 9) / 8760, in years.
+                poh=$(echo "$attrs" | awk '
+                    /^[[:space:]]*9[[:space:]]+Power_On_Hours/ { print $10; exit }
+                ')
+                if [ -n "$poh" ] && [ "$poh" -gt 0 ] 2>/dev/null; then
+                    age=$(awk -v h="$poh" 'BEGIN { printf "%.1fy", h / 8760 }')
+                fi
                 rot=$($sc -i "$dev" </dev/null 2>/dev/null | awk -F': +' '/Rotation Rate:/ {
                     gsub(/ *rpm.*/, "", $2); print $2; exit
                 }')
@@ -6579,8 +6854,8 @@ EOF
                 esac
             fi
 
-            printf '  %-8s %-9s %-4s %9s  %-24.24s  %-18s %5s %-6s %-4s %-4s %-10s %s\n' \
-                "$d" "${loc:-?}" "$kind" "$size" "$model" "$serial" "$temp" "$smart" "$rot" "$trim" "$proto_short" "$role"
+            printf '  %-8s %-9s %-4s %9s  %-24.24s  %-18s %5s %-6s %-4s %-5s %-4s %-10s %s\n' \
+                "$d" "${loc:-?}" "$kind" "$size" "$model" "$serial" "$temp" "$smart" "$rot" "$age" "$trim" "$proto_short" "$role"
         else
             model_c=$(printf '%s' "$model" | cut -c1-28)
             printf '  %-8s %-9s %-4s %9s  %-28s %s\n' \
@@ -7437,64 +7712,86 @@ EOF
 cmd_smart() {
     eval "$(parse_global_flags "$@")"
 
-    arg=""
+    args=""
     while [ $# -gt 0 ]; do
         case "$1" in
             -h|--help)
                 cat <<EOF
 Usage: $SCRIPT_NAME smart [<disk>]
+       $SCRIPT_NAME smart <disk1> <disk2>
 
-Detailed SMART health drill-down for one disk:
+Detailed SMART health drill-down for one disk, OR side-by-side
+comparison of two disks.
 
+ONE-DISK MODE (drill-down)
   1/4  Overall health           (smartctl -H)
   2/4  Pre-failure attributes   (smartctl -A) + non-zero killer summary
   3/4  Self-test log            (smartctl -l selftest)
   4/4  SMART error log          (smartctl -l error)
 
-The error log and self-test log are exactly the data that answers
-'was this drive ever in trouble in the past' - the firmware itself
-remembers errors and test outcomes across reboots. Neither is shown
-by '$SCRIPT_NAME health', which only alerts on the current value of
-overall health, temperature, and the killer attributes.
+  The error log and self-test log are exactly the data that answers
+  'was this drive ever in trouble in the past' - the firmware itself
+  remembers errors and test outcomes across reboots. Neither is shown
+  by '$SCRIPT_NAME health', which only alerts on the current value of
+  overall health, temperature, and the killer attributes.
+
+TWO-DISK MODE (comparison)
+  Render a per-attribute side-by-side table of two drives, compute
+  deltas (load-cycle wear, power-on-hours, helium level), and emit a
+  one-line VERDICT recommending which drive to retire FIRST if forced
+  to choose. Useful when retiring HE-series drives near end-of-life
+  and trying to decide which one is the weaker bet.
 
 ARGUMENTS
-  <disk>    Optional. Disk number (e.g. 3), short name (disk3) or
-            full path (/dev/disk3). If omitted, you get an
-            interactive picker listing all attached physical disks.
+  <disk>      Disk number (e.g. 3), short name (disk3) or full path
+              (/dev/disk3). Without args you get an interactive
+              picker listing all attached physical disks.
+  <disk1> <disk2>
+              Two disks to compare side-by-side.
 
 NOTES
   - Read-only.
-  - Auto-detects the right 'smartctl -d <type>' for USB/TB enclosures
-    (cached in ~/.cache/my-appleRAID-smart-dtypes).
-  - Refuses virtual devices (RAID/APFS containers - no SMART of their own).
+  - Auto-detects the right 'smartctl -d <type>' for USB/TB enclosures.
+  - Refuses virtual devices (RAID/APFS containers).
   - Requires smartctl: brew install smartmontools
 EOF
                 return 0
                 ;;
             -V|--verbose|-D|--debug) ;;
             -*) warn "Unknown option: $1" ;;
-            *)  arg="$1" ;;
+            *)  args="$args $1" ;;
         esac
         shift
     done
 
-    if [ -z "$arg" ]; then
-        arg=$(pick_physical_disk_interactively "inspect (SMART)") || return 1
-    fi
-
-    dev=$(resolve_disk "$arg") || die "Invalid disk spec: $arg"
-    assert_whole_disk "$dev"
+    # shellcheck disable=SC2086
+    set -- $args
 
     # Run writability checks ONCE in the main shell BEFORE any
-    # subshell-invoked smart_dtype_lookup / smart_dtype_store.
-    # Subshells inherit STATE_DIR / LOG_FILE at fork time, so doing
-    # the fallback here means the corrected paths are visible in
-    # every downstream subshell. cfg_load itself drives the writability
-    # checks, so we don't suppress its stderr - otherwise the
-    # 'using fallback ...' warning would be silenced too.
+    # subshell-invoked smart_dtype_lookup / smart_dtype_store. The
+    # corrected STATE_DIR / LOG_FILE then propagate via process
+    # inheritance to every downstream subshell.
     cfg_load
     _ensure_state_dir_writable
 
+    if [ $# -ge 2 ]; then
+        # Comparison mode.
+        devA=$(resolve_disk "$1") || die "Invalid disk spec: $1"
+        devB=$(resolve_disk "$2") || die "Invalid disk spec: $2"
+        assert_whole_disk "$devA"
+        assert_whole_disk "$devB"
+        [ "$devA" = "$devB" ] && die "Cannot compare a disk to itself."
+        _smart_compare_two "${devA#/dev/}" "${devB#/dev/}"
+        return 0
+    fi
+
+    arg=""
+    [ $# -ge 1 ] && arg="$1"
+    if [ -z "$arg" ]; then
+        arg=$(pick_physical_disk_interactively "inspect (SMART)") || return 1
+    fi
+    dev=$(resolve_disk "$arg") || die "Invalid disk spec: $arg"
+    assert_whole_disk "$dev"
     _smart_drilldown_one "${dev#/dev/}"
 }
 
