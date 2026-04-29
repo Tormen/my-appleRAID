@@ -6765,10 +6765,10 @@ EOF
         printf '  %-8s %-9s %-4s %9s  %-24s  %-18s %5s %-6s %-4s %-5s %-4s %-10s %s\n' \
             "---" "---" "----" "----" "-----" "------" "----" "-----" "---" "---" "----" "--------" "----"
     else
-        printf '  %-8s %-9s %-4s %9s  %-28s %s\n' \
-            "DEV" "LOC" "KIND" "SIZE" "MODEL" "ROLE"
-        printf '  %-8s %-9s %-4s %9s  %-28s %s\n' \
-            "---" "---" "----" "----" "-----" "----"
+        printf '  %-8s %-9s %-4s %9s  %-28s %-5s %s\n' \
+            "DEV" "LOC" "KIND" "SIZE" "MODEL" "AGE" "ROLE"
+        printf '  %-8s %-9s %-4s %9s  %-28s %-5s %s\n' \
+            "---" "---" "----" "----" "-----" "---" "----"
     fi
 
     # Capture the disk list FIRST into a variable, then iterate with
@@ -6889,8 +6889,24 @@ EOF
                 "$d" "${loc:-?}" "$kind" "$size" "$model" "$serial" "$temp" "$smart" "$rot" "$age" "$trim" "$proto_short" "$role"
         else
             model_c=$(printf '%s' "$model" | cut -c1-28)
-            printf '  %-8s %-9s %-4s %9s  %-28s %s\n' \
-                "$d" "${loc:-?}" "$kind" "$size" "$model_c" "$role"
+            # AGE column for the compact view too. We don't fetch
+            # SMART health/temp here (those are -V territory), just
+            # the cheap POH attribute. smartctl call is per disk;
+            # use </dev/null to keep it from eating the for-loop's
+            # stdin (same pitfall as the -V branch).
+            age="-"
+            if command -v smartctl >/dev/null 2>&1 && [ "$virtual" != "Yes" ]; then
+                sc=$(smart_cmd "$d" </dev/null 2>/dev/null)
+                [ -z "$sc" ] && sc="smartctl"
+                poh=$($sc -A "$dev" </dev/null 2>/dev/null | awk '
+                    /^[[:space:]]*9[[:space:]]+Power_On_Hours/ { print $10; exit }
+                ')
+                if [ -n "$poh" ] && [ "$poh" -gt 0 ] 2>/dev/null; then
+                    age=$(awk -v h="$poh" 'BEGIN { printf "%.1fy", h / 8760 }')
+                fi
+            fi
+            printf '  %-8s %-9s %-4s %9s  %-28s %-5s %s\n' \
+                "$d" "${loc:-?}" "$kind" "$size" "$model_c" "$age" "$role"
         fi
     done
 }
