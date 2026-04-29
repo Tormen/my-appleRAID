@@ -5687,11 +5687,12 @@ _smart_compare_two() {
         printf '%-4s %-25s %12s %12s   %s\n' "$1" "$2" "${3:-?}" "${4:-?}" "$5"
     }
 
-    # Killer attributes. Any non-zero is bad.
+    # Killer attributes - the three that genuinely point at drive
+    # failure when non-zero: reallocated sectors, current pending,
+    # offline uncorrectable. ANY non-zero == discard that drive.
     for spec in '5:Reallocated_Sector_Ct' \
                 '197:Current_Pending_Sector' \
-                '198:Offline_Uncorrectable' \
-                '199:UDMA_CRC_Error_Count'; do
+                '198:Offline_Uncorrectable'; do
         id=${spec%%:*}; name=${spec#*:}
         a=$(_attr_raw "$attrA" "$id")
         b=$(_attr_raw "$attrB" "$id")
@@ -5704,6 +5705,24 @@ _smart_compare_two() {
         if [ "$a_bad" = "1" ] && [ "$b_bad" = "1" ]; then note="BOTH non-zero - both suspect"; fi
         _row "$id" "$name" "$a" "$b" "$note"
     done
+
+    # UDMA_CRC_Error_Count (199) is in the kill-zone of many SMART
+    # tools, but on real hardware it's usually a SATA cable / port
+    # / connector issue rather than a drive defect: the protocol
+    # caught a bad transfer and retransmitted, so data integrity
+    # is preserved. Show non-zero values with a 'cable check'
+    # annotation rather than 'DISCARD', and treat it as a low-
+    # priority verdict signal (after age + load cycles).
+    a199=$(_attr_raw "$attrA" 199)
+    b199=$(_attr_raw "$attrB" 199)
+    a_bus_bad=0; b_bus_bad=0
+    [ -n "$a199" ] && [ "$a199" -gt 0 ] 2>/dev/null && a_bus_bad=1
+    [ -n "$b199" ] && [ "$b199" -gt 0 ] 2>/dev/null && b_bus_bad=1
+    crc_note="ok (both)"
+    if [ "$a_bus_bad" = "1" ] && [ "$b_bus_bad" = "0" ]; then crc_note="A non-zero - check A's SATA cable / port"; fi
+    if [ "$b_bus_bad" = "1" ] && [ "$a_bus_bad" = "0" ]; then crc_note="B non-zero - check B's SATA cable / port"; fi
+    if [ "$a_bus_bad" = "1" ] && [ "$b_bus_bad" = "1" ]; then crc_note="BOTH non-zero - check cabling on both"; fi
+    _row 199 "UDMA_CRC_Error_Count" "$a199" "$b199" "$crc_note"
 
     # Wear / age signals with delta % computed.
     for spec in '4:Start_Stop_Count' \
@@ -5760,19 +5779,21 @@ _smart_compare_two() {
     case "$healthA" in PASSED|OK|"") :;; *) verdict="A"; reason="overall health '$healthA' is not PASSED"; esac
     case "$healthB" in PASSED|OK|"") :;; *) [ -z "$verdict" ] && verdict="B" && reason="overall health '$healthB' is not PASSED";; esac
 
-    # 2) Killer attrs (any non-zero on one but not the other).
+    # 2) Killer attrs 5/197/198 (sector-level drive damage). 199 is
+    #    handled later as a low-priority hint because it's usually
+    #    cable/port/connector noise rather than a drive defect.
     if [ -z "$verdict" ]; then
-        for id in 5 197 198 199; do
+        for id in 5 197 198; do
             a=$(_attr_raw "$attrA" "$id")
             b=$(_attr_raw "$attrB" "$id")
             a_bad=0; b_bad=0
             [ -n "$a" ] && [ "$a" -gt 0 ] 2>/dev/null && a_bad=1
             [ -n "$b" ] && [ "$b" -gt 0 ] 2>/dev/null && b_bad=1
             if [ "$a_bad" = "1" ] && [ "$b_bad" = "0" ]; then
-                verdict="A"; reason="attribute $id is non-zero on A only (raw=$a)"; break
+                verdict="A"; reason="attribute $id is non-zero on A only (raw=$a) - drive sector damage"; break
             fi
             if [ "$b_bad" = "1" ] && [ "$a_bad" = "0" ]; then
-                verdict="B"; reason="attribute $id is non-zero on B only (raw=$b)"; break
+                verdict="B"; reason="attribute $id is non-zero on B only (raw=$b) - drive sector damage"; break
             fi
         done
     fi
@@ -5819,6 +5840,16 @@ _smart_compare_two() {
                 verdict="B"; reason="B is ${d}% older than A (POH $pohB vs $pohA)"
             fi
         fi
+    fi
+
+    # 6) UDMA_CRC delta - lowest-priority tiebreaker. This is rarely a
+    #    drive defect; it's typically a cable/port/connector issue.
+    #    Only fire if NOTHING else differentiated the drives.
+    if [ -z "$verdict" ] && [ "$a_bus_bad" = "1" ] && [ "$b_bus_bad" = "0" ]; then
+        verdict="A"; reason="UDMA CRC errors on A ($a199) suggest cable/port issue on A's bus (verify cabling before retiring)"
+    fi
+    if [ -z "$verdict" ] && [ "$b_bus_bad" = "1" ] && [ "$a_bus_bad" = "0" ]; then
+        verdict="B"; reason="UDMA CRC errors on B ($b199) suggest cable/port issue on B's bus (verify cabling before retiring)"
     fi
 
     if [ -n "$verdict" ]; then
