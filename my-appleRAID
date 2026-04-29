@@ -381,8 +381,22 @@ resolve_disk() {
         [0-9]*)          echo "/dev/disk$input" ;;
         # Anything else starting with '/' is treated as a mount path
         # (e.g. '/Volumes/backup', '/' for the boot volume, ...).
-        # Use 'diskutil info' to discover the partition node, then
-        # the 'Part of Whole' field to walk up to the whole disk.
+        # Walk diskutil's hierarchy to the underlying physical disk:
+        #
+        #   /Volumes/foo  -> diskNs1            (the volume)
+        #                 -> diskN              (Part of Whole: synthesized
+        #                                        APFS container, virtual)
+        #                 -> APFS Physical Store: diskM
+        #                 -> diskM              (the AppleRAID virtual
+        #                                        device, OR a real
+        #                                        physical disk)
+        #
+        # If after this walk the result is still virtual (e.g. an
+        # AppleRAID-backed APFS where the physical store IS the
+        # AppleRAID virtual device), we return that. Caller's
+        # assert_safe_target / assert_whole_disk will then fail with
+        # a clear 'VIRTUAL device' message - the user has to specify
+        # a specific physical member instead.
         /*)
             di=$(diskutil info "$input" 2>/dev/null) || return 1
             [ -n "$di" ] || return 1
@@ -390,6 +404,27 @@ resolve_disk() {
                 | awk -F': +' '/Part of Whole:/ {print $2; exit}' \
                 | sed 's/[[:space:]]*$//')
             [ -n "$parent" ] || return 1
+            # Second hop: if the parent is virtual AND we see an APFS
+            # Physical Store on the original (or parent) info, follow it.
+            di2=$(diskutil info "/dev/$parent" 2>/dev/null)
+            virt2=$(printf '%s\n' "$di2" \
+                | awk -F': +' '/Virtual:/ {print $2; exit}' \
+                | sed 's/[[:space:]]*$//')
+            if [ "$virt2" = "Yes" ]; then
+                phys=$(printf '%s\n' "$di" \
+                    | awk -F': +' '/APFS Physical Store/ {print $2; exit}' \
+                    | sed 's/[[:space:]]*$//')
+                if [ -z "$phys" ]; then
+                    phys=$(printf '%s\n' "$di2" \
+                        | awk -F': +' '/APFS Physical Store/ {print $2; exit}' \
+                        | sed 's/[[:space:]]*$//')
+                fi
+                if [ -n "$phys" ]; then
+                    # phys may be 'diskN' or 'diskNsM'; drop a partition
+                    # suffix if present.
+                    parent=$(printf '%s' "$phys" | sed 's/s[0-9]*$//')
+                fi
+            fi
             echo "/dev/$parent"
             ;;
         *) return 1 ;;
