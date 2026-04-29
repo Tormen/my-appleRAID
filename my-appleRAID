@@ -183,6 +183,113 @@ die() {
 }
 
 # ----------------------------------------------------------------------
+# errx - hard-fail with a UNIQUE numeric error code so post-mortem
+# debugging can grep the source for the exact origin of any error
+# the user sees in the terminal. Use this in preference to bare 'die'
+# for any newly-added failure path.
+#
+# Usage:   errx <code> [<msg>] [<exitCode>]
+# Output:  "ERROR <code> [<exitCode>]: <msg>" on stderr, then exit.
+#          (no message form: "ERROR <code> [<exitCode>]")
+#
+# Error-code registry (keep in sync with the call sites; grep for
+# 'errx '). When adding a new errx call site, take the NEXT unused
+# 3-digit number and bump _ERRX_HIGHEST below.
+#
+#   010   STATE_DIR not writable AND fallback under TMPDIR also failed
+#   011   LOG_FILE parent dir not writable; cannot append to log
+#   012   smart-dtype-cache: mktemp for atomic rewrite failed
+#   013   smart-dtype-cache: write of cache row failed
+#
+# _ERRX_HIGHEST=013
+# ----------------------------------------------------------------------
+errx() {
+    _ec_code="$1"
+    _ec_msg="${2:-}"
+    _ec_exit="${3:-1}"
+    if [ -n "$_ec_msg" ]; then
+        printf '\n%sERROR %s [%s]: %s%s\n' \
+            "${C_RED}" "$_ec_code" "$_ec_exit" "$_ec_msg" "${C_RESET}" >&2
+    else
+        printf '\n%sERROR %s [%s]%s\n' \
+            "${C_RED}" "$_ec_code" "$_ec_exit" "${C_RESET}" >&2
+    fi
+    exit "$_ec_exit"
+}
+
+# ----------------------------------------------------------------------
+# State-dir + log-file writability gate
+# ----------------------------------------------------------------------
+# When the daemon runs (root via launchd), STATE_DIR=/var/db/my-appleRAID
+# and LOG_FILE=/var/log/.../my-appleRAID.log are owned by root and
+# fully writable. When a NON-root user runs the script for read-only
+# commands (e.g. 'my-appleRAID smart disk7') those paths are NOT
+# writable by them, and unguarded redirects produced cascades of
+# 'Permission denied' / 'mkstemp failed' / 'awk: can't open' spam.
+#
+# Solution: detect non-writability at startup and fall back to a
+# user-private path under TMPDIR. The daemon path is unchanged
+# (root can write the canonical paths). Both functions log a single
+# warning when the fallback kicks in, so the user knows what happened.
+
+# Make STATE_DIR a writable directory, falling back to a user-private
+# tmp dir when the configured value isn't writable by the current uid.
+_ensure_state_dir_writable() {
+    [ -n "${STATE_DIR:-}" ] || STATE_DIR="/var/db/my-appleRAID"
+    # Already writable: done.
+    if [ -d "$STATE_DIR" ] && [ -w "$STATE_DIR" ]; then
+        return 0
+    fi
+    # Doesn't exist yet but we can create it.
+    if [ ! -d "$STATE_DIR" ] \
+       && mkdir -p "$STATE_DIR" 2>/dev/null \
+       && [ -w "$STATE_DIR" ]; then
+        return 0
+    fi
+    # Not writable. Fall back to user-private location.
+    _fb="${TMPDIR:-/tmp}/my-appleRAID-$(id -u 2>/dev/null || echo nobody)"
+    if [ ! -d "$_fb" ] && ! mkdir -p "$_fb" 2>/dev/null; then
+        errx 010 "Cannot write to STATE_DIR='$STATE_DIR' AND fallback '$_fb' creation failed"
+    fi
+    if [ ! -w "$_fb" ]; then
+        errx 010 "Fallback state dir '$_fb' is not writable"
+    fi
+    log_warn "STATE_DIR='$STATE_DIR' not writable by uid=$(id -u 2>/dev/null); using fallback: $_fb"
+    STATE_DIR="$_fb"
+    return 0
+}
+
+# Decide once whether LOG_FILE can be appended to. If it can't, NULL
+# the variable so log_write skips the file-append branch silently.
+# Avoids cascading 'cannot create <path>: Permission denied' messages
+# from the shell for every log line.
+_ensure_log_file_writable() {
+    [ -n "${LOG_FILE:-}" ] || return 0
+    _ld=$(dirname "$LOG_FILE")
+    # If the log file already exists, we can append iff it's writable.
+    if [ -f "$LOG_FILE" ] && [ -w "$LOG_FILE" ]; then
+        return 0
+    fi
+    # If parent dir exists and is writable, file can be created.
+    if [ -d "$_ld" ] && [ -w "$_ld" ]; then
+        return 0
+    fi
+    # Try to create the parent dir (only if path looks user-private).
+    case "$_ld" in
+        /var/*|/etc/*|/usr/*) ;; # don't create system paths from here
+        *)
+            if mkdir -p "$_ld" 2>/dev/null && [ -w "$_ld" ]; then
+                return 0
+            fi
+            ;;
+    esac
+    # Not writable. Disable file logging for this run and warn once.
+    log_warn "LOG_FILE='$LOG_FILE' not writable by uid=$(id -u 2>/dev/null); file logging disabled for this run (stderr still active)"
+    LOG_FILE=""
+    return 0
+}
+
+# ----------------------------------------------------------------------
 # Preflight
 # ----------------------------------------------------------------------
 preflight() {
@@ -851,6 +958,12 @@ cfg_load() {
         LAUNCHD_LABEL="${_tmp%.plist}"  # strip extension
     fi
 
+    # Verify LOG_FILE is writable for the running uid (NULL it if not,
+    # so log_write skips the file-append branch silently for the rest
+    # of this run). Daemon path keeps writing the canonical LOG_FILE;
+    # non-root interactive runs degrade to stderr-only.
+    _ensure_log_file_writable
+
     # Normalize duration-valued config keys: accept either a bare number
     # (seconds) or a suffix like 30s / 5m / 2h / 1d / 1w. Done once at
     # load time so the rest of the script can treat these as plain ints.
@@ -950,9 +1063,16 @@ log_write() {
     line=$(printf '%s [%s] %s' "$ts" "$lvl" "$msg")
     # Always echo to stderr so launchd stderr log catches it.
     printf '%s\n' "$line" >&2
+    # File-append branch. Wrapped in a subshell whose entire stderr is
+    # redirected so a redirect-open failure ('cannot create ...') from
+    # the shell itself is also suppressed (a plain '>>... 2>/dev/null'
+    # only suppresses the printf's stderr; the open-failure message is
+    # produced by dash itself BEFORE the printf runs and bypasses that
+    # redirect). _ensure_log_file_writable ought to have NULLed
+    # LOG_FILE already in the unwritable case, but the subshell guard
+    # is belt-and-braces.
     if [ -n "${LOG_FILE:-}" ]; then
-        # Best effort. Ignore failure (e.g. /var/log not writable as user).
-        printf '%s\n' "$line" >> "$LOG_FILE" 2>/dev/null || true
+        ( printf '%s\n' "$line" >> "$LOG_FILE" ) 2>/dev/null || true
     fi
 }
 log_error() { log_write error "$@"; }
@@ -978,22 +1098,19 @@ log_debug() { log_write debug "$@"; }
 STATE_FILE=""    # set by state_init based on STATE_DIR
 
 state_init() {
+    # _ensure_state_dir_writable may rewrite STATE_DIR to a user-
+    # private fallback if the canonical path isn't writable - run it
+    # FIRST so STATE_FILE picks up the corrected path.
+    _ensure_state_dir_writable
     STATE_FILE="${STATE_DIR}/state.db"
-    if [ ! -d "$STATE_DIR" ]; then
-        mkdir -p "$STATE_DIR" 2>/dev/null || {
-            log_warn "Could not create state dir $STATE_DIR - using /tmp"
-            STATE_DIR="/tmp"
-            STATE_FILE="${STATE_DIR}/appleRAID-state.db"
-            mkdir -p "$STATE_DIR" 2>/dev/null || true
-        }
-    fi
     if [ ! -f "$STATE_FILE" ]; then
         {
             echo "# appleRAID state file - DO NOT EDIT BY HAND"
             echo "# One line per active problem. Format:"
             echo "#   hash|severity|first_seen|last_alarm|last_email|summary"
             echo "# Lines starting with '#' are ignored."
-        } > "$STATE_FILE"
+        } > "$STATE_FILE" 2>/dev/null \
+            || errx 010 "Cannot create state file: $STATE_FILE"
     fi
 }
 
@@ -4961,34 +5078,49 @@ disk_serial_hash() {
     fi
 }
 
-# Look up cached -d type for this disk+serial. Empty if not cached.
+# Look up cached -d type for this disk+serial. Empty if not cached
+# OR if the cache file is unreadable (silent miss; not an error).
 smart_dtype_lookup() {
     disk="$1"; serial_hash="$2"
+    _ensure_state_dir_writable
     f=$(smart_cache_file)
-    [ -f "$f" ] || return 0
+    [ -f "$f" ] && [ -r "$f" ] || return 0
     awk -F'|' -v d="$disk" -v s="$serial_hash" '
         /^#/ { next }
         $1 == d && $2 == s { print $3; exit }
-    ' "$f"
+    ' "$f" 2>/dev/null
 }
 
 # Store -d type in cache (replaces any prior entry for same disk+serial).
+# Soft-fails (with a warning) when STATE_DIR is unwritable - the
+# probe loop will just re-run on the next invocation, so a missing
+# cache only costs a few smartctl probes, not correctness.
 smart_dtype_store() {
     disk="$1"; serial_hash="$2"; dtype="$3"
+    _ensure_state_dir_writable
     f=$(smart_cache_file)
     if [ ! -f "$f" ]; then
-        {
+        if ! {
             echo "# appleRAID smartctl -d type cache"
             echo "# Format: disk|serial_hash|dtype"
-        } > "$f"
+        } > "$f" 2>/dev/null; then
+            log_warn "smart-dtype-cache: cannot create $f - skipping cache write"
+            return 0
+        fi
     fi
-    tmp=$(mktemp "${f}.XXXXXX") || return 1
-    awk -F'|' -v d="$disk" -v s="$serial_hash" '
+    tmp=$(mktemp "${f}.XXXXXX" 2>/dev/null) \
+        || errx 012 "mktemp for smart-dtype-cache failed at ${f}.XXXXXX"
+    if ! awk -F'|' -v d="$disk" -v s="$serial_hash" '
         /^#/ { print; next }
         !($1 == d && $2 == s) { print }
-    ' "$f" > "$tmp"
-    printf '%s|%s|%s\n' "$disk" "$serial_hash" "$dtype" >> "$tmp"
-    mv "$tmp" "$f"
+    ' "$f" > "$tmp" 2>/dev/null; then
+        rm -f "$tmp"
+        errx 013 "smart-dtype-cache rewrite (awk) failed for $f"
+    fi
+    printf '%s|%s|%s\n' "$disk" "$serial_hash" "$dtype" >> "$tmp" \
+        || errx 013 "smart-dtype-cache: append of new row failed"
+    mv "$tmp" "$f" \
+        || errx 013 "smart-dtype-cache: atomic rename ${tmp} -> ${f} failed"
 }
 
 # Probe smartctl with the given -d type. Returns 0 if smartctl was
