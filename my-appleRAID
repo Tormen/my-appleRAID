@@ -5679,6 +5679,13 @@ _smart_compare_two() {
     healthB_raw=$($scB -H "$devB" 2>/dev/null)
     attrA=$($scA -A "$devA" 2>/dev/null)
     attrB=$($scB -A "$devB" 2>/dev/null)
+    # SMART self-test log + error log are firmware-resident on the
+    # drive itself - no external storage required. We pull them once
+    # here and parse below; counts/last-result feed comparison rows.
+    selftestA=$($scA -l selftest "$devA" 2>/dev/null)
+    selftestB=$($scB -l selftest "$devB" 2>/dev/null)
+    errlogA=$($scA -l error "$devA" 2>/dev/null)
+    errlogB=$($scB -l error "$devB" 2>/dev/null)
 
     # Helpers for parsing.
     _info_field() {
@@ -5786,6 +5793,108 @@ _smart_compare_two() {
     fi
     _row "-" "Age (years)" "${ageA_y:+${ageA_y}y}" "${ageB_y:+${ageB_y}y}" "$age_note"
 
+    # ---- Error log + self-test log (firmware-resident) ----
+    #
+    # The drive's own firmware keeps two persistent logs that survive
+    # reboots and travel with the disk:
+    #   - error log    (smartctl -l error)    - actual command failures
+    #   - self-test log (smartctl -l selftest) - results of every short
+    #                                            and long self-test
+    #
+    # 'health' fires a long self-test weekly per SELFTEST_LONG_SCHEDULE,
+    # so on a normally-monitored host these logs are populated and very
+    # useful for the comparison: a drive with a 'Completed: read failure'
+    # in its self-test log is a stronger discard signal than any
+    # threshold delta on an attribute.
+    #
+    # Parse:
+    #   _errlog_count(text) -> total errors recorded ('No Errors Logged'
+    #                          maps to 0)
+    #   _selftest_count(text) -> number of completed (any kind) entries
+    #   _selftest_last(text) -> status of the most recent entry, e.g.
+    #                          'Completed without error' or 'Completed:
+    #                          read failure'
+    _errlog_count() {
+        # Look for either 'No Errors Logged' (-> 0) or
+        # 'ATA Error Count: N' (-> N).
+        echo "$1" | awk '
+            /No Errors Logged/        { print 0; exit }
+            /ATA Error Count:/        { for (i = 1; i <= NF; i++) if (match($i, /^[0-9]+$/)) { print $i; exit } exit }
+            /Error logging capability:.*disabled/ { print "n/a"; exit }
+        '
+    }
+    _selftest_count() {
+        # Number of '# N  Description ...' rows.
+        echo "$1" | awk '/^# +[0-9]+ +/ { c++ } END { print c+0 }'
+    }
+    _selftest_last() {
+        # First entry under the header is the MOST RECENT (smartctl
+        # prints them newest-first). Status is a multi-word column
+        # between the description and the percentage-remaining.
+        # Capture the whole line, then extract the status piece.
+        echo "$1" | awk '
+            /^# +1 +/ {
+                # Drop "# N" and the description (1 or 2 words like
+                # "Short offline" / "Extended offline" / "Conveyance
+                # offline"). Easier to take the whole line and strip
+                # the prefix + percentage onward.
+                line = $0
+                sub(/^# +[0-9]+ +(Short|Extended|Conveyance|Selective)( offline| captive)? +/, "", line)
+                # Now line starts with the status (multi-word) and ends
+                # with "  XX% LIFETIME LBA". Strip from the percentage
+                # onward.
+                sub(/[[:space:]]+[0-9]+% .*/, "", line)
+                # Trim trailing whitespace.
+                sub(/[[:space:]]+$/, "", line)
+                print line
+                exit
+            }'
+    }
+    errA_n=$(_errlog_count "$errlogA")
+    errB_n=$(_errlog_count "$errlogB")
+    stcA_n=$(_selftest_count "$selftestA")
+    stcB_n=$(_selftest_count "$selftestB")
+    stlA=$(_selftest_last "$selftestA")
+    stlB=$(_selftest_last "$selftestB")
+
+    # Error-log row.
+    err_note=""
+    case "${errA_n:-?}" in
+        0|n/a|"") a_err_bad=0 ;;
+        *)
+            if [ "$errA_n" -gt 0 ] 2>/dev/null; then a_err_bad=1; else a_err_bad=0; fi ;;
+    esac
+    case "${errB_n:-?}" in
+        0|n/a|"") b_err_bad=0 ;;
+        *)
+            if [ "$errB_n" -gt 0 ] 2>/dev/null; then b_err_bad=1; else b_err_bad=0; fi ;;
+    esac
+    if [ "$a_err_bad" = "1" ] && [ "$b_err_bad" = "0" ]; then err_note="A has logged errors - DISCARD A"
+    elif [ "$b_err_bad" = "1" ] && [ "$a_err_bad" = "0" ]; then err_note="B has logged errors - DISCARD B"
+    elif [ "$a_err_bad" = "1" ] && [ "$b_err_bad" = "1" ]; then err_note="BOTH have logged errors"
+    else err_note="ok (both)"
+    fi
+    _row "-" "Error log entries" "${errA_n:-?}" "${errB_n:-?}" "$err_note"
+
+    # Self-test log rows: count + last result.
+    _row "-" "Self-tests recorded" "${stcA_n:-0}" "${stcB_n:-0}" ""
+    st_note=""
+    case "$stlA" in
+        ""|"-"|"Completed without error") a_st_bad=0 ;;
+        *Aborted*|*"in progress"*)        a_st_bad=0 ;;
+        *)                                a_st_bad=1 ;;
+    esac
+    case "$stlB" in
+        ""|"-"|"Completed without error") b_st_bad=0 ;;
+        *Aborted*|*"in progress"*)        b_st_bad=0 ;;
+        *)                                b_st_bad=1 ;;
+    esac
+    if [ "$a_st_bad" = "1" ] && [ "$b_st_bad" = "0" ]; then st_note="A failure - DISCARD A"
+    elif [ "$b_st_bad" = "1" ] && [ "$a_st_bad" = "0" ]; then st_note="B failure - DISCARD B"
+    elif [ "$a_st_bad" = "1" ] && [ "$b_st_bad" = "1" ]; then st_note="BOTH failures"
+    fi
+    _row "-" "Last self-test" "${stlA:--}" "${stlB:--}" "$st_note"
+
     # Killer attributes - the three that genuinely point at drive
     # failure when non-zero: reallocated sectors, current pending,
     # offline uncorrectable. ANY non-zero == discard that drive.
@@ -5878,7 +5987,26 @@ _smart_compare_two() {
     case "$healthA" in PASSED|OK|"") :;; *) verdict="A"; reason="overall health '$healthA' is not PASSED"; esac
     case "$healthB" in PASSED|OK|"") :;; *) [ -z "$verdict" ] && verdict="B" && reason="overall health '$healthB' is not PASSED";; esac
 
-    # 2) Killer attrs 5/197/198 (sector-level drive damage). 199 is
+    # 2) Self-test failure on one only - VERY strong signal (the drive
+    #    actually exercised its surface and reported a real fault).
+    if [ -z "$verdict" ]; then
+        if [ "$a_st_bad" = "1" ] && [ "$b_st_bad" = "0" ]; then
+            verdict="A"; reason="self-test failure on A (last result: '$stlA') - real surface fault"
+        elif [ "$b_st_bad" = "1" ] && [ "$a_st_bad" = "0" ]; then
+            verdict="B"; reason="self-test failure on B (last result: '$stlB') - real surface fault"
+        fi
+    fi
+
+    # 3) Error log entries on one only.
+    if [ -z "$verdict" ]; then
+        if [ "$a_err_bad" = "1" ] && [ "$b_err_bad" = "0" ]; then
+            verdict="A"; reason="error log entries on A (count=$errA_n) - firmware-recorded command failures"
+        elif [ "$b_err_bad" = "1" ] && [ "$a_err_bad" = "0" ]; then
+            verdict="B"; reason="error log entries on B (count=$errB_n) - firmware-recorded command failures"
+        fi
+    fi
+
+    # 4) Killer attrs 5/197/198 (sector-level drive damage). 199 is
     #    handled later as a low-priority hint because it's usually
     #    cable/port/connector noise rather than a drive defect.
     if [ -z "$verdict" ]; then
@@ -5963,9 +6091,27 @@ _smart_compare_two() {
         info "  Both passed killer attributes, helium, load cycles, and age delta thresholds."
     fi
     echo
-    explain "Note: this comparison only reads existing SMART attributes; it does not"
-    explain "run any test. For deeper inspection use '$SCRIPT_NAME smart <disk>' on"
-    explain "either drive (full attribute dump + self-test log + error log)."
+    # Closing note. If both drives have at least one recorded self-test,
+    # mention that we used those results in the comparison; otherwise
+    # say what was used and what was skipped.
+    if [ "${stcA_n:-0}" -gt 0 ] 2>/dev/null && [ "${stcB_n:-0}" -gt 0 ] 2>/dev/null; then
+        explain "Note: comparison includes attributes + error log + self-test history"
+        explain "(both drives have firmware-recorded self-tests; latest run on each is"
+        explain "shown in the 'Last self-test' row). For the full dump on either drive,"
+        explain "use '$SCRIPT_NAME smart <disk>'."
+    else
+        explain "Note: comparison includes attributes + error log; self-test history is"
+        if [ "${stcA_n:-0}" = 0 ] && [ "${stcB_n:-0}" = 0 ]; then
+            explain "  empty on BOTH drives (configure SELFTEST_LONG_SCHEDULE in the config"
+            explain "  to have the daemon run periodic long self-tests; results survive"
+            explain "  reboot in firmware-resident logs)."
+        elif [ "${stcA_n:-0}" = 0 ]; then
+            explain "  empty on Drive A (no self-tests have been run on this disk yet)."
+        else
+            explain "  empty on Drive B (no self-tests have been run on this disk yet)."
+        fi
+        explain "For the full dump on either drive, use '$SCRIPT_NAME smart <disk>'."
+    fi
 }
 
 # ----------------------------------------------------------------------
