@@ -5722,15 +5722,17 @@ _smart_compare_two() {
     step "SMART comparison: $devA  vs  $devB"
     info "Drive A: ${modelA:-?}  serial=${serialA:-?}  $devA"
     info "Drive B: ${modelB:-?}  serial=${serialB:-?}  $devB"
-    info "Overall health:  A=$healthA   B=$healthB"
 
-    # Age.
+    # Age - read from attr 9. Used both for the in-table age row
+    # AND by the verdict logic later, so compute here.
     pohA=$(_attr_raw "$attrA" 9)
     pohB=$(_attr_raw "$attrB" 9)
-    if [ -n "$pohA" ] && [ -n "$pohB" ]; then
+    ageA_y=""; ageB_y=""
+    if [ -n "$pohA" ]; then
         ageA_y=$(awk -v h="$pohA" 'BEGIN { printf "%.2f", h / 8760 }')
+    fi
+    if [ -n "$pohB" ]; then
         ageB_y=$(awk -v h="$pohB" 'BEGIN { printf "%.2f", h / 8760 }')
-        info "Age:             A=${pohA}h (${ageA_y} years)   B=${pohB}h (${ageB_y} years)"
     fi
 
     echo
@@ -5749,6 +5751,40 @@ _smart_compare_two() {
         # $1 id, $2 label, $3 a, $4 b, $5 note
         printf '%-4s %-25s %12s %12s   %s\n' "$1" "$2" "${3:-?}" "${4:-?}" "$5"
     }
+
+    # Top two rows: not actual SMART attributes, but values the user
+    # always wants to see at the top of the comparison. ID column
+    # uses '-' to flag them as derived/synthetic.
+    health_note="ok (both)"
+    case "$healthA" in PASSED|OK|"") :;; *)
+        case "$healthB" in PASSED|OK|"") health_note="A '$healthA' - DISCARD A" ;;
+                            *)            health_note="BOTH not PASSED" ;; esac ;;
+    esac
+    case "$healthB" in PASSED|OK|"") :;; *)
+        case "$healthA" in PASSED|OK|"") health_note="B '$healthB' - DISCARD B" ;;
+                            *)            health_note="BOTH not PASSED" ;; esac ;;
+    esac
+    _row "-" "Overall health" "$healthA" "$healthB" "$health_note"
+
+    # Age (years) row. Delta computed from POH (more precision than
+    # rounded years), but displayed as years for human readability.
+    age_note=""
+    if [ -n "$pohA" ] && [ -n "$pohB" ] \
+       && [ "$pohA" -gt 0 ] 2>/dev/null && [ "$pohB" -gt 0 ] 2>/dev/null; then
+        if [ "$pohA" -ge "$pohB" ]; then
+            d=$(awk -v hi="$pohA" -v lo="$pohB" 'BEGIN { printf "%.0f", (hi - lo) * 100 / lo }')
+            age_higher="A"
+        else
+            d=$(awk -v hi="$pohB" -v lo="$pohA" 'BEGIN { printf "%.0f", (hi - lo) * 100 / lo }')
+            age_higher="B"
+        fi
+        if [ "$d" -ge 5 ] 2>/dev/null; then
+            age_note="$age_higher older by ${d}%"
+        else
+            age_note="similar age"
+        fi
+    fi
+    _row "-" "Age (years)" "${ageA_y:+${ageA_y}y}" "${ageB_y:+${ageB_y}y}" "$age_note"
 
     # Killer attributes - the three that genuinely point at drive
     # failure when non-zero: reallocated sectors, current pending,
