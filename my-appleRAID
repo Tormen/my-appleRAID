@@ -5646,6 +5646,158 @@ _smart_drilldown_one() {
     fi
     echo
 
+    # ------------------------------------------------------------------
+    # Summary highlights. Mirrors the priority logic used by the 2-drive
+    # comparison (_smart_compare_two), but reduced to a single-drive
+    # verdict: HEALTHY / WATCH / RETIRE-CANDIDATE. Reuses $health_raw,
+    # $attrs, $selftest, $elog, $poh already collected above.
+    # ------------------------------------------------------------------
+    step "Summary"
+
+    # Helper: extract raw value of a numeric ATA attribute id from $attrs.
+    _attr_raw_one() {
+        echo "$attrs" | awk -v id="$1" '
+            $1+0 == id+0 && $2 ~ /^[A-Za-z]/ { print $10; exit }'
+    }
+
+    # Age in years from POH (8766 h/y).
+    age_y=""
+    if [ -n "$poh" ] && [ "$poh" -gt 0 ] 2>/dev/null; then
+        age_y=$(awk -v h="$poh" 'BEGIN { printf "%.1f", h/8766 }')
+    fi
+
+    # Killer attrs.
+    s5=$(_attr_raw_one 5)
+    s187=$(_attr_raw_one 187)
+    s197=$(_attr_raw_one 197)
+    s198=$(_attr_raw_one 198)
+    s199=$(_attr_raw_one 199)
+    s22=$(_attr_raw_one 22)
+
+    # Self-test status: count + last result.
+    st_count=0
+    st_last=""
+    st_failed=0
+    if [ -n "$selftest" ] && ! echo "$selftest" | grep -qE 'No self-tests have been logged|No Self-tests Logged'; then
+        st_count=$(echo "$selftest" | awk '/^# *[0-9]+/' | wc -l | awk '{print $1}')
+        st_last=$(echo "$selftest" | awk '
+            /^# *[0-9]+/ {
+                line=$0
+                # Status field is everything between Test_Description and Remaining
+                # but smartctl prints fixed columns; field 5 ("Status") is reliable.
+                gsub(/[[:space:]]+$/, "", line)
+                print line
+                exit
+            }')
+        if echo "$selftest" | grep -qE 'Failed|Completed: read failure|Completed: unknown failure|Completed: servo'; then
+            st_failed=1
+        fi
+    fi
+
+    # Error log count.
+    err_n=""
+    if [ -n "$elog" ] && ! echo "$elog" | grep -qE 'No Errors Logged|No errors logged'; then
+        err_n=$(echo "$elog" | awk -F': *' '
+            /Error [Cc]ount:/         { print $2; exit }
+            /Device Error Count:/     { print $2; exit }' | awk '{print $1}')
+    fi
+
+    # Render highlights.
+    printf '  %-22s %s\n' "Overall health:"  "${health_raw:-?}"
+    if [ -n "$age_y" ]; then
+        printf '  %-22s %s years  (POH=%sh)\n' "Age:" "$age_y" "$poh"
+    fi
+    if [ -n "$s5$s187$s197$s198" ]; then
+        printf '  %-22s 5=%s  187=%s  197=%s  198=%s\n' \
+            "Killer attrs (raw):" "${s5:-?}" "${s187:-?}" "${s197:-?}" "${s198:-?}"
+    fi
+    if [ -n "$s199" ]; then
+        printf '  %-22s %s  (cable/port noise; not a drive defect on its own)\n' \
+            "UDMA_CRC (199):" "$s199"
+    fi
+    if [ -n "$s22" ] && [ "$s22" -gt 0 ] 2>/dev/null; then
+        printf '  %-22s %s\n' "Helium level (22):" "$s22"
+    fi
+    if [ "$st_count" -gt 0 ] 2>/dev/null; then
+        printf '  %-22s %s recorded; last: %s\n' \
+            "Self-tests:" "$st_count" "${st_last:-?}"
+    else
+        printf '  %-22s none recorded yet\n' "Self-tests:"
+    fi
+    if [ -n "$err_n" ]; then
+        printf '  %-22s %s\n' "Error log:" "$err_n"
+    else
+        printf '  %-22s 0\n' "Error log:"
+    fi
+    echo
+
+    # Verdict logic (single drive). Priority matches _smart_compare_two.
+    verdict_level=""   # "" / WATCH / RETIRE
+    verdict_reason=""
+
+    case "$health_raw" in
+        PASSED|OK|"") :;;
+        *) verdict_level="RETIRE"; verdict_reason="overall health '$health_raw' is not PASSED" ;;
+    esac
+
+    if [ -z "$verdict_level" ] && [ "$st_failed" = "1" ]; then
+        verdict_level="RETIRE"
+        verdict_reason="self-test failure recorded - real surface fault"
+    fi
+
+    if [ -z "$verdict_level" ]; then
+        for v in "$s5" "$s197" "$s198"; do
+            if [ -n "$v" ] && [ "$v" -gt 0 ] 2>/dev/null; then
+                verdict_level="RETIRE"
+                verdict_reason="killer attribute non-zero (5=${s5:-0} 197=${s197:-0} 198=${s198:-0}) - sector damage"
+                break
+            fi
+        done
+    fi
+
+    if [ -z "$verdict_level" ] && [ -n "$err_n" ] && [ "$err_n" -gt 0 ] 2>/dev/null; then
+        verdict_level="WATCH"
+        verdict_reason="firmware-recorded error count = $err_n - inspect section 4 above"
+    fi
+
+    if [ -z "$verdict_level" ] && [ -n "$s187" ] && [ "$s187" -gt 0 ] 2>/dev/null; then
+        verdict_level="WATCH"
+        verdict_reason="Reported_Uncorrect (187) = $s187 - drive saw uncorrectable reads"
+    fi
+
+    if [ -z "$verdict_level" ] && [ -n "$s199" ] && [ "$s199" -gt 0 ] 2>/dev/null; then
+        verdict_level="WATCH"
+        verdict_reason="UDMA_CRC (199) = $s199 - check SATA cable / port (not a drive defect on its own)"
+    fi
+
+    if [ -z "$verdict_level" ] && [ -n "$age_y" ]; then
+        # >7 years: WATCH; >10 years: still WATCH but stronger phrasing.
+        age_int=${age_y%.*}
+        if [ "$age_int" -ge 10 ] 2>/dev/null; then
+            verdict_level="WATCH"
+            verdict_reason="drive is ${age_y} years old - well past typical lifetime, plan replacement"
+        elif [ "$age_int" -ge 7 ] 2>/dev/null; then
+            verdict_level="WATCH"
+            verdict_reason="drive is ${age_y} years old - approaching end of typical lifetime"
+        fi
+    fi
+
+    if [ "$st_count" = "0" ]; then
+        if [ -z "$verdict_level" ]; then
+            verdict_level="WATCH"
+            verdict_reason="no self-tests recorded - run 'sudo $sc -t short $dev' to populate the log"
+        else
+            verdict_reason="$verdict_reason; also: no self-tests recorded yet"
+        fi
+    fi
+
+    case "$verdict_level" in
+        RETIRE) errmsg "VERDICT: RETIRE-CANDIDATE - $verdict_reason" ;;
+        WATCH)  warn   "VERDICT: WATCH - $verdict_reason" ;;
+        *)      ok     "VERDICT: HEALTHY - no concerning indicators across health, killers, self-tests, error log, age." ;;
+    esac
+    echo
+
     step "Run a fresh self-test"
     explain "Short test:  sudo $sc -t short $dev   (~2 min, online; quick electronics + media sample)"
     explain "Long  test:  sudo $sc -t long  $dev   (hours, full surface scan)"
