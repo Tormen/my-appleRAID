@@ -367,9 +367,31 @@ preflight() {
 resolve_disk() {
     input="$1"
     case "$input" in
+        # /dev/diskNsM (a partition) -> walk up to the whole disk.
+        /dev/disk[0-9]*s[0-9]*)
+            base=$(printf '%s' "$input" | sed 's|^/dev/||; s/s[0-9]*$//')
+            echo "/dev/$base"
+            ;;
         /dev/disk[0-9]*) echo "$input" ;;
+        disk[0-9]*s[0-9]*)
+            base=$(printf '%s' "$input" | sed 's/s[0-9]*$//')
+            echo "/dev/$base"
+            ;;
         disk[0-9]*)      echo "/dev/$input" ;;
         [0-9]*)          echo "/dev/disk$input" ;;
+        # Anything else starting with '/' is treated as a mount path
+        # (e.g. '/Volumes/backup', '/' for the boot volume, ...).
+        # Use 'diskutil info' to discover the partition node, then
+        # the 'Part of Whole' field to walk up to the whole disk.
+        /*)
+            di=$(diskutil info "$input" 2>/dev/null) || return 1
+            [ -n "$di" ] || return 1
+            parent=$(printf '%s\n' "$di" \
+                | awk -F': +' '/Part of Whole:/ {print $2; exit}' \
+                | sed 's/[[:space:]]*$//')
+            [ -n "$parent" ] || return 1
+            echo "/dev/$parent"
+            ;;
         *) return 1 ;;
     esac
 }
@@ -7504,9 +7526,14 @@ USB bridges that intercept ATA pass-through may still ignore it;
 in that case the warning is non-fatal and the eject still runs.
 
 ARGUMENTS
-  <disk>      Optional. Disk number (e.g. 3), short name (disk3) or
-              full path (/dev/disk3). If omitted, you get an
-              interactive picker listing all attached physical disks.
+  <disk>      Optional. One of:
+                3                  disk number
+                disk3              short name
+                /dev/disk3         full device path
+                /dev/disk3s2       partition path (resolved to whole disk)
+                /Volumes/foo       mount point (walked back to whole disk)
+              If omitted, you get an interactive picker listing all
+              attached physical disks.
 
 OPTIONS
   --release   Only meaningful when the disk is an active AppleRAID
