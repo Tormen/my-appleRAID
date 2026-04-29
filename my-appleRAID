@@ -250,16 +250,25 @@ err() {
 
 # Make STATE_DIR a writable directory, falling back to a user-private
 # tmp dir when the configured value isn't writable by the current uid.
+#
+# A sentinel ($_STATE_DIR_CHECKED) makes this idempotent and silent
+# after the first call - the function is invoked from multiple sites
+# (state_init, smart_dtype_lookup, smart_dtype_store, ...) and we
+# don't want each one to log the same fallback warning.
+_STATE_DIR_CHECKED=0
 _ensure_state_dir_writable() {
+    [ "${_STATE_DIR_CHECKED:-0}" = "1" ] && return 0
     [ -n "${STATE_DIR:-}" ] || STATE_DIR="/var/db/my-appleRAID"
     # Already writable: done.
     if [ -d "$STATE_DIR" ] && [ -w "$STATE_DIR" ]; then
+        _STATE_DIR_CHECKED=1
         return 0
     fi
     # Doesn't exist yet but we can create it.
     if [ ! -d "$STATE_DIR" ] \
        && mkdir -p "$STATE_DIR" 2>/dev/null \
        && [ -w "$STATE_DIR" ]; then
+        _STATE_DIR_CHECKED=1
         return 0
     fi
     # Not writable. Fall back to user-private location.
@@ -272,6 +281,7 @@ _ensure_state_dir_writable() {
     fi
     log_warn "STATE_DIR='$STATE_DIR' not writable by uid=$(id -u 2>/dev/null); using fallback: $_fb"
     STATE_DIR="$_fb"
+    _STATE_DIR_CHECKED=1
     return 0
 }
 
@@ -279,7 +289,13 @@ _ensure_state_dir_writable() {
 # the variable so log_write skips the file-append branch silently.
 # Avoids cascading 'cannot create <path>: Permission denied' messages
 # from the shell for every log line.
+#
+# A sentinel makes the check idempotent (cfg_load may be called more
+# than once in a single run for some commands).
+_LOG_FILE_CHECKED=0
 _ensure_log_file_writable() {
+    [ "${_LOG_FILE_CHECKED:-0}" = "1" ] && return 0
+    _LOG_FILE_CHECKED=1
     [ -n "${LOG_FILE:-}" ] || return 0
     _ld=$(dirname "$LOG_FILE")
     # If the log file already exists, we can append iff it's writable.
