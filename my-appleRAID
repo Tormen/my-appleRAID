@@ -7488,9 +7488,11 @@ EOF
     # Run writability checks ONCE in the main shell BEFORE any
     # subshell-invoked smart_dtype_lookup / smart_dtype_store.
     # Subshells inherit STATE_DIR / LOG_FILE at fork time, so doing
-    # the fallback here means the warnings fire at most once and
-    # the corrected paths are visible in every downstream subshell.
-    cfg_load 2>/dev/null
+    # the fallback here means the corrected paths are visible in
+    # every downstream subshell. cfg_load itself drives the writability
+    # checks, so we don't suppress its stderr - otherwise the
+    # 'using fallback ...' warning would be silenced too.
+    cfg_load
     _ensure_state_dir_writable
 
     _smart_drilldown_one "${dev#/dev/}"
