@@ -147,7 +147,7 @@ parse_global_flags() {
 info()    { printf '%s[INFO]%s %s\n'  "${C_BLUE}"   "${C_RESET}" "$*"; }
 ok()      { printf '%s[ OK ]%s %s\n'  "${C_GREEN}"  "${C_RESET}" "$*"; }
 warn()    { printf '%s[WARN]%s %s\n'  "${C_YELLOW}" "${C_RESET}" "$*" >&2; }
-err()     { printf '%s[FAIL]%s %s\n'  "${C_RED}"    "${C_RESET}" "$*" >&2; }
+errmsg()     { printf '%s[FAIL]%s %s\n'  "${C_RED}"    "${C_RESET}" "$*" >&2; }
 step()    { printf '\n%s=== %s ===%s\n' "${C_BOLD}${C_CYAN}" "$*" "${C_RESET}"; }
 explain() { printf '%s%s%s\n' "${C_DIM}" "$*" "${C_RESET}"; }
 
@@ -178,32 +178,48 @@ pause() {
 }
 
 die() {
-    err "$*"
+    errmsg "$*"
     exit 1
 }
 
 # ----------------------------------------------------------------------
-# errx - hard-fail with a UNIQUE numeric error code so post-mortem
+# err - hard-fail with a UNIQUE numeric error code so post-mortem
 # debugging can grep the source for the exact origin of any error
-# the user sees in the terminal. Use this in preference to bare 'die'
-# for any newly-added failure path.
+# the user sees in the terminal. Use this for any newly-added
+# failure path. The 'errmsg' helper above is the non-exiting
+# message-only variant, kept for the existing log-style call sites
+# whose flow continues past the message.
 #
-# Usage:   errx <code> [<msg>] [<exitCode>]
+# Usage:   err <code> [<msg>] [<exitCode>]
 # Output:  "ERROR <code> [<exitCode>]: <msg>" on stderr, then exit.
 #          (no message form: "ERROR <code> [<exitCode>]")
 #
+# Idiomatic call site:
+#
+#       command || err 022 "optional message"
+#
 # Error-code registry (keep in sync with the call sites; grep for
-# 'errx '). When adding a new errx call site, take the NEXT unused
-# 3-digit number and bump _ERRX_HIGHEST below.
+# 'err 0' / 'err [0-9]'). When adding a new err call site, take the
+# NEXT unused 3-digit number and bump _ERR_HIGHEST below.
 #
 #   010   STATE_DIR not writable AND fallback under TMPDIR also failed
-#   011   LOG_FILE parent dir not writable; cannot append to log
+#   011   LOG_FILE parent dir not writable (reserved; soft-fallback)
 #   012   smart-dtype-cache: mktemp for atomic rewrite failed
-#   013   smart-dtype-cache: write of cache row failed
+#   013   smart-dtype-cache: awk rewrite OR write of cache row failed
+#   014   install-daemon: writing the LaunchDaemon plist failed
+#   015   install-daemon: chown root:wheel of plist failed
+#   016   install-daemon: chmod 644 of plist failed
+#   017   uninstall-daemon: rm of LaunchDaemon plist failed
+#   018   state-DB: mktemp for state-put atomic rewrite failed
+#   019   state-DB: awk rewrite during state-put failed
+#   020   state-DB: append of new row during state-put failed
+#   021   state-DB: atomic rename during state-put failed
+#   022   state-DB: awk rewrite during state-delete failed
+#   023   state-DB: atomic rename during state-delete failed
 #
-# _ERRX_HIGHEST=013
+# _ERR_HIGHEST=023
 # ----------------------------------------------------------------------
-errx() {
+err() {
     _ec_code="$1"
     _ec_msg="${2:-}"
     _ec_exit="${3:-1}"
@@ -249,10 +265,10 @@ _ensure_state_dir_writable() {
     # Not writable. Fall back to user-private location.
     _fb="${TMPDIR:-/tmp}/my-appleRAID-$(id -u 2>/dev/null || echo nobody)"
     if [ ! -d "$_fb" ] && ! mkdir -p "$_fb" 2>/dev/null; then
-        errx 010 "Cannot write to STATE_DIR='$STATE_DIR' AND fallback '$_fb' creation failed"
+        err 010 "Cannot write to STATE_DIR='$STATE_DIR' AND fallback '$_fb' creation failed"
     fi
     if [ ! -w "$_fb" ]; then
-        errx 010 "Fallback state dir '$_fb' is not writable"
+        err 010 "Fallback state dir '$_fb' is not writable"
     fi
     log_warn "STATE_DIR='$STATE_DIR' not writable by uid=$(id -u 2>/dev/null); using fallback: $_fb"
     STATE_DIR="$_fb"
@@ -375,7 +391,7 @@ assert_safe_target() {
                 if (base == d) { print n; exit }
             }
         ')
-        err "$dev is currently a member of an existing AppleRAID set${_set_name:+ '$_set_name'}."
+        errmsg "$dev is currently a member of an existing AppleRAID set${_set_name:+ '$_set_name'}."
         explain "Two ways to proceed:"
         explain "  - Destroy the set first:  $SCRIPT_NAME destroy${_set_name:+ '$_set_name'}"
         explain "  - Re-run 'create' with --force, which will release just the target"
@@ -1110,7 +1126,7 @@ state_init() {
             echo "#   hash|severity|first_seen|last_alarm|last_email|summary"
             echo "# Lines starting with '#' are ignored."
         } > "$STATE_FILE" 2>/dev/null \
-            || errx 010 "Cannot create state file: $STATE_FILE"
+            || err 010 "Cannot create state file: $STATE_FILE"
     fi
 }
 
@@ -1134,13 +1150,17 @@ state_get() {
 # Args: hash, severity, first_seen, last_alarm, last_email, summary
 state_put() {
     h="$1"; sev="$2"; first="$3"; alarm="$4"; email="$5"; summary="$6"
-    tmp=$(mktemp "${STATE_FILE}.XXXXXX") || die "mktemp failed"
+    tmp=$(mktemp "${STATE_FILE}.XXXXXX") \
+        || err 018 "mktemp for state-DB rewrite failed at ${STATE_FILE}.XXXXXX"
     awk -F'|' -v h="$h" '
         /^#/ { print; next }
         $1 != h { print }
-    ' "$STATE_FILE" > "$tmp"
-    printf '%s|%s|%s|%s|%s|%s\n' "$h" "$sev" "$first" "$alarm" "$email" "$summary" >> "$tmp"
-    mv "$tmp" "$STATE_FILE"
+    ' "$STATE_FILE" > "$tmp" \
+        || err 019 "awk rewrite of state-DB failed (writing to $tmp)"
+    printf '%s|%s|%s|%s|%s|%s\n' "$h" "$sev" "$first" "$alarm" "$email" "$summary" >> "$tmp" \
+        || err 020 "appending new state-DB row failed (to $tmp)"
+    mv "$tmp" "$STATE_FILE" \
+        || err 021 "atomic rename of state-DB failed: $tmp -> $STATE_FILE"
 }
 
 # Remove a problem by hash.
@@ -1151,8 +1171,10 @@ state_delete() {
     awk -F'|' -v h="$h" '
         /^#/ { print; next }
         $1 != h { print }
-    ' "$STATE_FILE" > "$tmp"
-    mv "$tmp" "$STATE_FILE"
+    ' "$STATE_FILE" > "$tmp" \
+        || err 022 "awk rewrite of state-DB during delete failed (writing to $tmp)"
+    mv "$tmp" "$STATE_FILE" \
+        || err 023 "atomic rename of state-DB during delete failed: $tmp -> $STATE_FILE"
 }
 
 # List all current problem hashes (one per line).
@@ -2790,7 +2812,7 @@ cmd_show_config() {
     # a state that doesn't exist.
     case "$LOADED_CONFIG" in
         *"(none"*|"")
-            err "No config file found on the search path."
+            errmsg "No config file found on the search path."
             echo
             info "Searched locations (first readable wins):"
             info "  \$MY_APPLERAID_CONFIG              (env var, for testing)"
@@ -2878,7 +2900,7 @@ format_duration() {
 # ----------------------------------------------------------------------
 cmd_create_config() {
     if [ $# -lt 1 ]; then
-        err "Usage: $SCRIPT_NAME create-config <path>"
+        errmsg "Usage: $SCRIPT_NAME create-config <path>"
         echo
         info "Suggested locations (any one works; first readable wins):"
         info "  /LINKS/default/my-appleRAID.conf        # your symlink-based location"
@@ -3522,9 +3544,12 @@ EOF
         # Write plist via sudo by piping the rendered tmpfile into a
         # root-owned 'cat'. Using cp would also work; this matches the
         # heredoc style of the rest of the script.
-        run sudo sh -c "cat > '$plist'" < "$new_tmp"
-        run sudo chown root:wheel "$plist"
-        run sudo chmod 644 "$plist"
+        run sudo sh -c "cat > '$plist'" < "$new_tmp" \
+            || err 014 "writing the LaunchDaemon plist to $plist failed"
+        run sudo chown root:wheel "$plist" \
+            || err 015 "chown root:wheel $plist failed"
+        run sudo chmod 644 "$plist" \
+            || err 016 "chmod 644 $plist failed"
     fi
 
     rm -f "$new_tmp"
@@ -3572,7 +3597,7 @@ cmd_daemon_status() {
         mtime=$(stat -f '%Sm' -t '%Y-%m-%d %H:%M:%S' "$plist" 2>/dev/null)
         ok "Present. Last modified: $mtime"
     else
-        err "Plist file missing: $plist"
+        errmsg "Plist file missing: $plist"
         warn "Run:  sudo $SCRIPT_NAME install-daemon"
         return 1
     fi
@@ -3617,7 +3642,7 @@ cmd_daemon_status() {
     elif sudo -n launchctl list "$label" >/dev/null 2>&1; then
         ok "Loaded (visible via sudo)."
     else
-        err "NOT loaded in launchd."
+        errmsg "NOT loaded in launchd."
         warn "Run:  sudo launchctl bootstrap system $plist"
         warn "Or:   sudo $SCRIPT_NAME install-daemon"
         # Continue with remaining checks anyway - the log / state info
@@ -3732,11 +3757,11 @@ cmd_daemon_status() {
         ok "smartctl is installed: $(command -v smartctl)"
         ok "  SMART monitoring is ACTIVE."
     else
-        err "smartctl is NOT INSTALLED."
-        err "  SMART monitoring is DISABLED."
-        err "  Temperature, pending/reallocated sectors, drive health -"
-        err "  NONE of these are being monitored. A failing drive could"
-        err "  go unnoticed until it causes RAID degradation or data loss."
+        errmsg "smartctl is NOT INSTALLED."
+        errmsg "  SMART monitoring is DISABLED."
+        errmsg "  Temperature, pending/reallocated sectors, drive health -"
+        errmsg "  NONE of these are being monitored. A failing drive could"
+        errmsg "  go unnoticed until it causes RAID degradation or data loss."
         echo
         info "  Fix:  brew install smartmontools"
         info "  Or:   set SMART_CHECK_ENABLED=no in config to silence the warning."
@@ -3765,7 +3790,8 @@ cmd_uninstall_daemon() {
     run sudo launchctl bootout system "$plist" 2>/dev/null \
         || run sudo launchctl unload "$plist" 2>/dev/null \
         || warn "launchctl unload failed (maybe not loaded)"
-    run sudo rm -f "$plist"
+    run sudo rm -f "$plist" \
+        || err 017 "removing the LaunchDaemon plist file $plist failed"
     ok "Uninstalled."
 }
 
@@ -4141,7 +4167,7 @@ softraid_release_volume() {
     # quickzero the wrong thing.
     if ! softraid_volume_is_softraid "$vol"; then
         flavor=$(softraid_volume_flavor "$vol")
-        err "Refusing to release: \"$vol\" is not a SoftRAID volume (softraidtool reports: ${flavor:-unknown})."
+        errmsg "Refusing to release: \"$vol\" is not a SoftRAID volume (softraidtool reports: ${flavor:-unknown})."
         return 1
     fi
 
@@ -4232,7 +4258,7 @@ cmd_uninstall_softraid() {
     if [ -z "$sr_disks" ]; then
         ok "No SoftRAID volumes detected."
     else
-        err "SoftRAID membership still present on:"
+        errmsg "SoftRAID membership still present on:"
         echo "$sr_disks" | sed 's|^|    /dev/|'
         warn "Migrate or delete these volumes BEFORE uninstalling SoftRAID."
         warn "Use: appleRAID migrate-softraid"
@@ -4516,9 +4542,9 @@ EOF
     sr_unmount=no
     if [ "$sr_member1" = "yes" ] || [ "$sr_member2" = "yes" ]; then
         if [ "$sr_member1" != "$sr_member2" ]; then
-            err "Asymmetric SoftRAID state:"
-            err "  /dev/$bsd1 SoftRAID-controlled: $sr_member1"
-            err "  /dev/$bsd2 SoftRAID-controlled: $sr_member2"
+            errmsg "Asymmetric SoftRAID state:"
+            errmsg "  /dev/$bsd1 SoftRAID-controlled: $sr_member1"
+            errmsg "  /dev/$bsd2 SoftRAID-controlled: $sr_member2"
             die "Both members must be in the same state. Inspect with: $SCRIPT_NAME disks"
         fi
 
@@ -4528,8 +4554,8 @@ EOF
             die "SoftRAID claims one of the disks but no volume name was found. Run: $SCRIPT_NAME disks"
         fi
         if [ "$vol1" != "$vol2" ]; then
-            err "/dev/$bsd1 belongs to SoftRAID volume \"$vol1\""
-            err "/dev/$bsd2 belongs to SoftRAID volume \"$vol2\""
+            errmsg "/dev/$bsd1 belongs to SoftRAID volume \"$vol1\""
+            errmsg "/dev/$bsd2 belongs to SoftRAID volume \"$vol2\""
             die "Cannot migrate two unrelated SoftRAID volumes in one run."
         fi
         sr_vol="$vol1"
@@ -4542,8 +4568,8 @@ EOF
     sudo \"$SOFTRAID_TOOL\" volume \"$sr_vol\" info"
                 ;;
             *)
-                err "Volume \"$sr_vol\" is RAID level '$sr_level' - not a mirror."
-                err "'migrate-softraid' only supports RAID 1 (mirrors)."
+                errmsg "Volume \"$sr_vol\" is RAID level '$sr_level' - not a mirror."
+                errmsg "'migrate-softraid' only supports RAID 1 (mirrors)."
                 info "To just tear down a non-mirror SoftRAID volume (delete + quickzero"
                 info "all its members) without creating an AppleRAID set, run:"
                 info "    $SCRIPT_NAME release-softraid \"$sr_vol\""
@@ -4701,9 +4727,9 @@ SoftRAID does not appear to be installed."
     # from being torn down by accident.
     if ! softraid_volume_is_softraid "$vol"; then
         flavor=$(softraid_volume_flavor "$vol")
-        err "Volume \"$vol\" is NOT a SoftRAID volume."
-        err "softraidtool reports it as: ${flavor:-(unknown)}"
-        err "Refusing to run destructive teardown against a non-SoftRAID volume."
+        errmsg "Volume \"$vol\" is NOT a SoftRAID volume."
+        errmsg "softraidtool reports it as: ${flavor:-(unknown)}"
+        errmsg "Refusing to run destructive teardown against a non-SoftRAID volume."
         info "If you meant a different SoftRAID volume, list them with:"
         info "    sudo \"$SOFTRAID_TOOL\" volume all info | grep -nE '^Info for \"|Volume is SoftRAID'"
         die "Aborted - safety check (not a SoftRAID volume)."
@@ -4913,9 +4939,9 @@ cmd_report() {
     # --- SMART polling ---
     step "SMART polling"
     if ! command -v smartctl >/dev/null 2>&1; then
-        err "smartctl is NOT INSTALLED - SMART checks are DISABLED."
-        err "  No temperature / sector / health monitoring is happening."
-        err "  Install with:  brew install smartmontools"
+        errmsg "smartctl is NOT INSTALLED - SMART checks are DISABLED."
+        errmsg "  No temperature / sector / health monitoring is happening."
+        errmsg "  Install with:  brew install smartmontools"
     else
         ok "smartctl is available: $(command -v smartctl)"
         f=$(smart_last_run_file)
@@ -5109,18 +5135,18 @@ smart_dtype_store() {
         fi
     fi
     tmp=$(mktemp "${f}.XXXXXX" 2>/dev/null) \
-        || errx 012 "mktemp for smart-dtype-cache failed at ${f}.XXXXXX"
+        || err 012 "mktemp for smart-dtype-cache failed at ${f}.XXXXXX"
     if ! awk -F'|' -v d="$disk" -v s="$serial_hash" '
         /^#/ { print; next }
         !($1 == d && $2 == s) { print }
     ' "$f" > "$tmp" 2>/dev/null; then
         rm -f "$tmp"
-        errx 013 "smart-dtype-cache rewrite (awk) failed for $f"
+        err 013 "smart-dtype-cache rewrite (awk) failed for $f"
     fi
     printf '%s|%s|%s\n' "$disk" "$serial_hash" "$dtype" >> "$tmp" \
-        || errx 013 "smart-dtype-cache: append of new row failed"
+        || err 013 "smart-dtype-cache: append of new row failed"
     mv "$tmp" "$f" \
-        || errx 013 "smart-dtype-cache: atomic rename ${tmp} -> ${f} failed"
+        || err 013 "smart-dtype-cache: atomic rename ${tmp} -> ${f} failed"
 }
 
 # Probe smartctl with the given -d type. Returns 0 if smartctl was
@@ -5359,7 +5385,7 @@ _smart_drilldown_one() {
             /Available Spare:/         { v=$2; gsub(/^ +| +$/,"",v); n=v; gsub(/%/,"",n); if (n+0 < 100 && n != "") printf "    %s = %s\n", $1, v }')
 
         if [ -n "$ata_nonzero" ] || [ -n "$nvme_warn" ]; then
-            err "Pre-failure indicator(s) found:"
+            errmsg "Pre-failure indicator(s) found:"
             [ -n "$ata_nonzero" ] && printf '%s\n' "$ata_nonzero"
             [ -n "$nvme_warn"   ] && printf '%s\n' "$nvme_warn"
         else
@@ -5448,7 +5474,7 @@ _smart_drilldown_one() {
         if [ -n "$ec" ] && [ "$ec" = "0" ]; then
             ok "Error count: 0"
         elif [ -n "$ec" ]; then
-            err "Error count: $ec  (firmware-recorded errors - inspect below)"
+            errmsg "Error count: $ec  (firmware-recorded errors - inspect below)"
             echo
             if [ -n "$poh" ]; then
                 explain "Each 'power-on lifetime: N hours' line is annotated with how long ago"
@@ -6981,7 +7007,7 @@ pick_physical_disk_interactively() {
     done
 
     if [ "$_i" -eq 0 ]; then
-        err "No physical disks found."
+        errmsg "No physical disks found."
         return 1
     fi
 
@@ -6995,7 +7021,7 @@ pick_physical_disk_interactively() {
         *[!0-9]*)    err "Invalid choice: $_choice"; return 1 ;;
     esac
     if [ "$_choice" -lt 1 ] || [ "$_choice" -gt "$_i" ]; then
-        err "Invalid choice: $_choice (must be 1..$_i)"
+        errmsg "Invalid choice: $_choice (must be 1..$_i)"
         return 1
     fi
 
@@ -7182,7 +7208,7 @@ EOF
     release_from_raid=0
     if [ "$is_raid_member" = "1" ]; then
         if [ "$do_release" = "0" ]; then
-            err "$dev is an active member of an AppleRAID set."
+            errmsg "$dev is an active member of an AppleRAID set."
             echo
             explain "Plain eject won't work: AppleRAID claims member disks at the"
             explain "kernel level, so 'diskutil eject' fails while the membership"
@@ -7258,7 +7284,7 @@ EOF
             info "rebuild with:  $SCRIPT_NAME repair <set>"
         fi
     else
-        err "diskutil eject failed for $dev."
+        errmsg "diskutil eject failed for $dev."
         explain "Possible reasons:"
         explain "  - A process is still holding files open on a volume on $dev."
         explain "    Try: lsof +D /Volumes/<name>  (or 'sudo lsof' for system processes)"
@@ -7508,7 +7534,7 @@ cmd_verify_wipe() {
     if verify_wipe "$dev"; then
         ok "$dev is cleanly zeroed at both ends."
     else
-        err "$dev still has non-zero data in first or last 100 MB."
+        errmsg "$dev still has non-zero data in first or last 100 MB."
         exit 1
     fi
 }
@@ -8001,17 +8027,17 @@ cmd_repair() {
 
             case "$chosen_member_status" in
                 Online)
-                    err "$dev is currently an ONLINE member of set '$target_set_name'."
-                    err "Nothing to repair on this disk - it's already part of an active mirror."
+                    errmsg "$dev is currently an ONLINE member of set '$target_set_name'."
+                    errmsg "Nothing to repair on this disk - it's already part of an active mirror."
                     explain "Possible reasons:"
                     explain "  - You picked the wrong disk. Use '$SCRIPT_NAME disks' to find a free one."
                     explain "  - You meant the OTHER member of this set."
                     die "Aborted - active member."
                     ;;
                 *[Rr]ebuild*)
-                    err "$dev is currently REBUILDING as a member of '$target_set_name'"
-                    err "  (status: $chosen_member_status)."
-                    err "A rebuild is already running. Don't start another one."
+                    errmsg "$dev is currently REBUILDING as a member of '$target_set_name'"
+                    errmsg "  (status: $chosen_member_status)."
+                    errmsg "A rebuild is already running. Don't start another one."
                     explain "Watch progress:"
                     explain "    $SCRIPT_NAME watch $target_set_name"
                     explain "Wait for it to finish, then re-run repair only if it didn't recover."
@@ -8081,7 +8107,7 @@ cmd_repair() {
         info "Existing member size: $raid_member_size bytes"
         info "Replacement size:     $new_size bytes"
         if [ "$new_size" -lt "$raid_member_size" ] 2>/dev/null; then
-            err "Replacement is SMALLER than existing member. Cannot proceed."
+            errmsg "Replacement is SMALLER than existing member. Cannot proceed."
             exit 1
         fi
     fi
@@ -8205,7 +8231,7 @@ _cmd_test_one_uuid() {
     if [ "$st" = "Online" ]; then
         ok "Status: $st"
     else
-        err "Status: $st (expected Online)"
+        errmsg "Status: $st (expected Online)"
         fails=$((fails + 1))
     fi
 
@@ -8229,7 +8255,7 @@ _cmd_test_one_uuid() {
     if [ -z "$bad_members" ]; then
         ok "All members are Online."
     else
-        err "Non-Online members found:"
+        errmsg "Non-Online members found:"
         echo "$bad_members" | sed 's/^/    /'
         fails=$((fails + 1))
     fi
@@ -8239,7 +8265,7 @@ _cmd_test_one_uuid() {
     if [ -b "/dev/$dev" ] || diskutil info "/dev/$dev" >/dev/null 2>&1; then
         ok "/dev/$dev is present."
     else
-        err "/dev/$dev not found."
+        errmsg "/dev/$dev not found."
         fails=$((fails + 1))
     fi
 
@@ -8291,12 +8317,12 @@ _cmd_test_one_uuid() {
             if [ "$readback" = "$payload" ]; then
                 ok "Write-then-read succeeded and content matches."
             else
-                err "Readback mismatch!"
+                errmsg "Readback mismatch!"
                 fails=$((fails + 1))
             fi
             rm -f "$probe"
         else
-            err "Could not write probe file to $probe (permissions? disk full?)"
+            errmsg "Could not write probe file to $probe (permissions? disk full?)"
             fails=$((fails + 1))
         fi
     fi
@@ -8306,7 +8332,7 @@ _cmd_test_one_uuid() {
         ok "All tests passed."
         return 0
     else
-        err "$fails test(s) failed."
+        errmsg "$fails test(s) failed."
         return 1
     fi
 }
@@ -8373,7 +8399,7 @@ EOF
             return 0
         else
             _nfail=$(printf '%s\n' "$_failed" | grep -c .)
-            err "$_nfail of $_total RAID set(s) failed:"
+            errmsg "$_nfail of $_total RAID set(s) failed:"
             printf '%s\n' "$_failed" | sed 's/^/    - /'
             exit 1
         fi
@@ -9216,7 +9242,7 @@ main() {
         release-softraid)   cmd_release_softraid "$@" ;;
         uninstall-softraid) cmd_uninstall_softraid "$@" ;;
         *)
-            err "Unknown command: $cmd"
+            errmsg "Unknown command: $cmd"
             echo
             cmd_help
             exit 2
