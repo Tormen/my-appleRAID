@@ -446,6 +446,15 @@ activity is the only available signal.
 3. Self-test log with calendar dates derived from
    `Power_On_Hours - LifeTime`
 4. Firmware error log with same date annotation
+5. **Summary highlights + verdict** — one-screen recap of overall
+   health, age (POH → years), the five killer attributes, helium
+   level, self-test count + last result, and error-log count;
+   followed by a single-line verdict: `HEALTHY`, `WATCH`, or
+   `RETIRE-CANDIDATE`. The verdict logic mirrors the priority
+   ordering used by `smart <a> <b>` comparison (health → self-test
+   failure → killers 5/197/198 → error-log entries → 187 → UDMA_CRC
+   → age threshold), so a single-drive verdict and a two-drive
+   verdict use the same evidence weighting.
 
 The killer attributes whose RAW value should always be `0`:
 
