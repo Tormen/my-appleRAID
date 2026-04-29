@@ -1017,8 +1017,8 @@ cfg_set_defaults() {
     EMAIL_INTERVAL=14400                   # 4 hours
     # SMART polling & self-tests
     SMART_POLL_INTERVAL=86400              # 1 day
-    SELFTEST_SHORT_SCHEDULE="never"        # never|daily|weekly
-    SELFTEST_LONG_SCHEDULE="weekly"        # never|daily|weekly
+    SELFTEST_SHORT_SCHEDULE="daily"        # never|daily|weekly  (~2 min per drive)
+    SELFTEST_LONG_SCHEDULE="weekly"        # never|daily|weekly  (hours; scales with disk size)
     SELFTEST_HOUR=3                        # 0-23, when scheduled tests kick off
     # State / logging
     STATE_DIR="/var/db/my-appleRAID"
@@ -2640,7 +2640,7 @@ run_selftests() {
         log_debug "Self-tests skipped: smartctl not in PATH"
         return 0
     fi
-    log_debug "Self-tests: short=${SELFTEST_SHORT_SCHEDULE:-never}, long=${SELFTEST_LONG_SCHEDULE:-weekly}, hour=$(printf '%02d' "${SELFTEST_HOUR:-3}"), now=$(date '+%H'):00"
+    log_debug "Self-tests: short=${SELFTEST_SHORT_SCHEDULE:-daily}, long=${SELFTEST_LONG_SCHEDULE:-weekly}, hour=$(printf '%02d' "${SELFTEST_HOUR:-3}"), now=$(date '+%H'):00"
     for d in $(resolve_monitored_disks); do
         dev="/dev/$d"
         [ -e "$dev" ] || continue
@@ -2656,7 +2656,7 @@ run_selftests() {
             log_debug "  $d: short self-test not due (schedule=${SELFTEST_SHORT_SCHEDULE:-never})"
         fi
         if selftest_should_run "${SELFTEST_LONG_SCHEDULE:-daily}" "$long_sentinel"; then
-            log_info "Starting LONG self-test on $d (runs in background, ~24-30h on 26TB)"
+            log_info "Starting LONG self-test on $d (runs in background, ~1.4 h per 1 TB at sustained ~200 MB/s)"
             $sc -t long "$dev" >/dev/null 2>&1 && touch "$long_sentinel"
         else
             log_debug "  $d: long self-test not due (schedule=${SELFTEST_LONG_SCHEDULE:-weekly})"
@@ -3314,24 +3314,42 @@ SMART_POLL_INTERVAL=1d
 # SMART self-test schedules: "never" | "daily" | "weekly".
 # Self-tests run IN THE BACKGROUND on the drive's own firmware - the
 # drive remains accessible but performance is slightly reduced.
+# Results land in the drive's firmware-resident self-test log (visible
+# via 'smart <disk>' section 3/4, and used by 'smart <disk1> <disk2>'
+# for comparative analysis).
 #
-#   short: ~2 minutes. Exercises electronics + a small media sample.
-#          Default "never" because the daily attribute scan
-#          (SMART_POLL_INTERVAL) already catches most failures
-#          short tests would catch. Set to "daily" if you want belt
-#          and braces - cost is negligible.
+#   short: ~2 minutes per drive. Quick electronics + small media
+#          sample. Cost is negligible (a couple of percent CPU on the
+#          drive controller, no host-side I/O).
+#          Default: "daily". Cheap belt-and-braces backstop on top of
+#          the daily attribute poll (SMART_POLL_INTERVAL), and it
+#          keeps the per-drive self-test log freshly populated for
+#          'smart <a> <b>' comparative analysis.
 #
-#   long:  full media scan. Duration scales with drive size:
-#          ~14h per  10TB,  ~19h per  14TB,  ~30h per  22TB,
-#          ~36h per  26TB,  and longer for bigger drives.
-#          At ~200 MB/s sequential read, a 26TB long test takes ~1.5 days,
-#          so "daily" makes no sense on large modern drives (the next
-#          test request is rejected while the previous one is still
-#          running). Default "weekly" gives room for the test to
-#          complete plus 5+ idle days. Rising bad-sector counts are
-#          caught within hours by the daily attribute poll, so the
-#          long test is a deep-scan backstop, not a primary detector.
-SELFTEST_SHORT_SCHEDULE="never"
+#   long:  full media scan. Duration scales LINEARLY with drive
+#          capacity at a sustained read rate of ~200 MB/s. Rule of
+#          thumb: ~1.4 hours per TB. Worked example:
+#                 1 TB ->  ~1.4 h
+#                 2 TB ->  ~2.8 h
+#                 4 TB ->  ~5.5 h
+#                 8 TB ->  ~11 h
+#                10 TB ->  ~14 h
+#                12 TB ->  ~17 h
+#                14 TB ->  ~19 h
+#                16 TB ->  ~22 h
+#                18 TB ->  ~25 h
+#                20 TB ->  ~28 h
+#                22 TB ->  ~30 h
+#                26 TB ->  ~36 h  (~1.5 days)
+#                30 TB ->  ~42 h
+#          On large modern drives a long test may take more than a day,
+#          so "daily" makes no sense - the next test request is
+#          rejected while the previous one is still running. Default
+#          "weekly" gives room for the test to complete plus several
+#          idle days. Rising bad-sector counts are caught within
+#          hours by the daily attribute poll, so the long test is a
+#          deep-scan backstop, not a primary detector.
+SELFTEST_SHORT_SCHEDULE="daily"
 SELFTEST_LONG_SCHEDULE="weekly"
 
 # Hour of day (0-23) when scheduled self-tests should kick off.
