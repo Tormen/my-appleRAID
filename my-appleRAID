@@ -990,11 +990,15 @@ cfg_load() {
         LAUNCHD_LABEL="${_tmp%.plist}"  # strip extension
     fi
 
-    # Verify LOG_FILE is writable for the running uid (NULL it if not,
-    # so log_write skips the file-append branch silently for the rest
-    # of this run). Daemon path keeps writing the canonical LOG_FILE;
-    # non-root interactive runs degrade to stderr-only.
+    # Verify LOG_FILE + STATE_DIR are writable for the running uid;
+    # fall back / NULL respectively if not. Done once here so that any
+    # subsequent subshell ($(...) / pipeline) forked off the main shell
+    # INHERITS the corrected paths, instead of independently rerunning
+    # the checks (and re-printing the same warnings) per subshell.
+    # Sentinel inside each function keeps it idempotent in case
+    # cfg_load is invoked more than once per run.
     _ensure_log_file_writable
+    _ensure_state_dir_writable
 
     # Normalize duration-valued config keys: accept either a bare number
     # (seconds) or a suffix like 30s / 5m / 2h / 1d / 1w. Done once at
@@ -7460,6 +7464,14 @@ EOF
 
     dev=$(resolve_disk "$arg") || die "Invalid disk spec: $arg"
     assert_whole_disk "$dev"
+
+    # Run writability checks ONCE in the main shell BEFORE any
+    # subshell-invoked smart_dtype_lookup / smart_dtype_store.
+    # Subshells inherit STATE_DIR / LOG_FILE at fork time, so doing
+    # the fallback here means the warnings fire at most once and
+    # the corrected paths are visible in every downstream subshell.
+    cfg_load 2>/dev/null
+    _ensure_state_dir_writable
 
     _smart_drilldown_one "${dev#/dev/}"
 }
