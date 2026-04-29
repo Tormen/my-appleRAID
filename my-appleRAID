@@ -251,24 +251,30 @@ err() {
 # Make STATE_DIR a writable directory, falling back to a user-private
 # tmp dir when the configured value isn't writable by the current uid.
 #
-# A sentinel ($_STATE_DIR_CHECKED) makes this idempotent and silent
-# after the first call - the function is invoked from multiple sites
-# (state_init, smart_dtype_lookup, smart_dtype_store, ...) and we
-# don't want each one to log the same fallback warning.
-_STATE_DIR_CHECKED=0
+# We remember the FALLBACK TARGET in $_STATE_DIR_FALLBACK so this
+# function is idempotent across repeated calls AND across cfg_load
+# invocations (cfg_set_defaults unconditionally resets STATE_DIR to
+# the system default; without the saved-target re-apply step a
+# subsequent cfg_load would silently put STATE_DIR back to the
+# unwritable system path while the sentinel-style early-return
+# prevented re-detection).
+_STATE_DIR_FALLBACK=""
 _ensure_state_dir_writable() {
-    [ "${_STATE_DIR_CHECKED:-0}" = "1" ] && return 0
     [ -n "${STATE_DIR:-}" ] || STATE_DIR="/var/db/my-appleRAID"
+    # If we already decided on a fallback path, re-apply it silently.
+    # Handles the cfg_set_defaults-reset-after-fallback case.
+    if [ -n "$_STATE_DIR_FALLBACK" ]; then
+        STATE_DIR="$_STATE_DIR_FALLBACK"
+        return 0
+    fi
     # Already writable: done.
     if [ -d "$STATE_DIR" ] && [ -w "$STATE_DIR" ]; then
-        _STATE_DIR_CHECKED=1
         return 0
     fi
     # Doesn't exist yet but we can create it.
     if [ ! -d "$STATE_DIR" ] \
        && mkdir -p "$STATE_DIR" 2>/dev/null \
        && [ -w "$STATE_DIR" ]; then
-        _STATE_DIR_CHECKED=1
         return 0
     fi
     # Not writable. Fall back to user-private location.
@@ -281,7 +287,7 @@ _ensure_state_dir_writable() {
     fi
     log_warn "STATE_DIR='$STATE_DIR' not writable by uid=$(id -u 2>/dev/null); using fallback: $_fb"
     STATE_DIR="$_fb"
-    _STATE_DIR_CHECKED=1
+    _STATE_DIR_FALLBACK="$_fb"
     return 0
 }
 
@@ -290,20 +296,32 @@ _ensure_state_dir_writable() {
 # Avoids cascading 'cannot create <path>: Permission denied' messages
 # from the shell for every log line.
 #
-# A sentinel makes the check idempotent (cfg_load may be called more
-# than once in a single run for some commands).
-_LOG_FILE_CHECKED=0
+# Tri-state: $_LOG_FILE_DECIDED in {"", "ok", "skip"}.
+#   ""    = not yet decided
+#   "ok"  = LOG_FILE is the canonical writable path
+#   "skip"= file logging disabled for this run (LOG_FILE re-NULLed)
+# This makes the function idempotent across cfg_load calls
+# (cfg_set_defaults resets LOG_FILE to the system default; without
+# the saved-decision re-apply step a sentinel-style early-return
+# would let LOG_FILE come back as the unwritable canonical path,
+# re-triggering the redirect-open errors log_write tries to suppress).
+_LOG_FILE_DECIDED=""
 _ensure_log_file_writable() {
-    [ "${_LOG_FILE_CHECKED:-0}" = "1" ] && return 0
-    _LOG_FILE_CHECKED=1
-    [ -n "${LOG_FILE:-}" ] || return 0
+    if [ "$_LOG_FILE_DECIDED" = "skip" ]; then
+        LOG_FILE=""
+        return 0
+    fi
+    [ "$_LOG_FILE_DECIDED" = "ok" ] && return 0
+    [ -n "${LOG_FILE:-}" ] || { _LOG_FILE_DECIDED=ok; return 0; }
     _ld=$(dirname "$LOG_FILE")
     # If the log file already exists, we can append iff it's writable.
     if [ -f "$LOG_FILE" ] && [ -w "$LOG_FILE" ]; then
+        _LOG_FILE_DECIDED=ok
         return 0
     fi
     # If parent dir exists and is writable, file can be created.
     if [ -d "$_ld" ] && [ -w "$_ld" ]; then
+        _LOG_FILE_DECIDED=ok
         return 0
     fi
     # Try to create the parent dir (only if path looks user-private).
@@ -311,6 +329,7 @@ _ensure_log_file_writable() {
         /var/*|/etc/*|/usr/*) ;; # don't create system paths from here
         *)
             if mkdir -p "$_ld" 2>/dev/null && [ -w "$_ld" ]; then
+                _LOG_FILE_DECIDED=ok
                 return 0
             fi
             ;;
@@ -318,6 +337,7 @@ _ensure_log_file_writable() {
     # Not writable. Disable file logging for this run and warn once.
     log_warn "LOG_FILE='$LOG_FILE' not writable by uid=$(id -u 2>/dev/null); file logging disabled for this run (stderr still active)"
     LOG_FILE=""
+    _LOG_FILE_DECIDED=skip
     return 0
 }
 
