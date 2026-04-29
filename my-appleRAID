@@ -5708,15 +5708,20 @@ _smart_drilldown_one() {
         printf '  %-22s %s years  (POH=%sh)\n' "Age:" "$age_y" "$poh"
     fi
     if [ -n "$s5$s187$s197$s198" ]; then
-        printf '  %-22s 5=%s  187=%s  197=%s  198=%s\n' \
-            "Killer attrs (raw):" "${s5:-?}" "${s187:-?}" "${s197:-?}" "${s198:-?}"
+        printf '  %-22s (any non-zero raw value = drive-level damage)\n' \
+            "Killer attrs:"
+        printf '    %-30s = %s\n'  "5   Reallocated_Sector_Ct"   "${s5:-?}"
+        printf '    %-30s = %s\n'  "187 Reported_Uncorrect"      "${s187:-?}"
+        printf '    %-30s = %s\n'  "197 Current_Pending_Sector"  "${s197:-?}"
+        printf '    %-30s = %s\n'  "198 Offline_Uncorrectable"   "${s198:-?}"
     fi
     if [ -n "$s199" ]; then
-        printf '  %-22s %s  (cable/port noise; not a drive defect on its own)\n' \
-            "UDMA_CRC (199):" "$s199"
+        printf '  %-22s %s  (199 UDMA_CRC_Error_Count - cable/port noise, not a drive defect on its own)\n' \
+            "UDMA_CRC:" "$s199"
     fi
     if [ -n "$s22" ] && [ "$s22" -gt 0 ] 2>/dev/null; then
-        printf '  %-22s %s\n' "Helium level (22):" "$s22"
+        printf '  %-22s %s  (22 Helium_Level - 100=full, drops as gas escapes; <95 = retire)\n' \
+            "Helium:" "$s22"
     fi
     if [ "$st_count" -gt 0 ] 2>/dev/null; then
         printf '  %-22s %s recorded; last: %s\n' \
