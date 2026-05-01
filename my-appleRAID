@@ -7863,16 +7863,15 @@ show_subcmd_help() {
 script_version_string() {
     _v="$SCRIPT_VERSION"
     _sha=""
-    # 1) Prefer the baked-in SCRIPT_COMMIT (set by 'stamp-version' before
-    #    deploy) - this is what makes deployed copies print a sha.
+    # SCRIPT_COMMIT (baked at stamp-version time) is AUTHORITATIVE
+    # when set. The runtime `git rev-parse` fallback is ONLY used
+    # when SCRIPT_COMMIT is empty. Earlier code consulted git
+    # unconditionally, which fired in any checkout the script's
+    # directory happened to be inside (e.g. an unrelated config repo
+    # on ada) and overwrote the bake with a wrong sha plus '-dirty'.
     if [ -n "${SCRIPT_COMMIT:-}" ]; then
         _sha="$SCRIPT_COMMIT"
-    fi
-    # 2) Fall back to a runtime git lookup. Useful when running directly
-    #    from a checkout (the developer machine), AND lets us append
-    #    "-dirty" when the working copy has uncommitted changes - which
-    #    SCRIPT_COMMIT can't represent.
-    if command -v git >/dev/null 2>&1; then
+    elif command -v git >/dev/null 2>&1; then
         _here=$(cd "$(dirname "$0")" 2>/dev/null && pwd)
         if [ -n "$_here" ] && cd "$_here" 2>/dev/null \
                 && git rev-parse --short HEAD >/dev/null 2>&1; then
