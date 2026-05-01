@@ -3821,16 +3821,35 @@ cmd_baseline() {
 Usage: $SCRIPT_NAME baseline [--sets|--disks|--show|--optsets]
 
 Snapshots the currently-existing RAID sets and/or attached disks into
-the "expected baseline" used by REQUIRED_SETS=all / REQUIRED_DISKS=all.
+the "expected baseline" used by REQUIRED_SETS=all / REQUIRED_DISKS=all,
+or interactively manages OPTIONAL_DISK_SETS for rotating-backup
+workflows.
 
   (no args)   Update both set and disk baselines.
   --sets      Update the RAID set baseline only.
   --disks     Update the disk baseline only.
   --show      Print the current baseline files without modifying them.
-  --optsets   Interactive manager for OPTIONAL_DISK_SETS. Lets you
-              create/rename/delete named rotation groups and assign
-              currently-attached or missing-from-baseline disks to
-              them. Writes back to the loaded config file.
+  --optsets   Interactive manager for OPTIONAL_DISK_SETS (SETs of
+              GROUPs of DISKs - the rotating-backup feature). Lets you
+              create/rename/delete named SETs and named GROUPs within
+              them, and assign currently-attached or
+              missing-from-baseline disks to a chosen Set/Group via
+              menu pick. Writes the result back into the loaded
+              config file atomically.
+
+              Three-level model:
+                DISK  - one physical disk (SN:/PART:/USB:/VOL: or diskN)
+                GROUP - bundle of disks. Rule (a): if any member is
+                        present, ALL must be present together.
+                SET   - collection of groups (one rotation pool).
+                        Rule (b): within the set, at least ONE group
+                        must be fully present.
+              Different SETs are independent (one rotation does not
+              constrain another).
+
+              Members of optional groups are excluded from
+              REQUIRED_DISKS resolution, so a swapped-out rotation
+              disk does not also fire a disk-missing alert.
 
 Baseline files:
   $(baseline_sets_file)
