@@ -3905,6 +3905,41 @@ EOF
         else
             warn "No disk baseline file yet: $f"
         fi
+
+        # ----------------------------------------------------------
+        # Optional disk sets (read-only summary).
+        # Show what 'health' will enforce: per-group rule (a), per-set
+        # rule (b), plus the explicit list of disk specs that are
+        # EXCLUDED from REQUIRED_DISKS resolution because they belong
+        # to an optset.
+        # ----------------------------------------------------------
+        echo
+        info "Optional disk sets (OPTIONAL_DISK_SETS in ${LOADED_CONFIG:-<no config>}):"
+        if [ -z "${OPTIONAL_DISK_SETS:-}" ]; then
+            echo "    (not configured)"
+        else
+            for _setn in $(optional_sets_set_names); do
+                printf '    %sSet:%s %s\n' "${C_BOLD}" "${C_RESET}" "$_setn"
+                for _grpn in $(optional_sets_groups_in "$_setn"); do
+                    _ms=$(optional_set_group_members "$_setn" "$_grpn" \
+                          | tr '\n' ',' | sed 's/,$//;s/,/, /g')
+                    printf '      %s/%s = %s\n' "$_setn" "$_grpn" "$_ms"
+                done
+            done
+            echo
+            info "How 'health' / 'baseline' use these:"
+            explain "  - Members of any optset GROUP are EXCLUDED from REQUIRED_DISKS"
+            explain "    resolution; swapping a rotation disk OUT does not trigger"
+            explain "    the standard 'required disk missing' alert."
+            explain "  - Per GROUP (rule a): if any member is present, ALL members"
+            explain "    must be present together (else: PARTIAL alert)."
+            explain "  - Per SET (rule b): at least ONE group must be fully present"
+            explain "    (else: 'no group fully present' alert)."
+            explain "  - Different SETs are independent; rule (b) is checked per-set."
+            echo
+            info "Disk specs excluded from REQUIRED_DISKS (governed by optset rules):"
+            optional_sets_all_specs | sed 's/^/    /'
+        fi
         return 0
     fi
 
@@ -4031,6 +4066,44 @@ _optsets_render_value() {
         }
     }' "$_wf"
     printf '"\n'
+}
+
+# Sweep baseline-disks: remove any tagged-id whose disk is now a
+# member of an optset (any group in any set). Those disks are
+# governed by the optset rules; keeping them in the standard
+# baseline-disks list would be confusing in `baseline --show` and
+# noisy in baseline diffs (resolve_required_disks already filters
+# them out at runtime, so behaviour doesn't change - this is a
+# cleanup pass for clarity).
+_optsets_clean_baseline() {
+    _wf="$1"
+    _bf=$(baseline_disks_file)
+    [ -f "$_bf" ] || return 0
+    _specs=$(mktemp "$STATE_DIR/.optsets-clean.XXXXXX") || return 0
+    awk -F'|' 'NF>=3 && $3 != "__placeholder__" {print $3}' "$_wf" | sort -u > "$_specs"
+    if [ ! -s "$_specs" ]; then rm -f "$_specs"; return 0; fi
+    _new=$(mktemp "$STATE_DIR/.optsets-cleanout.XXXXXX") || { rm -f "$_specs"; return 0; }
+    awk '
+        NR==FNR { specs[$0]=1; next }
+        /^[[:space:]]*#/ || NF==0 { print; next }
+        !($1 in specs) { print }
+    ' "$_specs" "$_bf" > "$_new"
+    _old_n=$(awk 'NF>0 && !/^[[:space:]]*#/' "$_bf" | wc -l | tr -d ' ')
+    _new_n=$(awk 'NF>0 && !/^[[:space:]]*#/' "$_new" | wc -l | tr -d ' ')
+    _removed=$((_old_n - _new_n))
+    if [ "$_removed" -gt 0 ]; then
+        chmod --reference="$_bf" "$_new" 2>/dev/null \
+            || chmod 0644 "$_new" 2>/dev/null || true
+        if mv "$_new" "$_bf"; then
+            ok "Removed $_removed disk(s) from baseline-disks (now governed by optset): $_bf"
+        else
+            rm -f "$_new"
+            warn "Could not update $_bf"
+        fi
+    else
+        rm -f "$_new"
+    fi
+    rm -f "$_specs"
 }
 
 # Splice a new OPTIONAL_DISK_SETS=<value> block into $LOADED_CONFIG,
@@ -4310,6 +4383,10 @@ cmd_baseline_optsets() {
                 _optsets_render_value "$_wf" > "$_val"
                 if _optsets_save_to_config "$_val"; then
                     rm -f "$_val"
+                    # Sweep baseline-disks: any disk that is now in an
+                    # optset is no longer a "plain required disk", so
+                    # remove it from the baseline file for clarity.
+                    _optsets_clean_baseline "$_wf"
                     info "Re-run 'my-appleRAID disks' to confirm membership annotations."
                     return 0
                 fi
