@@ -4327,6 +4327,49 @@ _optsets_prompt() {
     _ANS=$(printf '%s' "$_ANS" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
 }
 
+# Prompt with TAB autocomplete from a candidate list (for picking
+# existing set/group names, to avoid typos and accidental duplicates).
+# $1 = prompt; $2... = candidate strings.
+#
+# Implementation: we can't get readline TAB completion from dash's
+# `read`, but bash supports `dynamic-complete-history`, which cycles
+# through history entries that prefix-match the typed text. We seed
+# bash's history with the candidates, bind TAB to that command, and
+# delegate the line read to a short-lived interactive bash subshell.
+# Bash 3.2 (macOS default) is sufficient. Falls back to plain
+# _optsets_prompt when bash is unavailable.
+_optsets_prompt_completing() {
+    _prompt="$1"; shift
+    if ! command -v bash >/dev/null 2>&1; then
+        _optsets_prompt "$_prompt"
+        return $?
+    fi
+    _hf=$(mktemp 2>/dev/null) || { _optsets_prompt "$_prompt"; return $?; }
+    for _c in "$@"; do
+        [ -n "$_c" ] && printf '%s\n' "$_c"
+    done > "$_hf"
+    # The bash subshell MUST be interactive (-i) for `bind` to be
+    # accepted. macOS bash insists --norc/--noprofile come BEFORE -i.
+    # `read -p` writes the prompt to stderr, which we leave attached
+    # to the controlling tty so the user sees it. Stdout is captured
+    # via $(...). The "no job control" notice on stderr is harmless;
+    # we suppress it.
+    _ANS=$(MY_PROMPT="$(printf '%s%s%s ' "${C_YELLOW}" "$_prompt" "${C_RESET}")" \
+           HISTFILE="$_hf" \
+           bash --norc --noprofile -i -c '
+        set +o history
+        history -r 2>/dev/null
+        bind "set show-all-if-ambiguous on" 2>/dev/null
+        bind "set completion-ignore-case on" 2>/dev/null
+        bind "\"\\C-i\":dynamic-complete-history" 2>/dev/null
+        read -er -p "$MY_PROMPT" reply
+        printf "%s\n" "$reply"
+    ' 2>/dev/null)
+    rm -f "$_hf"
+    _ANS=$(printf '%s' "${_ANS:-}" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+    return 0
+}
+
 # List all (set, group) pairs in declaration order, numbered.
 # Sets _PATHS to a newline-separated "set/group" list and prints
 # them with numbers. Returns 1 if the work file is empty.
@@ -4390,21 +4433,66 @@ _optsets_validate_name() {
 
 _optsets_action_create() {
     _wf="$1"; _cache="$2"
-    _optsets_prompt "Path for new group (Set/Group, e.g. OffsiteRotation/Pair1):" || return
-    [ -n "$_ANS" ] || { warn "Empty path; aborted."; return; }
-    case "$_ANS" in
-        */*) ;;
-        *) warn "Need a Set/Group path. Example: OffsiteRotation/Pair1"; return ;;
-    esac
-    _setn=$(printf '%s' "$_ANS" | sed 's|/.*||')
-    _grpn=$(printf '%s' "$_ANS" | sed 's|^[^/]*/||')
-    _optsets_validate_name "$_setn" || { warn "Invalid set name (no space, '|', ',', '=', '/')."; return; }
-    _optsets_validate_name "$_grpn" || { warn "Invalid group name (no space, '|', ',', '=', '/')."; return; }
+
+    # Show existing sets+groups so the user has a clear visual reference
+    # for what already exists (helps avoid typos and duplicate set
+    # names). Two-step prompt: SET first (with TAB-completion of
+    # existing set names), then GROUP (with TAB-completion of existing
+    # group names within that set, shown for awareness — duplicates
+    # are rejected by validation below).
+    _existing_sets=$(awk -F'|' 'NF>=3 && !seen[$1]++ {print $1}' "$_wf")
+    if [ -n "$_existing_sets" ]; then
+        info "Existing sets and groups:"
+        echo "$_existing_sets" | while IFS= read -r _s; do
+            [ -n "$_s" ] || continue
+            _gs=$(awk -F'|' -v s="$_s" '$1==s && !seen[$2]++ {print $2}' "$_wf" | paste -sd, -)
+            printf '  - %s (%s)\n' "$_s" "${_gs:-empty}"
+        done
+    else
+        info "No sets defined yet — pick any name (e.g. OffsiteRotation, WeeklyArchive)."
+    fi
+    explain "Tip: TAB-TAB cycles through existing names (helps avoid typos / duplicates)."
+
+    # 1. Set name. Completion candidates = existing set names.
+    if [ -n "$_existing_sets" ]; then
+        # shellcheck disable=SC2046  # word-splitting intended
+        _optsets_prompt_completing \
+            "Set name (existing or new) [TAB to cycle]:" \
+            $(echo "$_existing_sets")
+    else
+        _optsets_prompt "Set name (e.g. OffsiteRotation):"
+    fi
+    [ -n "$_ANS" ] || { warn "Empty set name; aborted."; return; }
+    _setn="$_ANS"
+    _optsets_validate_name "$_setn" \
+        || { warn "Invalid set name (no space, '|', ',', '=', '/')."; return; }
+
+    # 2. Group name. Show this set's existing groups; completion
+    # candidates = those names (for visual reference only — exact
+    # duplicates are rejected).
+    _existing_groups=$(awk -F'|' -v s="$_setn" '$1==s && !seen[$2]++ {print $2}' "$_wf")
+    if [ -n "$_existing_groups" ]; then
+        info "Groups already in set '$_setn':"
+        echo "$_existing_groups" | sed 's/^/  - /'
+        # shellcheck disable=SC2046
+        _optsets_prompt_completing \
+            "New group name in '$_setn' (must be new) [TAB to see existing]:" \
+            $(echo "$_existing_groups")
+    else
+        info "Set '$_setn' has no groups yet."
+        _optsets_prompt "New group name in '$_setn' (e.g. Pair1):"
+    fi
+    [ -n "$_ANS" ] || { warn "Empty group name; aborted."; return; }
+    _grpn="$_ANS"
+    _optsets_validate_name "$_grpn" \
+        || { warn "Invalid group name (no space, '|', ',', '=', '/')."; return; }
+
     if awk -F'|' -v s="$_setn" -v g="$_grpn" '$1==s && $2==g {f=1; exit} END{exit !f}' "$_wf"; then
         warn "Group '$_setn/$_grpn' already exists."; return
     fi
     printf '%s|%s|__placeholder__\n' "$_setn" "$_grpn" >> "$_wf"
     ok "Created group '$_setn/$_grpn'."
+
     # Streamlined: chain immediately into disk assignment, using the
     # cached numbered list. Blank input keeps the empty group.
     _optsets_assign_disks "$_wf" "$_cache" "$_setn" "$_grpn" \
