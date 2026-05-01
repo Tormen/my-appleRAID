@@ -4514,6 +4514,9 @@ _optsets_assign_disks() {
         info "No disks assigned to '$_setn/$_grpn' yet."
         return
     fi
+    # Accept commas, semicolons, and whitespace as separators so "10,11",
+    # "10 11", "10; 11" all do the same thing.
+    _ANS=$(printf '%s' "$_ANS" | tr ',;' '  ')
     _added=0
     for _tok in $_ANS; do
         case "$_tok" in
@@ -4665,8 +4668,9 @@ _optsets_action_remove() {
     echo "$_ms" | while IFS= read -r _s; do
         _i=$((_i+1)); printf '  %d) %s\n' "$_i" "$_s"
     done
-    _optsets_prompt "Pick (multiple numbers space-separated allowed):"
+    _optsets_prompt "Pick (numbers; comma, semicolon, or whitespace separated):"
     [ -n "$_ANS" ] || { warn "Nothing entered."; return; }
+    _ANS=$(printf '%s' "$_ANS" | tr ',;' '  ')
     for _tok in $_ANS; do
         case "$_tok" in
             [0-9]*) _id=$(echo "$_ms" | awk -v n="$_tok" 'NR==n {print; exit}') ;;
