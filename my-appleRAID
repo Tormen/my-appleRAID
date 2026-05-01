@@ -4234,9 +4234,9 @@ _optsets_show_state() {
         _i=$((_i + 1))
         _own=$(_optsets_assignment_of "$_wf" "$_id")
         if [ -n "$_own" ]; then
-            _tag="$_own"
+            _tag="in: $_own"
         else
-            _tag="free"
+            _tag="unassigned"
         fi
         # Columns: NUM) KIND ID NODE SIZE MODEL [tag]
         # ID width sized for the widest tagged form: "PART:" + 36-char
