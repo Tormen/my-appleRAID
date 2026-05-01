@@ -83,7 +83,7 @@ SCRIPT_NAME="$(basename "$0")"
 # subcommand updates SCRIPT_COMMIT to the current HEAD sha and
 # amends - run it as the last step before deploying.
 SCRIPT_VERSION="v7"
-SCRIPT_COMMIT="4764f68"
+SCRIPT_COMMIT="de968dd"
 SCRIPT_COPYRIGHT="Copyright (C) 2026 Tormen <tormen@mail.ch>"
 SCRIPT_LICENSE_SHORT="GPL-3.0-or-later (copyleft)"
 SCRIPT_LICENSE_URL="https://www.gnu.org/licenses/gpl-3.0.html"
@@ -4093,12 +4093,10 @@ EOF
     if [ "$do_disks" = "1" ] || [ "$do_sets" = "1" ]; then
         step "Optional Disk Sets / Groups baseline"
         if [ -z "${OPTIONAL_DISK_SETS:-}" ]; then
-            explain "OPTIONAL_DISK_SETS is empty in ${LOADED_CONFIG:-<no config>}."
-            explain "Run 'baseline --optsets' to define rotation pools."
+            explain "Empty. Define rotation pools with 'baseline --optsets'."
         else
-            explain "Source: OPTIONAL_DISK_SETS in ${LOADED_CONFIG:-<no config>}"
-            explain "Edit interactively with: $SCRIPT_NAME baseline --optsets"
-            echo
+            explain "Rules: (a) within a group: all members present together; (b) within a set: >=1 group fully present."
+            explain "Read-only here. Source: OPTIONAL_DISK_SETS in ${LOADED_CONFIG:-<no config>} (edit via 'baseline --optsets')."
             for _setn in $(optional_sets_set_names); do
                 printf '  %sSet:%s %s\n' "${C_BOLD}" "${C_RESET}" "$_setn"
                 _any_full=0
@@ -4124,28 +4122,22 @@ EOF
                     else
                         _state="ABSENT"
                     fi
-                    printf '    %-18s %-12s %s\n' \
+                    printf '    %-12s %-12s %s\n' \
                         "$_grpn" "${_state}(${_present}/${_total})" "${_line# }"
                 done
                 if [ "$_any_full" = "1" ]; then
-                    printf '    %s%s%s rule (b): OK (a group is fully present)\n' \
-                        "${C_GREEN}" "Set '$_setn'" "${C_RESET}"
+                    printf '    %srule (b): OK%s\n' "${C_GREEN}" "${C_RESET}"
                 else
-                    printf '    %s%s%s rule (b): VIOLATED (no group fully present)\n' \
-                        "${C_YELLOW}" "Set '$_setn'" "${C_RESET}"
+                    printf '    %srule (b): VIOLATED%s\n' "${C_YELLOW}" "${C_RESET}"
                 fi
             done
-            echo
-            info "Optset baseline: no update written. OPTIONAL_DISK_SETS is the source of truth;"
-            info "  it lives in ${LOADED_CONFIG:-<no config>} and is edited via 'baseline --optsets'."
         fi
     fi
 
     if [ "$do_disks" = "1" ]; then
         step "Updating disk baseline"
-        explain "Snapshotting stable identifiers of all currently-attached"
-        explain "physical disks to:"
-        explain "  $(baseline_disks_file)"
+        explain "Snapshotting attached disks (stable ids) to: $(baseline_disks_file)"
+        explain "Optset members are filtered out - they're tracked by rules (a)+(b) above."
         # Capture the previous baseline file's data lines (full lines
         # including the bsd/size/model comment) so we can diff and show
         # the human-readable hint alongside each added/removed id.
@@ -4282,17 +4274,14 @@ EOF
         # optset rules - so they don't count as a baseline update.
         if [ -z "$_added_ids" ] && [ -z "$_removed_truly" ]; then
             if [ -n "$_added_optset" ] || [ -n "$_removed_optset" ]; then
-                info "Disk baseline: no update. Differences above are all governed by"
-                info "  OPTIONAL_DISK_SETS, not by REQUIRED_DISKS."
+                info "Disk baseline: no real update (only optset-governed diffs above)."
             else
                 info "Disk baseline unchanged."
             fi
         fi
     fi
 
-    ok "Baseline check complete."
-    info "REQUIRED_SETS=all / REQUIRED_DISKS=all compare against these files;"
-    info "OPTIONAL_DISK_SETS rules (a)+(b) are checked against the config."
+    ok "Baseline check complete. (REQUIRED_*=all use the files above; OPTIONAL_DISK_SETS rules (a)+(b) use the config.)"
 }
 
 # ----------------------------------------------------------------------
