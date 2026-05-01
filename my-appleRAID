@@ -83,7 +83,7 @@ SCRIPT_NAME="$(basename "$0")"
 # subcommand updates SCRIPT_COMMIT to the current HEAD sha and
 # amends - run it as the last step before deploying.
 SCRIPT_VERSION="v7"
-SCRIPT_COMMIT="59c6d44"
+SCRIPT_COMMIT="4764f68"
 SCRIPT_COPYRIGHT="Copyright (C) 2026 Tormen <tormen@mail.ch>"
 SCRIPT_LICENSE_SHORT="GPL-3.0-or-later (copyleft)"
 SCRIPT_LICENSE_URL="https://www.gnu.org/licenses/gpl-3.0.html"
@@ -4135,6 +4135,9 @@ EOF
                         "${C_YELLOW}" "Set '$_setn'" "${C_RESET}"
                 fi
             done
+            echo
+            info "Optset baseline: no update written. OPTIONAL_DISK_SETS is the source of truth;"
+            info "  it lives in ${LOADED_CONFIG:-<no config>} and is edited via 'baseline --optsets'."
         fi
     fi
 
@@ -4273,14 +4276,23 @@ EOF
             done
         fi
 
-        if [ -z "$_added_ids" ] && [ -z "$_removed_truly" ] \
-           && [ -z "$_added_optset" ] && [ -z "$_removed_optset" ]; then
-            info "Disk baseline unchanged."
+        # "Real" changes = entries that affect the plain-required set
+        # (truly added or truly removed). Optset-ignored entries are
+        # informational only - the disks remain tracked, just by the
+        # optset rules - so they don't count as a baseline update.
+        if [ -z "$_added_ids" ] && [ -z "$_removed_truly" ]; then
+            if [ -n "$_added_optset" ] || [ -n "$_removed_optset" ]; then
+                info "Disk baseline: no update. Differences above are all governed by"
+                info "  OPTIONAL_DISK_SETS, not by REQUIRED_DISKS."
+            else
+                info "Disk baseline unchanged."
+            fi
         fi
     fi
 
-    ok "Baseline updated."
-    info "REQUIRED_SETS=all / REQUIRED_DISKS=all will compare against these files."
+    ok "Baseline check complete."
+    info "REQUIRED_SETS=all / REQUIRED_DISKS=all compare against these files;"
+    info "OPTIONAL_DISK_SETS rules (a)+(b) are checked against the config."
 }
 
 # ----------------------------------------------------------------------
