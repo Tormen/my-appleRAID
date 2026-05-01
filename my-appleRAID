@@ -4448,10 +4448,10 @@ _optsets_action_create() {
             _gs=$(awk -F'|' -v s="$_s" '$1==s && !seen[$2]++ {print $2}' "$_wf" | paste -sd, -)
             printf '  - %s (%s)\n' "$_s" "${_gs:-empty}"
         done
+        explain "Tip: TAB-TAB cycles through existing names (helps avoid typos / duplicates)."
     else
         info "No sets defined yet — pick any name (e.g. OffsiteRotation, WeeklyArchive)."
     fi
-    explain "Tip: TAB-TAB cycles through existing names (helps avoid typos / duplicates)."
 
     # 1. Set name. Completion candidates = existing set names.
     if [ -n "$_existing_sets" ]; then
