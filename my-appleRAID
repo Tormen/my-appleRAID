@@ -4210,8 +4210,14 @@ _optsets_show_state() {
         else
             _tag="free"
         fi
-        printf '  %3d) [%-8s] %-22s %-12s %-32.32s [%s]\n' \
-            "$_i" "$_kind" "$_id" "$_node" "${_hint:-?}" "$_tag"
+        # ID column width is sized for the widest tagged form: PART:
+        # baseline ids are "PART:" + a 36-char GPT GUID = 41 chars.
+        # SN:/USB:/VOL: ids are shorter and just left-pad. Hint column
+        # is squashed (single-space-collapsed) so multi-space artifacts
+        # from the baseline file don't blow past the cap.
+        _hint_norm=$(printf '%s' "${_hint:-?}" | tr -s '[:space:]' ' ')
+        printf '  %3d) [%-8s] %-41s %-12s %-32.32s [%s]\n' \
+            "$_i" "$_kind" "$_id" "$_node" "$_hint_norm" "$_tag"
     done < "$_cache"
 }
 
