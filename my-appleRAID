@@ -83,7 +83,7 @@ SCRIPT_NAME="$(basename "$0")"
 # subcommand updates SCRIPT_COMMIT to the current HEAD sha and
 # amends - run it as the last step before deploying.
 SCRIPT_VERSION="v7"
-SCRIPT_COMMIT="cde688b"
+SCRIPT_COMMIT="59c6d44"
 SCRIPT_COPYRIGHT="Copyright (C) 2026 Tormen <tormen@mail.ch>"
 SCRIPT_LICENSE_SHORT="GPL-3.0-or-later (copyleft)"
 SCRIPT_LICENSE_URL="https://www.gnu.org/licenses/gpl-3.0.html"
@@ -1518,7 +1518,77 @@ baseline_write_sets() {
 #
 # Empty output means the disk has no stable identifier and cannot be
 # baselined; the caller should skip it with a warning.
+# ----------------------------------------------------------------------
+# bsd -> tagged-id cache (process-wide, file-backed).
+#
+# Computing a stable id for a disk hits disk_serial (smartctl), then
+# diskutil for GPT GUID, then `system_profiler SPUSBDataType`. The
+# last one is the slow one - hundreds of ms per call. cmd_baseline
+# previously called disk_baseline_id once per attached disk inside
+# baseline_write_disks AND once per (set, group, member) inside the
+# optsets-section renderer (via optional_spec_to_bsd ->
+# disk_for_baseline_id, which itself walks every attached disk
+# calling disk_baseline_id). With ~10 disks and ~5 optset specs that
+# is ~50 system_profiler invocations per `baseline` run.
+#
+# Solution: populate a file-backed cache once per process. The file
+# is plain "<bsd>|<id-or-__NONE__>" lines, so subshell-spawned
+# pipelines (e.g. `... | while read`) can read it too - in-memory
+# variables would be lost across the pipe. cmd_baseline,
+# cmd_baseline_optsets, cmd_disks, and cmd_health all populate the
+# cache early; trap removes the file on exit.
+# ----------------------------------------------------------------------
+_DISKID_CACHE_FILE=""
+
+# Build the cache for every currently-attached physical disk. Idempotent:
+# returns immediately if the cache already exists.
+_diskid_cache_init() {
+    if [ -n "${_DISKID_CACHE_FILE:-}" ] && [ -f "$_DISKID_CACHE_FILE" ]; then
+        return 0
+    fi
+    [ -n "${STATE_DIR:-}" ] || return 1
+    _DISKID_CACHE_FILE=$(mktemp "$STATE_DIR/.diskid-cache.XXXXXX" 2>/dev/null) \
+        || { _DISKID_CACHE_FILE=""; return 1; }
+    list_all_physical_disks | while IFS= read -r _d; do
+        [ -n "$_d" ] || continue
+        _id=$(_disk_baseline_id_uncached "$_d" 2>/dev/null)
+        printf '%s|%s\n' "$_d" "${_id:-__NONE__}" >> "$_DISKID_CACHE_FILE"
+    done
+}
+
+_diskid_cache_clear() {
+    [ -n "${_DISKID_CACHE_FILE:-}" ] || return 0
+    rm -f "$_DISKID_CACHE_FILE" 2>/dev/null || true
+    _DISKID_CACHE_FILE=""
+}
+
+# Public-facing disk_baseline_id: cache check, fall through to the
+# uncached implementation. Caches the result for next time.
 disk_baseline_id() {
+    bsd="${1#/dev/}"
+    [ -n "$bsd" ] || return 1
+    if [ -n "${_DISKID_CACHE_FILE:-}" ] && [ -f "$_DISKID_CACHE_FILE" ]; then
+        _hit=$(awk -F'|' -v b="$bsd" '$1==b {print $2; exit}' "$_DISKID_CACHE_FILE")
+        case "$_hit" in
+            "")        ;;  # not in cache, fall through
+            __NONE__)  return 1 ;;
+            *)         echo "$_hit"; return 0 ;;
+        esac
+    fi
+    _id=$(_disk_baseline_id_uncached "$bsd")
+    _rc=$?
+    # Memoize for next time (best-effort: any failure is silently ignored).
+    if [ -n "${_DISKID_CACHE_FILE:-}" ] && [ -f "$_DISKID_CACHE_FILE" ]; then
+        printf '%s|%s\n' "$bsd" "${_id:-__NONE__}" >> "$_DISKID_CACHE_FILE"
+    fi
+    [ -n "$_id" ] && echo "$_id"
+    return $_rc
+}
+
+# Original implementation, renamed. Kept as an internal entry point
+# for the cache initializer (which populates the cache by walking
+# every disk) and as a fallback when cache hasn't been initialized.
+_disk_baseline_id_uncached() {
     bsd="${1#/dev/}"
     [ -n "$bsd" ] || return 1
 
@@ -1683,6 +1753,19 @@ baseline_write_disks() {
 disk_for_baseline_id() {
     target="$1"
     [ -n "$target" ] || return 1
+    # Cache fast-path: read the bsd column for the row whose tagged-id
+    # matches the target. ~1ms vs ~hundreds of ms for the slow path.
+    if [ -n "${_DISKID_CACHE_FILE:-}" ] && [ -f "$_DISKID_CACHE_FILE" ]; then
+        _hit=$(awk -F'|' -v t="$target" '$2==t {print $1; exit}' "$_DISKID_CACHE_FILE")
+        if [ -n "$_hit" ]; then
+            echo "$_hit"
+            return 0
+        fi
+        return 1
+    fi
+    # Slow path: cache uninitialized. Walk all disks and compute their
+    # ids one at a time. disk_baseline_id will memoize each, so a
+    # subsequent call is fast even without explicit init.
     list_all_physical_disks | while IFS= read -r d; do
         [ -n "$d" ] || continue
         cur=$(disk_baseline_id "$d" 2>/dev/null)
@@ -3023,7 +3106,11 @@ cmd_health() {
     export HEALTH_RUN_LOG
 
     # Trap so we always clean up the temp seen-file + run-log.
-    trap 'seen_cleanup; [ -n "$HEALTH_RUN_LOG" ] && rm -f "$HEALTH_RUN_LOG"' EXIT INT TERM
+    # Health iterates monitored disks, optsets, and presence checks -
+    # all of which call disk_baseline_id / disk_for_baseline_id. Cache
+    # once up front, clean up via the same trap as the rest.
+    _diskid_cache_init
+    trap 'seen_cleanup; _diskid_cache_clear; [ -n "$HEALTH_RUN_LOG" ] && rm -f "$HEALTH_RUN_LOG"' EXIT INT TERM
 
     dry=0
     force=0
@@ -3842,6 +3929,14 @@ cmd_baseline() {
     cfg_load
     state_init
 
+    # Build the bsd -> tagged-id cache ONCE for this run. baseline
+    # walks attached disks several times (write-disks filter, optsets
+    # rendering, Added/Removed annotation, '--show'), each of which
+    # would otherwise call disk_baseline_id per disk and trip
+    # system_profiler. Single init means single sweep. Trap cleans up.
+    _diskid_cache_init
+    trap '_diskid_cache_clear' EXIT INT TERM
+
     do_sets=1
     do_disks=1
     show_only=0
@@ -4534,7 +4629,13 @@ cmd_baseline_optsets() {
             d|D) _optsets_action_delete "$_wf" ;;
             a|A) _optsets_action_add    "$_wf" "$_cache" ;;
             x|X) _optsets_action_remove "$_wf" ;;
-            R)   info "Rebuilding disk cache..."; _optsets_build_cache "$_cache"; ok "Cache rebuilt." ;;
+            R)   info "Rebuilding disk cache..."
+                 # Drop the bsd->id cache too so hardware changes are
+                 # picked up on the next disk_baseline_id / for_id call.
+                 _diskid_cache_clear
+                 _diskid_cache_init
+                 _optsets_build_cache "$_cache"
+                 ok "Cache rebuilt." ;;
             s|S)
                 _val=$(mktemp "$STATE_DIR/.optsets-val.XXXXXX") \
                     || { errmsg "mktemp failed"; continue; }
@@ -8635,6 +8736,13 @@ EOF
     # Load config so OPTIONAL_DISK_SETS (used to annotate the Role
     # column and emit the per-group summary block) is in scope.
     cfg_load 2>/dev/null
+
+    # Pre-populate the bsd -> tagged-id cache: the per-row optset
+    # annotation calls disk_baseline_id once per disk, and the optset
+    # summary block calls optional_spec_to_bsd / disk_for_baseline_id
+    # which (without the cache) re-walks every disk for every spec.
+    _diskid_cache_init
+    trap '_diskid_cache_clear' EXIT INT TERM
 
     if [ "$DEBUG" = "1" ]; then
         step "Listing all disks (full diskutil list)"
