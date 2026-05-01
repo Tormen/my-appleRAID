@@ -83,7 +83,7 @@ SCRIPT_NAME="$(basename "$0")"
 # subcommand updates SCRIPT_COMMIT to the current HEAD sha and
 # amends - run it as the last step before deploying.
 SCRIPT_VERSION="v7"
-SCRIPT_COMMIT="d5e7174"
+SCRIPT_COMMIT="c9476fb"
 SCRIPT_COPYRIGHT="Copyright (C) 2026 Tormen <tormen@mail.ch>"
 SCRIPT_LICENSE_SHORT="GPL-3.0-or-later (copyleft)"
 SCRIPT_LICENSE_URL="https://www.gnu.org/licenses/gpl-3.0.html"
@@ -4106,6 +4106,8 @@ EOF
             for _setn in $(optional_sets_set_names); do
                 printf '  %sSet:%s %s\n' "${C_BOLD}" "${C_RESET}" "$_setn"
                 _any_full=0
+                _any_partial=0
+                _partial_groups=""
                 for _grpn in $(optional_sets_groups_in "$_setn"); do
                     _members=$(optional_set_group_members "$_setn" "$_grpn")
                     _total=$(printf '%s\n' "$_members" | awk 'NF>0' | wc -l | tr -d ' ')
@@ -4124,17 +4126,30 @@ EOF
                     if [ "$_total" -gt 0 ] && [ "$_present" = "$_total" ]; then
                         _state="FULL"; _any_full=1
                     elif [ "$_present" -gt 0 ]; then
-                        _state="PARTIAL"
+                        _state="PARTIAL"; _any_partial=1
+                        _partial_groups="$_partial_groups $_grpn"
                     else
                         _state="ABSENT"
                     fi
                     printf '    %-12s %-12s %s\n' \
                         "$_grpn" "${_state}(${_present}/${_total})" "${_line# }"
                 done
-                if [ "$_any_full" = "1" ]; then
-                    printf '    %srule (b): OK%s\n' "${C_GREEN}" "${C_RESET}"
+                # Combined verdict for rules (a) + (b):
+                #   (a) violated when ANY group is PARTIAL.
+                #   (b) violated when NO group is FULL.
+                if [ "$_any_partial" = "0" ] && [ "$_any_full" = "1" ]; then
+                    printf '    %srules (a) + (b): OK%s\n' "${C_GREEN}" "${C_RESET}"
                 else
-                    printf '    %srule (b): VIOLATED%s\n' "${C_YELLOW}" "${C_RESET}"
+                    _why=""
+                    if [ "$_any_partial" = "1" ]; then
+                        _why="(a) partial group(s):${_partial_groups}"
+                    fi
+                    if [ "$_any_full" = "0" ]; then
+                        [ -n "$_why" ] && _why="$_why; "
+                        _why="${_why}(b) no group fully present"
+                    fi
+                    printf '    %srules (a) + (b): VIOLATED [%s]%s\n' \
+                        "${C_YELLOW}" "$_why" "${C_RESET}"
                 fi
             done
         fi
