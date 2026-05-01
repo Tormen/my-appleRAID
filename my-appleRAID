@@ -34,8 +34,18 @@
 # See `appleRAID --help` for full command list and `appleRAID create-config
 # <path>` to produce a well-commented default config.
 #
-# Author: Tormen <tormen@mail.ch>
-# License: public domain / do-what-you-want
+# Author:    Tormen <tormen@mail.ch>
+# Copyright: (C) 2026 Tormen
+# License:   GPL-3.0-or-later (copyleft).
+#            This program is free software: you can redistribute it
+#            and/or modify it under the terms of the GNU General
+#            Public License as published by the Free Software
+#            Foundation, either version 3 of the License, or (at your
+#            option) any later version.
+#            This program is distributed in the hope that it will be
+#            useful, but WITHOUT ANY WARRANTY; without even the
+#            implied warranty of MERCHANTABILITY or FITNESS FOR A
+#            PARTICULAR PURPOSE. See <https://www.gnu.org/licenses/>.
 #
 
 set -u  # Treat unset variables as errors (but NOT -e: we want to handle
@@ -65,6 +75,16 @@ else
 fi
 
 SCRIPT_NAME="$(basename "$0")"
+
+# Version: bump in lockstep with the git tag. `--version` prints this
+# plus the license + copyright; appended dev info ("+N-gSHA") is
+# computed at runtime from `git describe` when the script is run from
+# a checkout, so a working-copy build is distinguishable from a
+# clean tagged release.
+SCRIPT_VERSION="v7"
+SCRIPT_COPYRIGHT="Copyright (C) 2026 Tormen <tormen@mail.ch>"
+SCRIPT_LICENSE_SHORT="GPL-3.0-or-later (copyleft)"
+SCRIPT_LICENSE_URL="https://www.gnu.org/licenses/gpl-3.0.html"
 
 # Augment PATH for the launchd context.
 # launchd starts daemons with a minimal PATH (/usr/bin:/bin:/usr/sbin:/sbin)
@@ -7348,9 +7368,47 @@ show_subcmd_help() {
     '
 }
 
+# Compute the displayed version string. Starts from the embedded
+# SCRIPT_VERSION constant (which tracks the latest git tag); if the
+# script lives in a git checkout, append a dev-build suffix from
+# `git describe --tags --dirty` so users can tell a working-copy
+# build apart from a clean tagged release. Fails silently on systems
+# without git or outside any repo - in that case the bare embedded
+# version is shown.
+script_version_string() {
+    _v="$SCRIPT_VERSION"
+    if command -v git >/dev/null 2>&1; then
+        _here=$(cd "$(dirname "$0")" 2>/dev/null && pwd)
+        if [ -n "$_here" ] && [ -d "$_here/.git" -o -f "$_here/.git" ] 2>/dev/null; then
+            _gd=$(cd "$_here" && git describe --tags --dirty --always 2>/dev/null)
+            if [ -n "$_gd" ] && [ "$_gd" != "$SCRIPT_VERSION" ]; then
+                _v="$SCRIPT_VERSION ($_gd)"
+            fi
+        fi
+    fi
+    echo "$_v"
+}
+
+cmd_version() {
+    _v=$(script_version_string)
+    printf '%s%s%s %s\n' "${C_BOLD}" "$SCRIPT_NAME" "${C_RESET}" "$_v"
+    printf '%s\n' "$SCRIPT_COPYRIGHT"
+    printf 'License: %s\n' "$SCRIPT_LICENSE_SHORT"
+    printf '         %s\n' "$SCRIPT_LICENSE_URL"
+    printf '\n'
+    printf 'This is free software: you are free to redistribute and modify it\n'
+    printf 'under the terms of the GNU General Public License as published by\n'
+    printf 'the Free Software Foundation, either version 3 of the License or\n'
+    printf '(at your option) any later version.\n'
+    printf '\n'
+    printf 'This program comes with %sABSOLUTELY NO WARRANTY%s.\n' "${C_BOLD}" "${C_RESET}"
+    printf 'Derivative works MUST be released under a compatible copyleft\n'
+    printf 'license (this is the "copyleft" obligation of the GPL).\n'
+}
+
 cmd_help() {
     cat <<EOF
-${C_BOLD}${SCRIPT_NAME}${C_RESET} - The Swiss Army knife for disks and RAIDs on macOS
+${C_BOLD}${SCRIPT_NAME}${C_RESET} $(script_version_string) - The Swiss Army knife for disks and RAIDs on macOS
                  (AppleRAID + SoftRAID interop, SMART, launchd watchdog)
 
 ${C_BOLD}USAGE${C_RESET}
@@ -11002,6 +11060,17 @@ COMPLETION_EOF
 # Main dispatch
 # ----------------------------------------------------------------------
 main() {
+    # `--version` is a top-level info command. Handle it BEFORE
+    # preflight + flag parsing so it works even when run as a
+    # non-root user on a system where preflight would fail. Accept
+    # both --version and -- the bare 'version' subcommand.
+    case "${1:-}" in
+        --version|-version|version)
+            cmd_version
+            exit 0
+            ;;
+    esac
+
     preflight
 
     # Global flags (-V/--verbose, -D/--debug) can appear before OR after
