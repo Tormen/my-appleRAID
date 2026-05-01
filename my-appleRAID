@@ -972,12 +972,14 @@ cfg_set_defaults() {
     MISSING_DISK_SEVERITY=crit             # warn|crit
     MISSING_DISK_GRACE_PERIOD=5m           # debounce transient disappearance
 
-    # --- Optional disk sets (named rotation groups) ---
-    # Built for ROTATING EXTRA BACKUP DISK SETS (off-site rotation).
-    # Multi-line list: "Name = disk1, disk2, ..." per line. Per-group rule:
-    #   (a) ALL members must be present together (no partial group); and
-    # Across the whole list:
-    #   (b) at least ONE group must be fully present at any time.
+    # --- Optional disk sets (SETs of GROUPs of DISKs) ---
+    # Built for ROTATING EXTRA BACKUP DISK SETS (off-site rotation),
+    # supporting multiple independent rotation pools in parallel.
+    # Multi-line list: "Set/Group = disk1, disk2, ..." per line.
+    #   (a) Per group: if any member is present, ALL must be (no partial).
+    #   (b) Per set:   at least ONE group in the set must be fully present.
+    # Bare names without '/' are auto-promoted into a 'default' set
+    # (backwards compat with the v6 single-set layout).
     # Members of optional groups are EXCLUDED from REQUIRED_DISKS resolution
     # so a swapped-out rotation disk does not also fire a disk-missing alert.
     OPTIONAL_DISK_SETS=""
@@ -2165,30 +2167,47 @@ list_all_physical_disks() {
 }
 
 # ----------------------------------------------------------------------
-# Optional disk sets (named rotation groups).
+# Optional disk SETs of GROUPs.
+#
+# Three-level structure:
+#
+#   DISK          one physical disk, identified by stable id (SN:/PART:/
+#                 USB:/VOL:) or bare disk-node name.
+#   GROUP         named bundle of disks. Rule (a): if ANY member is
+#                 present, ALL members must be present (no partial group).
+#   SET           named collection of GROUPs (a "rotation"). Rule (b):
+#                 within the set, AT LEAST ONE group must be fully
+#                 present at any time.
+#
+# Multiple SETs can coexist; rules (a) and (b) are checked per-set
+# independently. Typical use: one SET per rotation pool (off-site
+# rotation pair vs. weekly archive vs. ...).
 #
 # Config: OPTIONAL_DISK_SETS is a multi-line string. Each non-empty,
 # non-comment line has the form:
 #
-#     <name> = <disk-spec>, <disk-spec>, ...
+#     <set>/<group> = <disk-spec>, <disk-spec>, ...
+#
+# Backwards-compatibility: a line with no '/' (legacy v6 form
+# "<name> = ...") is auto-promoted to "default/<name>", so the SET
+# named 'default' holds all such legacy groups. v6 semantics are
+# preserved exactly: rule (b) "across the whole list" was a single
+# implicit set.
 #
 # A <disk-spec> may be a tagged baseline id (SN:..., PART:..., USB:...,
 # VOL:...) OR a bare disk-node form (disk7, /dev/disk7, 7). Tagged ids
 # are STRONGLY preferred for rotation use cases since the bsd shuffles
 # across replug/reboot.
 #
-# Semantics enforced by check_optional_disk_sets:
-#   (a) For each named group: if ANY member is present, ALL members
-#       must be present (no partial group attached).
-#   (b) Across the full list: at least ONE group must be fully present.
-#
-# Members of optional groups are EXCLUDED from REQUIRED_DISKS resolution
-# so a swapped-out rotation disk does not also fire a disk-missing alert.
+# Members of any optional GROUP (in any SET) are EXCLUDED from
+# REQUIRED_DISKS resolution so a swapped-out rotation disk does not
+# also fire a disk-missing alert.
 # ----------------------------------------------------------------------
 
-# Emit "name|spec" lines for every (group, member) pair defined in
-# OPTIONAL_DISK_SETS. Skips blank lines and '#' comments. Trims
-# whitespace around the name and each spec.
+# Emit "set|group|spec" lines for every (set, group, member) tuple
+# defined in OPTIONAL_DISK_SETS. Skips blanks/'#' comments. Trims
+# whitespace. Auto-promotes legacy bare-name lines into the 'default'
+# set.
 optional_sets_iter() {
     [ -n "${OPTIONAL_DISK_SETS:-}" ] || return 0
     printf '%s\n' "$OPTIONAL_DISK_SETS" | while IFS= read -r _line; do
@@ -2200,37 +2219,56 @@ optional_sets_iter() {
             *=*) ;;
             *) log_warn "OPTIONAL_DISK_SETS: ignoring malformed line (no '='): $_line"; continue ;;
         esac
-        _name=$(printf '%s' "$_line" | sed 's/=.*//' | sed 's/[[:space:]]*$//')
+        _path=$(printf '%s' "$_line" | sed 's/=.*//' | sed 's/[[:space:]]*$//')
         _rest=$(printf '%s' "$_line" | sed 's/^[^=]*=//')
-        [ -n "$_name" ] || continue
+        [ -n "$_path" ] || continue
+        # Split set/group. Bare name = default set, name as group.
+        case "$_path" in
+            */*)
+                _setn=$(printf '%s' "$_path" | sed 's|/.*||' | sed 's/[[:space:]]*$//')
+                _grpn=$(printf '%s' "$_path" | sed 's|^[^/]*/||' | sed 's/^[[:space:]]*//')
+                ;;
+            *)
+                _setn="default"
+                _grpn="$_path"
+                ;;
+        esac
+        case "$_setn" in *'|'*|*' '*) log_warn "OPTIONAL_DISK_SETS: bad set name (space/'|') in: $_line"; continue ;; esac
+        case "$_grpn" in *'|'*|*' '*) log_warn "OPTIONAL_DISK_SETS: bad group name (space/'|') in: $_line"; continue ;; esac
+        [ -n "$_setn" ] && [ -n "$_grpn" ] || continue
         printf '%s\n' "$_rest" | tr ',' '\n' | while IFS= read -r _spec; do
             _spec=$(printf '%s' "$_spec" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
             [ -n "$_spec" ] || continue
-            printf '%s|%s\n' "$_name" "$_spec"
+            printf '%s|%s|%s\n' "$_setn" "$_grpn" "$_spec"
         done
     done
 }
 
-# Unique group names, in declaration order.
-optional_sets_names() {
+# Distinct SET names, in declaration order.
+optional_sets_set_names() {
     optional_sets_iter | awk -F'|' 'NF>0 && !seen[$1]++ {print $1}'
 }
 
-# Members of one named group (one spec per line).
-optional_set_members() {
-    _n="$1"
-    optional_sets_iter | awk -F'|' -v n="$_n" '$1==n {print $2}'
+# Distinct GROUP names within a given SET, in declaration order.
+optional_sets_groups_in() {
+    _s="$1"
+    optional_sets_iter | awk -F'|' -v s="$_s" '$1==s && !seen[$2]++ {print $2}'
 }
 
-# Emit every spec across every group (one per line, deduplicated).
-# Used to filter REQUIRED_DISKS resolution.
+# Disks in (set, group), one spec per line.
+optional_set_group_members() {
+    _s="$1"; _g="$2"
+    optional_sets_iter | awk -F'|' -v s="$_s" -v g="$_g" '$1==s && $2==g {print $3}'
+}
+
+# Every spec across every (set, group), deduplicated. Used to filter
+# REQUIRED_DISKS resolution.
 optional_sets_all_specs() {
-    optional_sets_iter | awk -F'|' '{print $2}' | awk 'NF>0 && !seen[$0]++'
+    optional_sets_iter | awk -F'|' '{print $3}' | awk 'NF>0 && !seen[$0]++'
 }
 
-# Resolve a single optional-set spec to the currently-attached bsd, or
-# empty if not present. Accepts tagged baseline ids and bare disk-node
-# forms (with all the variants that normalize_disk_id understands).
+# Resolve a single spec to the currently-attached bsd, or empty if not
+# present. Accepts tagged baseline ids and bare disk-node forms.
 optional_spec_to_bsd() {
     _s="$1"
     [ -n "$_s" ] || return 0
@@ -2247,26 +2285,26 @@ optional_spec_to_bsd() {
     esac
 }
 
-# Given a bsd, return the name of the optional set it is a member of
-# (empty if none). Compares both the disk's baseline id and its bsd
-# against every group's specs.
+# Given a bsd, return "set/group" if the disk is a member of any
+# (set, group); empty otherwise. First match wins (a disk should not
+# be in two groups).
 optional_set_for_bsd() {
     _b="${1#/dev/}"
     [ -n "$_b" ] || return 0
     [ -n "${OPTIONAL_DISK_SETS:-}" ] || return 0
     _id=$(disk_baseline_id "$_b" 2>/dev/null)
-    optional_sets_iter | while IFS='|' read -r _n _spec; do
-        [ -n "$_n" ] || continue
+    optional_sets_iter | while IFS='|' read -r _setn _grpn _spec; do
+        [ -n "$_setn" ] || continue
         case "$_spec" in
             SN:*|PART:*|USB:*|VOL:*)
                 if [ -n "$_id" ] && [ "$_spec" = "$_id" ]; then
-                    echo "$_n"; return 0
+                    printf '%s/%s\n' "$_setn" "$_grpn"; return 0
                 fi
                 ;;
             *)
                 _nb=$(normalize_disk_id "$_spec")
                 if [ -n "$_nb" ] && [ "$_nb" = "$_b" ]; then
-                    echo "$_n"; return 0
+                    printf '%s/%s\n' "$_setn" "$_grpn"; return 0
                 fi
                 ;;
         esac
@@ -2505,20 +2543,19 @@ check_disk_presence() {
     done
 }
 
-# Presence check for OPTIONAL_DISK_SETS named groups.
+# Presence check for OPTIONAL_DISK_SETS (SETs of GROUPs of DISKs).
 #
-# For each group:
-#   present == total       -> OK (rule a + group-level rule b satisfied)
-#   0 < present < total    -> PARTIAL: rule (a) violated. Alert with
-#                             severity OPTIONAL_DISK_SET_SEVERITY.
-#   present == 0           -> not satisfying b on its own; not an error
-#                             unless NO group is fully present.
+# For each (set, group):
+#   present == total       -> OK; group is "fully present"
+#   0 < present < total    -> PARTIAL: rule (a) violated for that group;
+#                             alert with severity OPTIONAL_DISK_SET_SEVERITY
+#   present == 0           -> group fully absent; fine on its own
 #
-# After per-group eval, check rule (b): at least ONE group must be
-# fully present. If none is, fire a global alert.
+# Then per SET, rule (b): at least ONE of the set's groups must be
+# fully present. If no group in the set is fully present, alert.
 #
-# Both alert types are debounced by OPTIONAL_DISK_SET_GRACE_PERIOD so a
-# transient hub re-enumeration on swap-out doesn't fire instantly.
+# Both alert types are debounced by OPTIONAL_DISK_SET_GRACE_PERIOD so
+# transient hub re-enumeration on swap-out does not fire instantly.
 check_optional_disk_sets() {
     [ -n "${OPTIONAL_DISK_SETS:-}" ] || {
         log_debug "Optional disk sets check skipped: OPTIONAL_DISK_SETS empty"
@@ -2536,66 +2573,67 @@ check_optional_disk_sets() {
     esac
     grace="${OPTIONAL_DISK_SET_GRACE_PERIOD:-300}"
 
-    _names=$(optional_sets_names)
-    [ -n "$_names" ] || return 0
+    _sets=$(optional_sets_set_names)
+    [ -n "$_sets" ] || return 0
 
-    _any_full=0
-    _full_names=""
-    # Per-group evaluation.
-    for _n in $_names; do
-        _members=$(optional_set_members "$_n")
-        _total=$(printf '%s\n' "$_members" | awk 'NF>0' | wc -l | tr -d ' ')
-        [ "$_total" -gt 0 ] || continue
+    for _setn in $_sets; do
+        _groups=$(optional_sets_groups_in "$_setn")
+        [ -n "$_groups" ] || continue
 
-        # Resolve every member spec to "PRESENT <spec> <bsd>" or
-        # "MISSING <spec>". The body runs in a $(...) subshell so its
-        # stdout is captured as a single block we can re-scan.
-        _resolved=$(printf '%s\n' "$_members" | while IFS= read -r _spec; do
-            [ -n "$_spec" ] || continue
-            _bsd=$(optional_spec_to_bsd "$_spec")
-            if [ -n "$_bsd" ]; then
-                printf 'PRESENT %s %s\n' "$_spec" "$_bsd"
+        _any_full=0
+        _full_groups=""
+        for _grpn in $_groups; do
+            _members=$(optional_set_group_members "$_setn" "$_grpn")
+            _total=$(printf '%s\n' "$_members" | awk 'NF>0' | wc -l | tr -d ' ')
+            [ "$_total" -gt 0 ] || continue
+
+            _resolved=$(printf '%s\n' "$_members" | while IFS= read -r _spec; do
+                [ -n "$_spec" ] || continue
+                _bsd=$(optional_spec_to_bsd "$_spec")
+                if [ -n "$_bsd" ]; then
+                    printf 'PRESENT %s %s\n' "$_spec" "$_bsd"
+                else
+                    printf 'MISSING %s\n' "$_spec"
+                fi
+            done)
+            _present=$(printf '%s\n' "$_resolved" | awk '$1=="PRESENT"' | wc -l | tr -d ' ')
+            _missing=$(printf '%s\n' "$_resolved" | awk '$1=="MISSING" {print $2}' | paste -sd, -)
+
+            log_debug "  optional ${_setn}/${_grpn}: $_present/$_total present"
+
+            # Slash in the tag would land as a path separator in
+            # pending-optset-partial-<tag>; flatten to underscore.
+            _gracetag="${_setn}__${_grpn}"
+            if [ "$_present" = "$_total" ]; then
+                grace_clear "optset-partial" "$_gracetag"
+                _any_full=1
+                _full_groups="$_full_groups $_grpn"
+            elif [ "$_present" -gt 0 ]; then
+                if grace_check "optset-partial" "$_gracetag" "$grace"; then
+                    h=$(problem_hash "optset-partial" "$_gracetag" "${_present}of${_total}")
+                    seen_add "$h"
+                    handle_problem "optset-partial" "$_gracetag" "${_present}of${_total}" "$sev" \
+                        "Optional set '$_setn' group '$_grpn' is partially present ($_present of $_total); missing: ${_missing:-?}"
+                fi
             else
-                printf 'MISSING %s\n' "$_spec"
+                grace_clear "optset-partial" "$_gracetag"
             fi
-        done)
-        _present=$(printf '%s\n' "$_resolved" | awk '$1=="PRESENT"' | wc -l | tr -d ' ')
-        _missing=$(printf '%s\n' "$_resolved" | awk '$1=="MISSING" {print $2}' | paste -sd, -)
+        done
 
-        log_debug "  optional set '$_n': $_present/$_total present"
-
-        if [ "$_present" = "$_total" ]; then
-            # Rule (a) and group-level (b) satisfied.
-            grace_clear "optset-partial" "$_n"
-            _any_full=1
-            _full_names="$_full_names $_n"
-        elif [ "$_present" -gt 0 ]; then
-            # Rule (a) violated: partial group.
-            if grace_check "optset-partial" "$_n" "$grace"; then
-                h=$(problem_hash "optset-partial" "$_n" "${_present}of${_total}")
-                seen_add "$h"
-                handle_problem "optset-partial" "$_n" "${_present}of${_total}" "$sev" \
-                    "Optional disk set '$_n' is partially present ($_present of $_total); missing: ${_missing:-?}"
-            fi
+        # Rule (b) per-set.
+        if [ "$_any_full" = "1" ]; then
+            grace_clear "optset-none-full" "$_setn"
+            log_debug "  optional set '$_setn' rule (b) OK; fully present:$_full_groups"
         else
-            # Group fully absent - fine on its own; rule (b) checked below.
-            grace_clear "optset-partial" "$_n"
+            if grace_check "optset-none-full" "$_setn" "$grace"; then
+                h=$(problem_hash "optset-none-full" "$_setn" "no-group-fully-present")
+                seen_add "$h"
+                _gnames=$(printf '%s' "$_groups" | tr '\n' ',' | sed 's/,$//;s/,/, /g')
+                handle_problem "optset-none-full" "$_setn" "no-group-fully-present" "$sev" \
+                    "Optional set '$_setn': no group is fully present (defined groups: ${_gnames})"
+            fi
         fi
     done
-
-    # Rule (b): at least one group must be fully present.
-    if [ "$_any_full" = "1" ]; then
-        grace_clear "optset-none-full" "any"
-        log_debug "  optional disk sets rule (b) OK; fully present:$_full_names"
-    else
-        if grace_check "optset-none-full" "any" "$grace"; then
-            h=$(problem_hash "optset-none-full" "any" "no-group-fully-present")
-            seen_add "$h"
-            _gnames=$(printf '%s' "$_names" | tr '\n' ',' | sed 's/,$//;s/,/, /g')
-            handle_problem "optset-none-full" "any" "no-group-fully-present" "$sev" \
-                "No optional disk set is fully present (defined groups: ${_gnames})"
-        fi
-    fi
 }
 
 # Presence check for RAID sets. Fires alerts when a set in REQUIRED_SETS
@@ -3409,41 +3447,44 @@ MISSING_DISK_SEVERITY=crit
 MISSING_DISK_GRACE_PERIOD=5m
 
 
-# --- Optional disk sets (named rotation groups) ---------------------
+# --- Optional disk sets (SETs of GROUPs of DISKs) -------------------
 #
 # WHEN TO USE THIS:
 #   This feature is for ROTATING EXTRA BACKUP DISK SETS - the standard
 #   3-2-1-style offsite-backup workflow where you keep two (or more)
-#   identical sets of backup disks and physically rotate them between
-#   "on-site, plugged in" and "off-site / in a safe / at another
-#   location". One set is connected and being written to; the other is
-#   somewhere else providing disaster-recovery isolation. You swap them
-#   on a cadence (weekly, monthly, etc).
+#   identical bundles of backup disks and physically rotate them
+#   between "on-site, plugged in" and "off-site / in a safe / at
+#   another location". You swap them on a cadence (weekly, monthly,
+#   etc). You can run multiple independent rotations in parallel
+#   (e.g. an off-site rotation AND a separate weekly archive rotation).
 #
 #   Without this feature, a swapped-out set would (a) trip the standard
 #   "required disk missing" alert, and (b) you'd have no automated
 #   confirmation that you actually plugged in the OTHER set after
 #   pulling the first one. This feature handles both cases cleanly.
 #
-# Define one or more NAMED groups of disks (one group per backup set).
-# For each group:
+# THREE LEVELS:
 #
-#   (a) If ANY member of the group is currently present, ALL members
-#       must be present together (no partial group attached).
+#   DISK    one physical disk, identified by stable id (SN:/PART:/USB:/
+#           VOL:) or bare disk-node name.
+#   GROUP   a named bundle of disks (e.g. a mirror pair). Rule (a):
+#           if ANY member of the group is currently present, ALL members
+#           must be present together (no partial group attached).
+#   SET     a named collection of GROUPs (one rotation pool). Rule (b):
+#           within the set, AT LEAST ONE group must be fully present at
+#           any time. Different SETs are independent.
 #
-# Across the LIST of groups:
+# Members of any optional GROUP (in any SET) are EXCLUDED from
+# REQUIRED_DISKS resolution, so swapping out a rotation disk does NOT
+# also fire a stand-alone disk-missing alert. The optional-set checker
+# is the authoritative source of truth for those disks' presence.
 #
-#   (b) At least ONE group must be fully present at any time. (Otherwise
-#       you have nothing on-line in the rotation.)
+# CONFIG FORMAT: multi-line. Each non-empty, non-'#' line:
 #
-# Members of any optional disk set are EXCLUDED from REQUIRED_DISKS
-# resolution, so swapping out a rotation disk does NOT also fire a
-# stand-alone disk-missing alert. The optional-set checker is the
-# authoritative source of truth for those disks' presence.
+#     <Set>/<Group> = <disk-spec>, <disk-spec>, ...
 #
-# Format: multi-line. Each non-empty, non-'#' line:
-#
-#     <name> = <disk-spec>, <disk-spec>, ...
+# A line with no '/' (legacy v6 form "<name> = ...") is auto-promoted
+# into the SET named 'default'. v6 semantics are preserved exactly.
 #
 # A disk-spec may be a tagged baseline id (preferred for rotation):
 #
@@ -3458,16 +3499,36 @@ MISSING_DISK_GRACE_PERIOD=5m
 # to discover stable ids; the SERIAL column (with -V) shows the raw
 # serial that you'd write as 'SN:<serial>'.
 #
-# Example: two pairs of rotating offsite-backup mirror disks.
-# RotationA lives on-site; RotationB lives in a safe at another
-# location. Once a week you swap them. The daemon enforces:
-#   - exactly one of RotationA / RotationB must be plugged in,
-#   - and ALL members of whichever set you plugged in must be present
-#     (no half-attached pair).
+# INTERACTIVE MANAGER: instead of hand-editing this section, run
+# 'appleRAID baseline --optsets'. It lists currently-attached disks and
+# disks in the baseline-but-missing list, lets you create / rename /
+# delete sets and groups, assign disks via menu pick, and writes the
+# result back into this config file atomically.
+#
+# EXAMPLE 1: a single rotation pool with two mirror pairs.
+# OffsiteRotation lives in two halves: Pair1 on-site, Pair2 off-site.
+# Once a week you swap them. The daemon enforces:
+#   - within each pair, both disks must be present together (rule a);
+#   - within OffsiteRotation, exactly one pair must be fully present
+#     at any time (rule b).
 #
 #     OPTIONAL_DISK_SETS="
-#     RotationA = SN:WD-AAA1, SN:WD-AAA2
-#     RotationB = SN:WD-BBB1, SN:WD-BBB2
+#     OffsiteRotation/Pair1 = SN:WD-AAA1, SN:WD-AAA2
+#     OffsiteRotation/Pair2 = SN:WD-BBB1, SN:WD-BBB2
+#     "
+#
+# EXAMPLE 2: two independent rotation pools (off-site rotation AND a
+# separate quarterly archive). Each pool's rule (b) is checked
+# independently - you must always have one OffsiteRotation pair AND
+# one QuarterlyArchive disk plugged in.
+#
+#     OPTIONAL_DISK_SETS="
+#     OffsiteRotation/Pair1 = SN:WD-AAA1, SN:WD-AAA2
+#     OffsiteRotation/Pair2 = SN:WD-BBB1, SN:WD-BBB2
+#     QuarterlyArchive/Q1 = SN:HGST-Q1
+#     QuarterlyArchive/Q2 = SN:HGST-Q2
+#     QuarterlyArchive/Q3 = SN:HGST-Q3
+#     QuarterlyArchive/Q4 = SN:HGST-Q4
 #     "
 #
 # Default empty -> feature disabled.
@@ -3907,27 +3968,27 @@ EOF
 # OPTIONAL_DISK_SETS assignment, single-line or multi-line).
 # ----------------------------------------------------------------------
 
-# Render the current work file back into a shell value for
-# OPTIONAL_DISK_SETS. Output: a multi-line "..." string suitable for
-# splicing into a config file. Empty work file -> empty string value.
+# Render the work file back into a shell value for OPTIONAL_DISK_SETS.
+# Output: a multi-line "..." string. Each non-empty (set, group) emits
+# "<set>/<group> = spec, spec, ..." line. Empty placeholder-only groups
+# are excluded (they exist only as in-memory scaffolding mid-edit).
 _optsets_render_value() {
     _wf="$1"
     [ -f "$_wf" ] || { printf '""\n'; return 0; }
-    if ! awk 'NF>0' "$_wf" | head -n1 | grep -q .; then
+    # Real (non-placeholder) tuples?
+    if ! awk -F'|' 'NF>=3 && $3 != "__placeholder__" {f=1; exit} END{exit !f}' "$_wf"; then
         printf '""\n'; return 0
     fi
     printf '"\n'
-    # Group lines by name in declaration order (preserve order via awk).
-    # Skip empty placeholder-only groups - they exist only as in-memory
-    # scaffolding while the user is mid-edit and have no value in the
-    # persisted config.
-    awk -F'|' 'NF>=2 && $2 != "__placeholder__" {
-        if (!(seen_name[$1]++)) order[++n] = $1
-        members[$1] = (members[$1] ? members[$1] ", " $2 : $2)
+    awk -F'|' 'NF>=3 && $3 != "__placeholder__" {
+        key = $1 "|" $2
+        if (!(seen[key]++)) order[++n] = key
+        members[key] = (members[key] ? members[key] ", " $3 : $3)
     }
     END {
         for (i = 1; i <= n; i++) {
-            print order[i] " = " members[order[i]]
+            split(order[i], a, "|")
+            print a[1] "/" a[2] " = " members[order[i]]
         }
     }' "$_wf"
     printf '"\n'
@@ -3992,60 +4053,57 @@ _optsets_save_to_config() {
     fi
 }
 
-# Print the current state of the work file: groups, members, presence,
-# plus a list of unassigned attached disks and missing-from-baseline
-# disks the user can assign.
+# Print the current state of the work file as a SET/GROUP tree, with
+# presence tally per group; plus unassigned attached disks and
+# missing-from-baseline disks the user can assign.
 _optsets_show_state() {
     _wf="$1"
     echo
     step "Optional disk sets (working draft)"
     if ! awk 'NF>0' "$_wf" | head -n1 | grep -q .; then
-        info "(no groups defined yet)"
+        info "(no sets/groups defined yet)"
     else
-        printf '  %-16s %-9s %s\n' "GROUP" "STATE"  "MEMBERS"
-        printf '  %-16s %-9s %s\n' "-----" "-----"  "-------"
-        # Build "<group>|<member member ...>" rows, listing every group
-        # (including empty placeholder-only groups) but filtering the
-        # placeholder marker out of the per-row member list.
-        awk -F'|' 'NF>=2 {
-            if (!(seen[$1]++)) order[++n] = $1
-            if ($2 != "__placeholder__") {
-                members[$1] = (members[$1] ? members[$1] " " $2 : $2)
-            } else if (!(members[$1])) {
-                members[$1] = ""
-            }
-        }
-        END {
-            for (i = 1; i <= n; i++) print order[i] "|" members[order[i]]
-        }' "$_wf" | while IFS='|' read -r _gn _ms; do
-            if [ -z "$_ms" ]; then
-                printf '  %-16s %-9s %s\n' "$_gn" "EMPTY(0/0)" "(no disks assigned yet)"
-                continue
-            fi
-            _total=0; _present=0; _line=""
-            for _s in $_ms; do
-                _total=$((_total + 1))
-                _bsd=$(optional_spec_to_bsd "$_s" 2>/dev/null)
-                if [ -n "$_bsd" ]; then
-                    _present=$((_present + 1))
-                    _line="$_line ${_s}->${_bsd}"
-                else
-                    _line="$_line ${_s}=MISSING"
+        # Walk SET, then GROUPs within. We rebuild the per-(set,group)
+        # member list and presence on the fly.
+        _setlist=$(awk -F'|' 'NF>=3 && !seen[$1]++ {print $1}' "$_wf")
+        echo "$_setlist" | while IFS= read -r _setn; do
+            [ -n "$_setn" ] || continue
+            printf '  %sSet: %s%s\n' "${C_BOLD}" "$_setn" "${C_RESET}"
+            printf '    %-18s %-12s %s\n' "GROUP" "STATE" "MEMBERS"
+            printf '    %-18s %-12s %s\n' "-----" "-----" "-------"
+            _groups=$(awk -F'|' -v s="$_setn" '$1==s && !seen[$2]++ {print $2}' "$_wf")
+            echo "$_groups" | while IFS= read -r _grpn; do
+                [ -n "$_grpn" ] || continue
+                _ms=$(awk -F'|' -v s="$_setn" -v g="$_grpn" '$1==s && $2==g && $3 != "__placeholder__" {print $3}' "$_wf" | tr '\n' ' ')
+                if [ -z "$(printf '%s' "$_ms" | tr -d '[:space:]')" ]; then
+                    printf '    %-18s %-12s %s\n' "$_grpn" "EMPTY(0/0)" "(no disks assigned yet)"
+                    continue
                 fi
+                _total=0; _present=0; _line=""
+                for _s in $_ms; do
+                    _total=$((_total + 1))
+                    _bsd=$(optional_spec_to_bsd "$_s" 2>/dev/null)
+                    if [ -n "$_bsd" ]; then
+                        _present=$((_present + 1))
+                        _line="$_line ${_s}->${_bsd}"
+                    else
+                        _line="$_line ${_s}=MISSING"
+                    fi
+                done
+                if [ "$_total" -gt 0 ] && [ "$_present" = "$_total" ]; then
+                    _state="FULL"
+                elif [ "$_present" -gt 0 ]; then
+                    _state="PARTIAL"
+                else
+                    _state="ABSENT"
+                fi
+                printf '    %-18s %-12s %s\n' "$_grpn" "${_state}(${_present}/${_total})" "${_line# }"
             done
-            if [ "$_total" -gt 0 ] && [ "$_present" = "$_total" ]; then
-                _state="FULL"
-            elif [ "$_present" -gt 0 ]; then
-                _state="PARTIAL"
-            else
-                _state="ABSENT"
-            fi
-            printf '  %-16s %-9s %s\n' "$_gn" "${_state}(${_present}/${_total})" "${_line# }"
         done
     fi
 
     # Build set of specs already assigned, for filtering candidate lists.
-    _assigned=$(awk -F'|' 'NF>=2 {print $2}' "$_wf")
+    _assigned=$(awk -F'|' 'NF>=3 && $3 != "__placeholder__" {print $3}' "$_wf")
 
     # Unassigned currently-attached physical disks.
     echo
@@ -4104,19 +4162,20 @@ cmd_baseline_optsets() {
     # Seed the work file from the current OPTIONAL_DISK_SETS value.
     optional_sets_iter > "$_wf" 2>/dev/null || true
 
-    step "Interactive OPTIONAL_DISK_SETS manager"
+    step "Interactive OPTIONAL_DISK_SETS manager (SETs of GROUPs of DISKs)"
     explain "Loaded config: ${LOADED_CONFIG:-<none>}"
     explain "Changes are kept in memory until you 's'ave."
-    explain "Per-group rule (a): if any member is present, ALL must be."
-    explain "Across groups rule (b): at least one group must be fully present."
+    explain "Per-group rule (a): if any member is present, ALL members must be."
+    explain "Per-set rule (b): at least one group in the set must be fully present."
+    explain "Paths are 'Set/Group' (e.g. OffsiteRotation/Pair1)."
 
     while :; do
         _optsets_show_state "$_wf"
         echo
         printf '%sActions:%s\n' "${C_BOLD}" "${C_RESET}"
-        printf '  c) create a new group\n'
-        printf '  r) rename a group\n'
-        printf '  d) delete a group\n'
+        printf '  c) create a new group (Set/Group)\n'
+        printf '  r) rename a group or a whole set\n'
+        printf '  d) delete a group or a whole set\n'
         printf '  a) add a disk (attached or missing-from-baseline) to a group\n'
         printf '  x) remove a disk from a group\n'
         printf '  s) save and exit (writes to %s)\n' "${LOADED_CONFIG:-<none>}"
@@ -4161,85 +4220,180 @@ _optsets_prompt() {
     _ANS=$(printf '%s' "$_ANS" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
 }
 
-_optsets_pick_group() {
-    # $1=prompt; sets _PICK to a group name (or empty).
-    _wf="$2"
-    _names=$(awk -F'|' 'NF>=2 {if(!seen[$1]++) print $1}' "$_wf")
-    if [ -z "$_names" ]; then
-        warn "No groups defined yet. Use 'c' to create one first."
-        _PICK=""; return 1
-    fi
+# List all (set, group) pairs in declaration order, numbered.
+# Sets _PATHS to a newline-separated "set/group" list and prints
+# them with numbers. Returns 1 if the work file is empty.
+_optsets_list_paths() {
+    _wf="$1"
+    _PATHS=$(awk -F'|' 'NF>=3 && !seen[$1"|"$2]++ {print $1 "/" $2}' "$_wf")
+    if [ -z "$_PATHS" ]; then return 1; fi
     _i=0
-    echo "$_names" | while IFS= read -r _n; do
-        _i=$((_i+1)); printf '  %d) %s\n' "$_i" "$_n"
+    echo "$_PATHS" | while IFS= read -r _p; do
+        _i=$((_i+1)); printf '  %2d) %s\n' "$_i" "$_p"
     done
-    _optsets_prompt "$1"
-    case "$_ANS" in
+    return 0
+}
+
+# Resolve a user input to a "set/group" path. Accepts:
+#   - a number from the list shown by _optsets_list_paths
+#   - a literal "set/group" string
+#   - a bare group name if exactly one group with that name exists
+# Sets _PICK to the resolved "set/group" or empty.
+_optsets_resolve_path() {
+    _wf="$1"; _ans="$2"
+    _PICK=""
+    [ -n "$_ans" ] || return 1
+    _all=$(awk -F'|' 'NF>=3 && !seen[$1"|"$2]++ {print $1 "/" $2}' "$_wf")
+    case "$_ans" in
         [0-9]*)
-            _PICK=$(echo "$_names" | awk -v n="$_ANS" 'NR==n {print; exit}')
+            _PICK=$(echo "$_all" | awk -v n="$_ans" 'NR==n {print; exit}')
             ;;
-        *)  _PICK="$_ANS" ;;
+        */*)
+            if echo "$_all" | grep -qxF "$_ans"; then
+                _PICK="$_ans"
+            fi
+            ;;
+        *)
+            # Bare group name: unique-match across all sets.
+            _hits=$(echo "$_all" | awk -F'/' -v g="$_ans" '$2==g {print}')
+            _hc=$(echo "$_hits" | awk 'NF>0' | wc -l | tr -d ' ')
+            if [ "$_hc" = "1" ]; then
+                _PICK=$(echo "$_hits" | head -n1)
+            elif [ "$_hc" -gt 1 ]; then
+                warn "Group name '$_ans' is ambiguous (matches: $(echo "$_hits" | tr '\n' ' '))."
+                return 1
+            fi
+            ;;
     esac
-    if [ -z "$_PICK" ] || ! echo "$_names" | grep -qxF "$_PICK"; then
-        warn "No such group: '$_ANS'"
-        _PICK=""; return 1
+    if [ -z "$_PICK" ]; then
+        warn "No such set/group: '$_ans'"
+        return 1
     fi
+    return 0
+}
+
+_optsets_validate_name() {
+    # $1 = candidate name; rejects empty / space / | / , / = / /.
+    case "$1" in
+        '') return 1 ;;
+        *'|'*|*','*|*'='*|*'/'*|*' '*) return 1 ;;
+    esac
     return 0
 }
 
 _optsets_action_create() {
     _wf="$1"
-    _optsets_prompt "Name for new group (e.g. RotationA):" || return
-    [ -n "$_ANS" ] || { warn "Empty name; aborted."; return; }
+    _optsets_prompt "Path for new group (Set/Group, e.g. OffsiteRotation/Pair1):" || return
+    [ -n "$_ANS" ] || { warn "Empty path; aborted."; return; }
     case "$_ANS" in
-        *'|'*|*','*|*'='*|*' '*)
-            warn "Group name cannot contain space, '|', ',' or '='."; return ;;
+        */*) ;;
+        *) warn "Need a Set/Group path. Example: OffsiteRotation/Pair1"; return ;;
     esac
-    if awk -F'|' -v n="$_ANS" '$1==n {found=1; exit} END{exit !found}' "$_wf"; then
-        warn "Group '$_ANS' already exists."; return
+    _setn=$(printf '%s' "$_ANS" | sed 's|/.*||')
+    _grpn=$(printf '%s' "$_ANS" | sed 's|^[^/]*/||')
+    _optsets_validate_name "$_setn" || { warn "Invalid set name (no space, '|', ',', '=', '/')."; return; }
+    _optsets_validate_name "$_grpn" || { warn "Invalid group name (no space, '|', ',', '=', '/')."; return; }
+    if awk -F'|' -v s="$_setn" -v g="$_grpn" '$1==s && $2==g {f=1; exit} END{exit !f}' "$_wf"; then
+        warn "Group '$_setn/$_grpn' already exists."; return
     fi
-    # Create an empty placeholder line so the group is visible even before
-    # any member is added. We use the convention "<name>|" with empty spec.
-    printf '%s|__placeholder__\n' "$_ANS" >> "$_wf"
-    ok "Created group '$_ANS'. Use 'a' to assign disks."
+    printf '%s|%s|__placeholder__\n' "$_setn" "$_grpn" >> "$_wf"
+    ok "Created group '$_setn/$_grpn'. Use 'a' to assign disks."
 }
 
 _optsets_action_rename() {
     _wf="$1"
-    _optsets_pick_group "Group to rename (number or name):" "$_wf" || return
-    _old="$_PICK"
-    _optsets_prompt "New name:" || return
-    [ -n "$_ANS" ] || { warn "Empty name; aborted."; return; }
+    _optsets_prompt "Path to rename (Set or Set/Group; number from list or string):" || return
+    [ -n "$_ANS" ] || { warn "Empty; aborted."; return; }
+
+    # Determine if it refers to a SET (no slash) or a GROUP (has slash
+    # or matches a numbered list entry).
     case "$_ANS" in
-        *'|'*|*','*|*'='*|*' '*)
-            warn "Group name cannot contain space, '|', ',' or '='."; return ;;
+        */*|[0-9]*)
+            _optsets_resolve_path "$_wf" "$_ANS" || return
+            _oldset=$(printf '%s' "$_PICK" | sed 's|/.*||')
+            _oldgrp=$(printf '%s' "$_PICK" | sed 's|^[^/]*/||')
+            _optsets_prompt "New Set/Group name:" || return
+            case "$_ANS" in
+                */*) ;;
+                *) warn "Need a Set/Group path."; return ;;
+            esac
+            _newset=$(printf '%s' "$_ANS" | sed 's|/.*||')
+            _newgrp=$(printf '%s' "$_ANS" | sed 's|^[^/]*/||')
+            _optsets_validate_name "$_newset" && _optsets_validate_name "$_newgrp" \
+                || { warn "Invalid name."; return; }
+            if awk -F'|' -v s="$_newset" -v g="$_newgrp" '$1==s && $2==g {f=1; exit} END{exit !f}' "$_wf"; then
+                warn "Target '$_newset/$_newgrp' already exists."; return
+            fi
+            _tmp=$(mktemp "$STATE_DIR/.optsets-rn.XXXXXX") || { errmsg "mktemp failed"; return; }
+            awk -F'|' -v os="$_oldset" -v og="$_oldgrp" -v ns="$_newset" -v ng="$_newgrp" \
+                'BEGIN{OFS="|"} $1==os && $2==og {$1=ns; $2=ng} {print}' "$_wf" > "$_tmp" \
+                && mv "$_tmp" "$_wf" \
+                && ok "Renamed '$_oldset/$_oldgrp' -> '$_newset/$_newgrp'." \
+                || { rm -f "$_tmp"; errmsg "rename failed"; }
+            ;;
+        *)
+            # Rename a SET (affects all its groups).
+            _oldset="$_ANS"
+            if ! awk -F'|' -v s="$_oldset" '$1==s {f=1; exit} END{exit !f}' "$_wf"; then
+                warn "No such set: '$_oldset'"; return
+            fi
+            _optsets_prompt "New set name:" || return
+            _optsets_validate_name "$_ANS" || { warn "Invalid set name."; return; }
+            if awk -F'|' -v s="$_ANS" '$1==s {f=1; exit} END{exit !f}' "$_wf"; then
+                warn "Set '$_ANS' already exists; renames must not collide."; return
+            fi
+            _tmp=$(mktemp "$STATE_DIR/.optsets-rn.XXXXXX") || { errmsg "mktemp failed"; return; }
+            awk -F'|' -v os="$_oldset" -v ns="$_ANS" \
+                'BEGIN{OFS="|"} $1==os {$1=ns} {print}' "$_wf" > "$_tmp" \
+                && mv "$_tmp" "$_wf" \
+                && ok "Renamed set '$_oldset' -> '$_ANS' (all its groups moved)." \
+                || { rm -f "$_tmp"; errmsg "rename failed"; }
+            ;;
     esac
-    if awk -F'|' -v n="$_ANS" '$1==n {found=1; exit} END{exit !found}' "$_wf"; then
-        warn "Group '$_ANS' already exists."; return
-    fi
-    _tmp=$(mktemp "$STATE_DIR/.optsets-rn.XXXXXX") || { errmsg "mktemp failed"; return; }
-    awk -F'|' -v old="$_old" -v new="$_ANS" 'BEGIN{OFS="|"} $1==old {$1=new} {print}' "$_wf" > "$_tmp" \
-        && mv "$_tmp" "$_wf" \
-        && ok "Renamed '$_old' -> '$_ANS'." \
-        || { rm -f "$_tmp"; errmsg "rename failed"; }
 }
 
 _optsets_action_delete() {
     _wf="$1"
-    _optsets_pick_group "Group to delete (number or name):" "$_wf" || return
-    _g="$_PICK"
-    confirm "Delete group '$_g' and unassign all its members?" || return
-    _tmp=$(mktemp "$STATE_DIR/.optsets-del.XXXXXX") || { errmsg "mktemp failed"; return; }
-    awk -F'|' -v g="$_g" '$1!=g' "$_wf" > "$_tmp" \
-        && mv "$_tmp" "$_wf" \
-        && ok "Deleted group '$_g'." \
-        || { rm -f "$_tmp"; errmsg "delete failed"; }
+    _optsets_prompt "Path to delete (Set or Set/Group; number from list or string):" || return
+    [ -n "$_ANS" ] || { warn "Empty; aborted."; return; }
+    case "$_ANS" in
+        */*|[0-9]*)
+            _optsets_resolve_path "$_wf" "$_ANS" || return
+            _setn=$(printf '%s' "$_PICK" | sed 's|/.*||')
+            _grpn=$(printf '%s' "$_PICK" | sed 's|^[^/]*/||')
+            confirm "Delete group '$_setn/$_grpn' and unassign all its members?" || return
+            _tmp=$(mktemp "$STATE_DIR/.optsets-del.XXXXXX") || { errmsg "mktemp failed"; return; }
+            awk -F'|' -v s="$_setn" -v g="$_grpn" '!($1==s && $2==g)' "$_wf" > "$_tmp" \
+                && mv "$_tmp" "$_wf" \
+                && ok "Deleted group '$_setn/$_grpn'." \
+                || { rm -f "$_tmp"; errmsg "delete failed"; }
+            ;;
+        *)
+            _setn="$_ANS"
+            if ! awk -F'|' -v s="$_setn" '$1==s {f=1; exit} END{exit !f}' "$_wf"; then
+                warn "No such set: '$_setn'"; return
+            fi
+            confirm "Delete entire set '$_setn' (all its groups and members)?" || return
+            _tmp=$(mktemp "$STATE_DIR/.optsets-del.XXXXXX") || { errmsg "mktemp failed"; return; }
+            awk -F'|' -v s="$_setn" '$1!=s' "$_wf" > "$_tmp" \
+                && mv "$_tmp" "$_wf" \
+                && ok "Deleted set '$_setn'." \
+                || { rm -f "$_tmp"; errmsg "delete failed"; }
+            ;;
+    esac
 }
 
 _optsets_action_add() {
     _wf="$1"
-    _optsets_pick_group "Add to which group (number or name):" "$_wf" || return
-    _g="$_PICK"
+    info "Existing groups:"
+    if ! _optsets_list_paths "$_wf"; then
+        warn "No groups defined yet. Use 'c' to create one (Set/Group)."
+        return
+    fi
+    _optsets_prompt "Add to which group (Set/Group, or number above):" || return
+    _optsets_resolve_path "$_wf" "$_ANS" || return
+    _setn=$(printf '%s' "$_PICK" | sed 's|/.*||')
+    _grpn=$(printf '%s' "$_PICK" | sed 's|^[^/]*/||')
 
     # Build the candidate list: attached disks (with stable id) +
     # missing-from-baseline ids, minus anything already assigned. We
@@ -4247,7 +4401,7 @@ _optsets_action_add() {
     # rather than `awk -v` because POSIX awk's -v doesn't reliably
     # carry embedded newlines across implementations.
     _assigned_file=$(mktemp "$STATE_DIR/.optsets-asg.XXXXXX") || { errmsg "mktemp failed"; return; }
-    awk -F'|' 'NF>=2 {print $2}' "$_wf" > "$_assigned_file"
+    awk -F'|' 'NF>=3 && $3 != "__placeholder__" {print $3}' "$_wf" > "$_assigned_file"
     _cands_raw=$(mktemp "$STATE_DIR/.optsets-craw.XXXXXX") || { rm -f "$_assigned_file"; errmsg "mktemp failed"; return; }
     _cands=$(mktemp "$STATE_DIR/.optsets-cand.XXXXXX") || { rm -f "$_assigned_file" "$_cands_raw"; errmsg "mktemp failed"; return; }
     {
@@ -4304,15 +4458,23 @@ _optsets_action_add() {
             *)  _id="$_tok" ;;
         esac
         [ -n "$_id" ] || { warn "Could not resolve '$_tok'"; continue; }
-        # Drop placeholder for this group if present.
+        # Drop placeholder for this (set, group) if present.
         _tmp=$(mktemp "$STATE_DIR/.optsets-addg.XXXXXX") || continue
-        awk -F'|' -v g="$_g" '!($1==g && $2=="__placeholder__")' "$_wf" > "$_tmp" && mv "$_tmp" "$_wf"
-        # Check duplicates within the same group.
-        if awk -F'|' -v g="$_g" -v s="$_id" '$1==g && $2==s {f=1; exit} END{exit !f}' "$_wf"; then
-            warn "$_id already in '$_g'; skipped."; continue
+        awk -F'|' -v s="$_setn" -v g="$_grpn" '!($1==s && $2==g && $3=="__placeholder__")' "$_wf" > "$_tmp" \
+            && mv "$_tmp" "$_wf"
+        # Skip if already in the same group.
+        if awk -F'|' -v s="$_setn" -v g="$_grpn" -v sp="$_id" '$1==s && $2==g && $3==sp {f=1; exit} END{exit !f}' "$_wf"; then
+            warn "$_id already in '$_setn/$_grpn'; skipped."; continue
         fi
-        printf '%s|%s\n' "$_g" "$_id" >> "$_wf"
-        ok "Added $_id to '$_g'."
+        # Forbid the same disk being assigned to multiple groups (in any
+        # set). The model is "exactly one home per disk".
+        if awk -F'|' -v sp="$_id" '$3==sp {f=1; exit} END{exit !f}' "$_wf"; then
+            _other=$(awk -F'|' -v sp="$_id" '$3==sp {print $1 "/" $2; exit}' "$_wf")
+            warn "$_id is already assigned to '$_other'; skipped (a disk lives in one group)."
+            continue
+        fi
+        printf '%s|%s|%s\n' "$_setn" "$_grpn" "$_id" >> "$_wf"
+        ok "Added $_id to '$_setn/$_grpn'."
         _added=$((_added + 1))
     done
     rm -f "$_cands"
@@ -4321,14 +4483,22 @@ _optsets_action_add() {
 
 _optsets_action_remove() {
     _wf="$1"
-    _optsets_pick_group "Remove from which group (number or name):" "$_wf" || return
-    _g="$_PICK"
-    _ms=$(awk -F'|' -v g="$_g" '$1==g && $2!="__placeholder__" {print $2}' "$_wf")
-    if [ -z "$_ms" ]; then
-        warn "Group '$_g' has no members."
+    info "Existing groups:"
+    if ! _optsets_list_paths "$_wf"; then
+        warn "No groups defined yet."
         return
     fi
-    info "Members of '$_g':"
+    _optsets_prompt "Remove from which group (Set/Group, or number above):" || return
+    _optsets_resolve_path "$_wf" "$_ANS" || return
+    _setn=$(printf '%s' "$_PICK" | sed 's|/.*||')
+    _grpn=$(printf '%s' "$_PICK" | sed 's|^[^/]*/||')
+
+    _ms=$(awk -F'|' -v s="$_setn" -v g="$_grpn" '$1==s && $2==g && $3!="__placeholder__" {print $3}' "$_wf")
+    if [ -z "$_ms" ]; then
+        warn "Group '$_setn/$_grpn' has no members."
+        return
+    fi
+    info "Members of '$_setn/$_grpn':"
     _i=0
     echo "$_ms" | while IFS= read -r _s; do
         _i=$((_i+1)); printf '  %d) %s\n' "$_i" "$_s"
@@ -4342,11 +4512,12 @@ _optsets_action_remove() {
         esac
         [ -n "$_id" ] || { warn "Could not resolve '$_tok'"; continue; }
         _tmp=$(mktemp "$STATE_DIR/.optsets-rm.XXXXXX") || continue
-        awk -F'|' -v g="$_g" -v s="$_id" '!($1==g && $2==s)' "$_wf" > "$_tmp" && mv "$_tmp" "$_wf" \
-            && ok "Removed $_id from '$_g'."
+        awk -F'|' -v s="$_setn" -v g="$_grpn" -v sp="$_id" '!($1==s && $2==g && $3==sp)' "$_wf" > "$_tmp" \
+            && mv "$_tmp" "$_wf" \
+            && ok "Removed $_id from '$_setn/$_grpn'."
         # If the group is now empty, restore a placeholder so it stays visible.
-        if ! awk -F'|' -v g="$_g" '$1==g && $2!="__placeholder__" {f=1; exit} END{exit !f}' "$_wf"; then
-            printf '%s|__placeholder__\n' "$_g" >> "$_wf"
+        if ! awk -F'|' -v s="$_setn" -v g="$_grpn" '$1==s && $2==g && $3!="__placeholder__" {f=1; exit} END{exit !f}' "$_wf"; then
+            printf '%s|%s|__placeholder__\n' "$_setn" "$_grpn" >> "$_wf"
         fi
     done
 }
@@ -8130,48 +8301,49 @@ EOF
     done
 
     # ------------------------------------------------------------------
-    # Optional disk sets summary
+    # Optional disk sets summary (SETs of GROUPs of DISKs)
     # ------------------------------------------------------------------
     if [ -n "${OPTIONAL_DISK_SETS:-}" ]; then
         echo
         step "Optional disk sets"
         explain "Per-group rule (a): if any member is present, ALL must be (else PARTIAL)."
-        explain "Across the list rule (b): at least ONE group must be fully present."
+        explain "Per-set rule (b): at least ONE group in the set must be fully present."
         echo
-        printf '  %-16s %-9s %s\n' "GROUP" "STATE" "MEMBERS (spec -> bsd or MISSING)"
-        printf '  %-16s %-9s %s\n' "-----" "-----" "--------------------------------"
-        any_full=0
-        for n in $(optional_sets_names); do
-            members=$(optional_set_members "$n")
-            total=$(printf '%s\n' "$members" | awk 'NF>0' | wc -l | tr -d ' ')
-            present=0
-            line=""
-            for s in $members; do
-                [ -n "$s" ] || continue
-                bsd=$(optional_spec_to_bsd "$s")
-                if [ -n "$bsd" ]; then
-                    present=$((present + 1))
-                    line="$line ${s}->${bsd}"
+        for setn in $(optional_sets_set_names); do
+            printf '%s%s%s\n' "${C_BOLD}" "Set: $setn" "${C_RESET}"
+            printf '  %-18s %-12s %s\n' "GROUP" "STATE" "MEMBERS (spec -> bsd or MISSING)"
+            printf '  %-18s %-12s %s\n' "-----" "-----" "--------------------------------"
+            any_full=0
+            for grpn in $(optional_sets_groups_in "$setn"); do
+                members=$(optional_set_group_members "$setn" "$grpn")
+                total=$(printf '%s\n' "$members" | awk 'NF>0' | wc -l | tr -d ' ')
+                present=0; line=""
+                for s in $members; do
+                    [ -n "$s" ] || continue
+                    bsd=$(optional_spec_to_bsd "$s" 2>/dev/null)
+                    if [ -n "$bsd" ]; then
+                        present=$((present + 1))
+                        line="$line ${s}->${bsd}"
+                    else
+                        line="$line ${s}=MISSING"
+                    fi
+                done
+                if [ "$total" -gt 0 ] && [ "$present" = "$total" ]; then
+                    state="FULL"; any_full=1
+                elif [ "$present" -gt 0 ]; then
+                    state="PARTIAL"
                 else
-                    line="$line ${s}=MISSING"
+                    state="ABSENT"
                 fi
+                printf '  %-18s %-12s %s\n' "$grpn" "${state}(${present}/${total})" "${line# }"
             done
-            if [ "$present" = "$total" ] && [ "$total" -gt 0 ]; then
-                state="FULL"
-                any_full=1
-            elif [ "$present" -gt 0 ]; then
-                state="PARTIAL"
+            if [ "$any_full" = "1" ]; then
+                ok "  Set '$setn' rule (b) OK: a group is fully present."
             else
-                state="ABSENT"
+                warn "  Set '$setn' rule (b) VIOLATED: no group fully present."
             fi
-            printf '  %-16s %-9s %s\n' "$n" "${state}(${present}/${total})" "${line# }"
+            echo
         done
-        echo
-        if [ "$any_full" = "1" ]; then
-            ok "Rule (b) OK: at least one optional set is fully present."
-        else
-            warn "Rule (b) VIOLATED: no optional disk set is fully present."
-        fi
     fi
 }
 
