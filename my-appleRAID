@@ -4096,7 +4096,7 @@ _optsets_save_to_config() {
 # presence tally per group; plus unassigned attached disks and
 # missing-from-baseline disks the user can assign.
 # Build the candidate cache. Format per line:
-#     KIND|ID|NODE|MODEL_OR_HINT
+#     KIND|ID|NODE|SIZE|MODEL
 # KIND is ATTACHED (currently plugged in, has a stable id) or MISSING
 # (in baseline-disks but not currently attached). Order: attached
 # first (declaration order from list_all_physical_disks), then
@@ -4111,23 +4111,51 @@ _optsets_build_cache() {
         [ -n "$_d" ] || continue
         _id=$(disk_baseline_id "$_d" 2>/dev/null)
         [ -n "$_id" ] || continue
-        _model=$(diskutil info "/dev/$_d" 2>/dev/null \
+        _info=$(diskutil info "/dev/$_d" 2>/dev/null)
+        _model=$(printf '%s\n' "$_info" \
             | awk -F': +' '/Device \/ Media Name:/ {print $2; exit}' \
             | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
-        printf 'ATTACHED|%s|/dev/%s|%s\n' "$_id" "$_d" "${_model:-?}" >> "$_cache"
+        # "Disk Size: 16.0 TB (15999999999 Bytes) (...)". We want the
+        # human form (first two whitespace-separated tokens after the
+        # colon), e.g. "16.0 TB".
+        _size=$(printf '%s\n' "$_info" \
+            | awk -F': +' '/Disk Size:/ {print $2; exit}' \
+            | awk '{print $1, $2}' \
+            | sed 's/[[:space:]]*$//')
+        printf 'ATTACHED|%s|/dev/%s|%s|%s\n' "$_id" "$_d" "${_size:-?}" "${_model:-?}" >> "$_cache"
     done
-    # Missing-from-baseline.
+    # Missing-from-baseline. baseline_write_disks formats each line as
+    #     <id>  # <bsd>  <size>  <model>
+    # where <size> is "<num> <unit>" (two whitespace-separated tokens)
+    # and <model> is the rest. Parse with awk.
     _bf=$(baseline_disks_file)
     if [ -f "$_bf" ]; then
-        awk 'NF>0 && !/^#/' "$_bf" | while IFS= read -r _ln; do
-            _id=$(printf '%s' "$_ln" | awk '{print $1}')
+        awk '
+            NF>0 && !/^#/ {
+                id = $1
+                hidx = 0
+                for (i = 2; i <= NF; i++) if ($i == "#") { hidx = i; break }
+                if (hidx == 0 || hidx + 3 > NF) {
+                    # Fallback: no parsable hint. Emit whole tail as model.
+                    rest = ""
+                    for (j = 2; j <= NF; j++) rest = rest (rest=="" ? "" : " ") $j
+                    print id "|-|?|" rest
+                    next
+                }
+                bsd = $(hidx + 1)
+                size = $(hidx + 2) " " $(hidx + 3)
+                model = ""
+                for (j = hidx + 4; j <= NF; j++) model = (model == "" ? $j : model " " $j)
+                if (model == "") model = "?"
+                print id "|" bsd "|" size "|" model
+            }
+        ' "$_bf" | while IFS='|' read -r _id _bsd _size _model; do
             [ -n "$_id" ] || continue
-            # Skip if we already listed it as ATTACHED.
+            # Skip if we already listed it as ATTACHED (under any bsd).
             if grep -q "^ATTACHED|${_id}|" "$_cache" 2>/dev/null; then continue; fi
             # Confirm it's actually missing from current attachment.
             [ -z "$(disk_for_baseline_id "$_id" 2>/dev/null)" ] || continue
-            _hint=$(printf '%s' "$_ln" | sed 's/^[^#]*#[[:space:]]*//')
-            printf 'MISSING|%s|-|%s\n' "$_id" "${_hint:-?}" >> "$_cache"
+            printf 'MISSING|%s|-|%s|%s\n' "$_id" "${_size:-?}" "${_model:-?}" >> "$_cache"
         done
     fi
 }
@@ -4201,7 +4229,7 @@ _optsets_show_state() {
         return 0
     fi
     _i=0
-    while IFS='|' read -r _kind _id _node _hint; do
+    while IFS='|' read -r _kind _id _node _size _model; do
         [ -n "$_kind" ] || continue
         _i=$((_i + 1))
         _own=$(_optsets_assignment_of "$_wf" "$_id")
@@ -4210,14 +4238,14 @@ _optsets_show_state() {
         else
             _tag="free"
         fi
-        # ID column width is sized for the widest tagged form: PART:
-        # baseline ids are "PART:" + a 36-char GPT GUID = 41 chars.
-        # SN:/USB:/VOL: ids are shorter and just left-pad. Hint column
-        # is squashed (single-space-collapsed) so multi-space artifacts
-        # from the baseline file don't blow past the cap.
-        _hint_norm=$(printf '%s' "${_hint:-?}" | tr -s '[:space:]' ' ')
-        printf '  %3d) [%-8s] %-41s %-12s %-32.32s [%s]\n' \
-            "$_i" "$_kind" "$_id" "$_node" "$_hint_norm" "$_tag"
+        # Columns: NUM) KIND ID NODE SIZE MODEL [tag]
+        # ID width sized for the widest tagged form: "PART:" + 36-char
+        # GPT GUID = 41 chars. SIZE is "<num> <unit>" e.g. "16.0 TB"
+        # (8 chars max for sane disks). MODEL squashed to single
+        # spaces and capped at 28 chars.
+        _model_norm=$(printf '%s' "${_model:-?}" | tr -s '[:space:]' ' ')
+        printf '  %3d) [%-8s] %-41s %-12s %-9s %-28.28s [%s]\n' \
+            "$_i" "$_kind" "$_id" "$_node" "${_size:-?}" "$_model_norm" "$_tag"
     done < "$_cache"
 }
 
