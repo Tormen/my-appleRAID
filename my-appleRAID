@@ -10915,6 +10915,7 @@ _my-appleRAID() {
         'release-softraid:Tear down a SoftRAID volume without creating an AppleRAID set'
         'uninstall-softraid:Pre/post-flight verification for SoftRAID removal'
         'help:Show help (use help <command> for details)'
+        'version:Print version, copyright, and license info'
     )
 
     local -a global_opts
@@ -10922,6 +10923,7 @@ _my-appleRAID() {
         '(-V --verbose)'{-V,--verbose}'[Show more detail]'
         '(-D --debug)'{-D,--debug}'[Even more detail; implies -V + set -x]'
         '(-h --help)'{-h,--help}'[Show help]'
+        '--version[Print version + copyright + license]'
     )
 
     _arguments -s : \
@@ -10984,7 +10986,8 @@ _my-appleRAID() {
                     _arguments \
                         '--sets[Only update set baseline]' \
                         '--disks[Only update disk baseline]' \
-                        '--show[Print current baselines only]'
+                        '--show[Print current baselines only]' \
+                        '--optsets[Interactive manager for OPTIONAL_DISK_SETS (SETs of GROUPs of DISKs)]'
                     ;;
                 *)
                     _files
