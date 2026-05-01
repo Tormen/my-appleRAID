@@ -83,7 +83,7 @@ SCRIPT_NAME="$(basename "$0")"
 # subcommand updates SCRIPT_COMMIT to the current HEAD sha and
 # amends - run it as the last step before deploying.
 SCRIPT_VERSION="v7"
-SCRIPT_COMMIT="de968dd"
+SCRIPT_COMMIT="d5e7174"
 SCRIPT_COPYRIGHT="Copyright (C) 2026 Tormen <tormen@mail.ch>"
 SCRIPT_LICENSE_SHORT="GPL-3.0-or-later (copyleft)"
 SCRIPT_LICENSE_URL="https://www.gnu.org/licenses/gpl-3.0.html"
@@ -3207,45 +3207,51 @@ cmd_health() {
     done
     log_debug "Health check complete. Exit=$worst"
 
-    # End-of-run SUMMARY. Always shown, regardless of -V, so daemon
-    # callers and humans both see a one-block recap. Reads the per-run
-    # event log for new/ongoing/resolved/stale counts and combines
-    # with the state-DB tallies above for currently-open problems.
-    new_crit=0; new_warn=0; ongoing=0; resolved_n=0; stale_n=0
-    if [ -n "${HEALTH_RUN_LOG:-}" ] && [ -r "$HEALTH_RUN_LOG" ]; then
-        new_crit=$(awk -F'|' '$1=="new"      && $2=="crit"' "$HEALTH_RUN_LOG" | wc -l | tr -d ' ')
-        new_warn=$(awk -F'|' '$1=="new"      && $2=="warn"' "$HEALTH_RUN_LOG" | wc -l | tr -d ' ')
-        ongoing=$( awk -F'|' '$1=="ongoing"'                "$HEALTH_RUN_LOG" | wc -l | tr -d ' ')
-        resolved_n=$(awk -F'|' '$1=="resolved"'             "$HEALTH_RUN_LOG" | wc -l | tr -d ' ')
-        stale_n=$(awk -F'|' '$1=="stale"'                   "$HEALTH_RUN_LOG" | wc -l | tr -d ' ')
-    fi
-    case "$worst" in
-        0) _exit_label="OK (no problems)" ;;
-        1) _exit_label="WARN (warn-level problems present)" ;;
-        2) _exit_label="CRIT (crit-level problems present)" ;;
-        *) _exit_label="?" ;;
-    esac
-    echo
-    step "SUMMARY"
-    info "  Currently open problems:     $((crit_count + warn_count))  (crit=$crit_count, warn=$warn_count)"
-    info "  New this run:                $((new_crit + new_warn))  (crit=$new_crit, warn=$new_warn)"
-    info "  Ongoing this run:            $ongoing  (already known, rate-limit applied)"
-    info "  Resolved this run:           $resolved_n  (sent 'all clear' email + cleared state)"
-    if [ "$stale_n" -gt 0 ]; then
-        info "  Stale state pruned:          $stale_n  (legacy hashes; underlying issue re-fired with current keys)"
-    fi
-    info "  Exit code:                   $worst  ($_exit_label)"
-    info "    0 = clean, 1 = warn-level open, 2 = crit-level open."
-    if [ "$crit_count" -gt 0 ] || [ "$warn_count" -gt 0 ]; then
+    # End-of-run SUMMARY. Shown only in -V/-D mode. The non-verbose
+    # path (incl. the launchd daemon) is intentionally silent on
+    # stdout: real alerts go via the structured logger (LOG_FILE,
+    # log_warn/error -> stderr) and the email/alarm side effects.
+    # The exit code still reflects worst-severity for scripted
+    # callers. The smartctl-missing banner below is unconditional
+    # because that's a silent-failure-mode alert that must never
+    # be hidden by quiet mode.
+    if [ "$_verbose_health" = "1" ]; then
+        new_crit=0; new_warn=0; ongoing=0; resolved_n=0; stale_n=0
+        if [ -n "${HEALTH_RUN_LOG:-}" ] && [ -r "$HEALTH_RUN_LOG" ]; then
+            new_crit=$(awk -F'|' '$1=="new"      && $2=="crit"' "$HEALTH_RUN_LOG" | wc -l | tr -d ' ')
+            new_warn=$(awk -F'|' '$1=="new"      && $2=="warn"' "$HEALTH_RUN_LOG" | wc -l | tr -d ' ')
+            ongoing=$( awk -F'|' '$1=="ongoing"'                "$HEALTH_RUN_LOG" | wc -l | tr -d ' ')
+            resolved_n=$(awk -F'|' '$1=="resolved"'             "$HEALTH_RUN_LOG" | wc -l | tr -d ' ')
+            stale_n=$(awk -F'|' '$1=="stale"'                   "$HEALTH_RUN_LOG" | wc -l | tr -d ' ')
+        fi
+        case "$worst" in
+            0) _exit_label="OK (no problems)" ;;
+            1) _exit_label="WARN (warn-level problems present)" ;;
+            2) _exit_label="CRIT (crit-level problems present)" ;;
+            *) _exit_label="?" ;;
+        esac
         echo
-        info "  Open problems:"
-        for h in $(state_list_hashes); do
-            sev=$(state_field "$h" 2)
-            sum=$(state_field "$h" 6)
-            printf '    [%s] %s\n' "$sev" "$sum"
-        done
+        step "SUMMARY"
+        info "  Currently open problems:     $((crit_count + warn_count))  (crit=$crit_count, warn=$warn_count)"
+        info "  New this run:                $((new_crit + new_warn))  (crit=$new_crit, warn=$new_warn)"
+        info "  Ongoing this run:            $ongoing  (already known, rate-limit applied)"
+        info "  Resolved this run:           $resolved_n  (sent 'all clear' email + cleared state)"
+        if [ "$stale_n" -gt 0 ]; then
+            info "  Stale state pruned:          $stale_n  (legacy hashes; underlying issue re-fired with current keys)"
+        fi
+        info "  Exit code:                   $worst  ($_exit_label)"
+        info "    0 = clean, 1 = warn-level open, 2 = crit-level open."
+        if [ "$crit_count" -gt 0 ] || [ "$warn_count" -gt 0 ]; then
+            echo
+            info "  Open problems:"
+            for h in $(state_list_hashes); do
+                sev=$(state_field "$h" 2)
+                sum=$(state_field "$h" 6)
+                printf '    [%s] %s\n' "$sev" "$sum"
+            done
+        fi
+        echo
     fi
-    echo
 
     # --- Prominent end-of-run SMART-missing warning ---
     # If smartctl was discovered missing during this run, emit a visible
