@@ -83,7 +83,7 @@ SCRIPT_NAME="$(basename "$0")"
 # subcommand updates SCRIPT_COMMIT to the current HEAD sha and
 # amends - run it as the last step before deploying.
 SCRIPT_VERSION="v7"
-SCRIPT_COMMIT="5386f8d"
+SCRIPT_COMMIT="cde688b"
 SCRIPT_COPYRIGHT="Copyright (C) 2026 Tormen <tormen@mail.ch>"
 SCRIPT_LICENSE_SHORT="GPL-3.0-or-later (copyleft)"
 SCRIPT_LICENSE_URL="https://www.gnu.org/licenses/gpl-3.0.html"
@@ -7839,10 +7839,14 @@ cmd_stamp_version() {
         || die "git amend failed"
 
     _final_sha=$(git rev-parse --short HEAD)
-    info "HEAD sha changed by the amend: $_new_sha -> $_final_sha"
-    info "If you intended SCRIPT_COMMIT to match the FINAL sha, re-run"
-    info "'$SCRIPT_NAME stamp-version'. (Otherwise this single pass is"
-    info "fine - SCRIPT_COMMIT now points at the parent of HEAD.)"
+    ok "Stamped. SCRIPT_COMMIT='$_new_sha'; HEAD is now '$_final_sha'."
+    info "Note: amend rewrote HEAD's sha, so SCRIPT_COMMIT lags HEAD by 1."
+    info "This is mathematically unavoidable (a commit's sha depends on"
+    info "its content, which includes SCRIPT_COMMIT). Re-running stamp-"
+    info "version would just produce another off-by-one. Tag at the new"
+    info "HEAD; on a deployed copy, --version shows: <tag> ($_new_sha),"
+    info "the sha of the tag's PARENT. Run 'git log $_new_sha..HEAD'"
+    info "to confirm the only difference is the bake itself."
 }
 
 cmd_version() {
