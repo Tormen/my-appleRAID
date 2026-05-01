@@ -972,6 +972,19 @@ cfg_set_defaults() {
     MISSING_DISK_SEVERITY=crit             # warn|crit
     MISSING_DISK_GRACE_PERIOD=5m           # debounce transient disappearance
 
+    # --- Optional disk sets (named rotation groups) ---
+    # Built for ROTATING EXTRA BACKUP DISK SETS (off-site rotation).
+    # Multi-line list: "Name = disk1, disk2, ..." per line. Per-group rule:
+    #   (a) ALL members must be present together (no partial group); and
+    # Across the whole list:
+    #   (b) at least ONE group must be fully present at any time.
+    # Members of optional groups are EXCLUDED from REQUIRED_DISKS resolution
+    # so a swapped-out rotation disk does not also fire a disk-missing alert.
+    OPTIONAL_DISK_SETS=""
+    ALERT_ON_OPTIONAL_DISK_SETS=yes
+    OPTIONAL_DISK_SET_SEVERITY=crit
+    OPTIONAL_DISK_SET_GRACE_PERIOD=5m
+
     # --- Auto-baseline (keeps REQUIRED_*=all in sync with reality) ---
     AUTO_BASELINE_FOR_SETS_ON_CREATE=yes   # `appleRAID create` adds set to baseline
     AUTO_BASELINE_FOR_SETS_ON_DESTROY=yes  # `appleRAID destroy` removes set from baseline
@@ -1087,6 +1100,7 @@ cfg_load() {
     LAUNCHD_INTERVAL=$(parse_duration "$LAUNCHD_INTERVAL" "LAUNCHD_INTERVAL")
     MISSING_SET_GRACE_PERIOD=$(parse_duration "$MISSING_SET_GRACE_PERIOD" "MISSING_SET_GRACE_PERIOD")
     MISSING_DISK_GRACE_PERIOD=$(parse_duration "$MISSING_DISK_GRACE_PERIOD" "MISSING_DISK_GRACE_PERIOD")
+    OPTIONAL_DISK_SET_GRACE_PERIOD=$(parse_duration "${OPTIONAL_DISK_SET_GRACE_PERIOD:-300}" "OPTIONAL_DISK_SET_GRACE_PERIOD")
     AUTO_BASELINE_GRACE_PERIOD=$(parse_duration "$AUTO_BASELINE_GRACE_PERIOD" "AUTO_BASELINE_GRACE_PERIOD")
     return 0
 }
@@ -2150,6 +2164,115 @@ list_all_physical_disks() {
         }'
 }
 
+# ----------------------------------------------------------------------
+# Optional disk sets (named rotation groups).
+#
+# Config: OPTIONAL_DISK_SETS is a multi-line string. Each non-empty,
+# non-comment line has the form:
+#
+#     <name> = <disk-spec>, <disk-spec>, ...
+#
+# A <disk-spec> may be a tagged baseline id (SN:..., PART:..., USB:...,
+# VOL:...) OR a bare disk-node form (disk7, /dev/disk7, 7). Tagged ids
+# are STRONGLY preferred for rotation use cases since the bsd shuffles
+# across replug/reboot.
+#
+# Semantics enforced by check_optional_disk_sets:
+#   (a) For each named group: if ANY member is present, ALL members
+#       must be present (no partial group attached).
+#   (b) Across the full list: at least ONE group must be fully present.
+#
+# Members of optional groups are EXCLUDED from REQUIRED_DISKS resolution
+# so a swapped-out rotation disk does not also fire a disk-missing alert.
+# ----------------------------------------------------------------------
+
+# Emit "name|spec" lines for every (group, member) pair defined in
+# OPTIONAL_DISK_SETS. Skips blank lines and '#' comments. Trims
+# whitespace around the name and each spec.
+optional_sets_iter() {
+    [ -n "${OPTIONAL_DISK_SETS:-}" ] || return 0
+    printf '%s\n' "$OPTIONAL_DISK_SETS" | while IFS= read -r _line; do
+        _line=$(printf '%s' "$_line" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+        case "$_line" in
+            ''|'#'*) continue ;;
+        esac
+        case "$_line" in
+            *=*) ;;
+            *) log_warn "OPTIONAL_DISK_SETS: ignoring malformed line (no '='): $_line"; continue ;;
+        esac
+        _name=$(printf '%s' "$_line" | sed 's/=.*//' | sed 's/[[:space:]]*$//')
+        _rest=$(printf '%s' "$_line" | sed 's/^[^=]*=//')
+        [ -n "$_name" ] || continue
+        printf '%s\n' "$_rest" | tr ',' '\n' | while IFS= read -r _spec; do
+            _spec=$(printf '%s' "$_spec" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+            [ -n "$_spec" ] || continue
+            printf '%s|%s\n' "$_name" "$_spec"
+        done
+    done
+}
+
+# Unique group names, in declaration order.
+optional_sets_names() {
+    optional_sets_iter | awk -F'|' 'NF>0 && !seen[$1]++ {print $1}'
+}
+
+# Members of one named group (one spec per line).
+optional_set_members() {
+    _n="$1"
+    optional_sets_iter | awk -F'|' -v n="$_n" '$1==n {print $2}'
+}
+
+# Emit every spec across every group (one per line, deduplicated).
+# Used to filter REQUIRED_DISKS resolution.
+optional_sets_all_specs() {
+    optional_sets_iter | awk -F'|' '{print $2}' | awk 'NF>0 && !seen[$0]++'
+}
+
+# Resolve a single optional-set spec to the currently-attached bsd, or
+# empty if not present. Accepts tagged baseline ids and bare disk-node
+# forms (with all the variants that normalize_disk_id understands).
+optional_spec_to_bsd() {
+    _s="$1"
+    [ -n "$_s" ] || return 0
+    case "$_s" in
+        SN:*|PART:*|USB:*|VOL:*)
+            disk_for_baseline_id "$_s"
+            ;;
+        *)
+            _b=$(normalize_disk_id "$_s")
+            if [ -n "$_b" ] && diskutil info "/dev/$_b" >/dev/null 2>&1; then
+                echo "$_b"
+            fi
+            ;;
+    esac
+}
+
+# Given a bsd, return the name of the optional set it is a member of
+# (empty if none). Compares both the disk's baseline id and its bsd
+# against every group's specs.
+optional_set_for_bsd() {
+    _b="${1#/dev/}"
+    [ -n "$_b" ] || return 0
+    [ -n "${OPTIONAL_DISK_SETS:-}" ] || return 0
+    _id=$(disk_baseline_id "$_b" 2>/dev/null)
+    optional_sets_iter | while IFS='|' read -r _n _spec; do
+        [ -n "$_n" ] || continue
+        case "$_spec" in
+            SN:*|PART:*|USB:*|VOL:*)
+                if [ -n "$_id" ] && [ "$_spec" = "$_id" ]; then
+                    echo "$_n"; return 0
+                fi
+                ;;
+            *)
+                _nb=$(normalize_disk_id "$_spec")
+                if [ -n "$_nb" ] && [ "$_nb" = "$_b" ]; then
+                    echo "$_n"; return 0
+                fi
+                ;;
+        esac
+    done
+}
+
 # Build the expected disk list WITHOUT presence validation.
 # This is the union of (base list from MONITOR_DISKS) + MONITOR_EXTRA_DISKS,
 # normalized and deduplicated. Used by both the SMART pipeline (which
@@ -2166,39 +2289,56 @@ list_all_physical_disks() {
 #
 # 'all' mode reads the baseline file, which is now serial-keyed.
 resolve_required_disks() {
-    case "${REQUIRED_DISKS:-}" in
-        ""|none|NONE)
-            return 0
-            ;;
-        all|ALL)
-            f=$(baseline_disks_file)
-            if [ ! -f "$f" ]; then
-                log_info "No disk baseline yet; creating from current state"
-                baseline_write_disks
-            fi
-            if baseline_disks_is_legacy 2>/dev/null; then
-                log_warn "baseline-disks is in legacy disk-node format (e.g. 'disk2')."
-                log_warn "Disk-node names are TRANSIENT and shuffle across reboots/replugs."
-                log_warn "Re-run 'my-appleRAID baseline --disks' to switch to stable serials."
-            fi
-            baseline_read_disks
-            ;;
-        *)
-            echo "$REQUIRED_DISKS" | tr ',' '\n' | while read -r spec; do
-                spec=$(printf '%s' "$spec" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
-                [ -n "$spec" ] || continue
-                case "$spec" in
-                    disk[0-9]*|/dev/disk[0-9]*|[0-9]*)
-                        normalize_disk_id "$spec"
-                        ;;
-                    *)
-                        # Treated as a serial number by check_disk_presence.
-                        echo "$spec"
-                        ;;
-                esac
-            done
-            ;;
-    esac
+    _raw=$(
+        case "${REQUIRED_DISKS:-}" in
+            ""|none|NONE)
+                ;;
+            all|ALL)
+                f=$(baseline_disks_file)
+                if [ ! -f "$f" ]; then
+                    log_info "No disk baseline yet; creating from current state"
+                    baseline_write_disks
+                fi
+                if baseline_disks_is_legacy 2>/dev/null; then
+                    log_warn "baseline-disks is in legacy disk-node format (e.g. 'disk2')."
+                    log_warn "Disk-node names are TRANSIENT and shuffle across reboots/replugs."
+                    log_warn "Re-run 'my-appleRAID baseline --disks' to switch to stable serials."
+                fi
+                baseline_read_disks
+                ;;
+            *)
+                echo "$REQUIRED_DISKS" | tr ',' '\n' | while read -r spec; do
+                    spec=$(printf '%s' "$spec" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+                    [ -n "$spec" ] || continue
+                    case "$spec" in
+                        disk[0-9]*|/dev/disk[0-9]*|[0-9]*)
+                            normalize_disk_id "$spec"
+                            ;;
+                        *)
+                            # Treated as a serial number by check_disk_presence.
+                            echo "$spec"
+                            ;;
+                    esac
+                done
+                ;;
+        esac
+    )
+    # Subtract any disk that is a member of an optional disk set:
+    # presence of those is governed by check_optional_disk_sets, not the
+    # plain disk-missing alert. Match on verbatim spec equality (covers
+    # tagged baseline ids when both sides use SN:/PART:/USB:/VOL: form).
+    _optspecs=$(optional_sets_all_specs)
+    if [ -z "$_optspecs" ]; then
+        printf '%s\n' "$_raw" | awk 'NF>0'
+        return 0
+    fi
+    printf '%s\n' "$_raw" | awk 'NF>0' | while IFS= read -r _r; do
+        if printf '%s\n' "$_optspecs" | grep -qxF "$_r"; then
+            log_debug "  required disk '$_r' suppressed (member of an optional disk set)"
+            continue
+        fi
+        echo "$_r"
+    done
 }
 
 # Resolve REQUIRED_SETS into a concrete list of set NAMES (not UUIDs).
@@ -2363,6 +2503,99 @@ check_disk_presence() {
                 ;;
         esac
     done
+}
+
+# Presence check for OPTIONAL_DISK_SETS named groups.
+#
+# For each group:
+#   present == total       -> OK (rule a + group-level rule b satisfied)
+#   0 < present < total    -> PARTIAL: rule (a) violated. Alert with
+#                             severity OPTIONAL_DISK_SET_SEVERITY.
+#   present == 0           -> not satisfying b on its own; not an error
+#                             unless NO group is fully present.
+#
+# After per-group eval, check rule (b): at least ONE group must be
+# fully present. If none is, fire a global alert.
+#
+# Both alert types are debounced by OPTIONAL_DISK_SET_GRACE_PERIOD so a
+# transient hub re-enumeration on swap-out doesn't fire instantly.
+check_optional_disk_sets() {
+    [ -n "${OPTIONAL_DISK_SETS:-}" ] || {
+        log_debug "Optional disk sets check skipped: OPTIONAL_DISK_SETS empty"
+        return 0
+    }
+    if [ "${ALERT_ON_OPTIONAL_DISK_SETS:-yes}" != "yes" ]; then
+        log_debug "Optional disk sets check skipped: ALERT_ON_OPTIONAL_DISK_SETS=${ALERT_ON_OPTIONAL_DISK_SETS:-yes}"
+        return 0
+    fi
+
+    sev="${OPTIONAL_DISK_SET_SEVERITY:-crit}"
+    case "$sev" in
+        warn|crit) ;;
+        *) log_warn "Invalid OPTIONAL_DISK_SET_SEVERITY='$sev'; using 'crit'"; sev=crit ;;
+    esac
+    grace="${OPTIONAL_DISK_SET_GRACE_PERIOD:-300}"
+
+    _names=$(optional_sets_names)
+    [ -n "$_names" ] || return 0
+
+    _any_full=0
+    _full_names=""
+    # Per-group evaluation.
+    for _n in $_names; do
+        _members=$(optional_set_members "$_n")
+        _total=$(printf '%s\n' "$_members" | awk 'NF>0' | wc -l | tr -d ' ')
+        [ "$_total" -gt 0 ] || continue
+
+        # Resolve every member spec to "PRESENT <spec> <bsd>" or
+        # "MISSING <spec>". The body runs in a $(...) subshell so its
+        # stdout is captured as a single block we can re-scan.
+        _resolved=$(printf '%s\n' "$_members" | while IFS= read -r _spec; do
+            [ -n "$_spec" ] || continue
+            _bsd=$(optional_spec_to_bsd "$_spec")
+            if [ -n "$_bsd" ]; then
+                printf 'PRESENT %s %s\n' "$_spec" "$_bsd"
+            else
+                printf 'MISSING %s\n' "$_spec"
+            fi
+        done)
+        _present=$(printf '%s\n' "$_resolved" | awk '$1=="PRESENT"' | wc -l | tr -d ' ')
+        _missing=$(printf '%s\n' "$_resolved" | awk '$1=="MISSING" {print $2}' | paste -sd, -)
+
+        log_debug "  optional set '$_n': $_present/$_total present"
+
+        if [ "$_present" = "$_total" ]; then
+            # Rule (a) and group-level (b) satisfied.
+            grace_clear "optset-partial" "$_n"
+            _any_full=1
+            _full_names="$_full_names $_n"
+        elif [ "$_present" -gt 0 ]; then
+            # Rule (a) violated: partial group.
+            if grace_check "optset-partial" "$_n" "$grace"; then
+                h=$(problem_hash "optset-partial" "$_n" "${_present}of${_total}")
+                seen_add "$h"
+                handle_problem "optset-partial" "$_n" "${_present}of${_total}" "$sev" \
+                    "Optional disk set '$_n' is partially present ($_present of $_total); missing: ${_missing:-?}"
+            fi
+        else
+            # Group fully absent - fine on its own; rule (b) checked below.
+            grace_clear "optset-partial" "$_n"
+        fi
+    done
+
+    # Rule (b): at least one group must be fully present.
+    if [ "$_any_full" = "1" ]; then
+        grace_clear "optset-none-full" "any"
+        log_debug "  optional disk sets rule (b) OK; fully present:$_full_names"
+    else
+        if grace_check "optset-none-full" "any" "$grace"; then
+            h=$(problem_hash "optset-none-full" "any" "no-group-fully-present")
+            seen_add "$h"
+            _gnames=$(printf '%s' "$_names" | tr '\n' ',' | sed 's/,$//;s/,/, /g')
+            handle_problem "optset-none-full" "any" "no-group-fully-present" "$sev" \
+                "No optional disk set is fully present (defined groups: ${_gnames})"
+        fi
+    fi
 }
 
 # Presence check for RAID sets. Fires alerts when a set in REQUIRED_SETS
@@ -2763,32 +2996,34 @@ cmd_health() {
         echo
     fi
 
-    [ "$_verbose_health" = "1" ] && step "Check 1/8: RAID set state (Online / Degraded / Rebuilding / Failed)"
+    [ "$_verbose_health" = "1" ] && step "Check 1/9: RAID set state (Online / Degraded / Rebuilding / Failed)"
     check_raid_sets
 
     # Enforce DEFAULT_AUTO_REBUILD policy on every monitored set.
     # Skipped if config is empty. Silent when no drift; logs an info
     # line when it actually flips a set's AutoRebuild.
     if [ -n "${DEFAULT_AUTO_REBUILD:-}" ]; then
-        [ "$_verbose_health" = "1" ] && step "Check 2/8: Enforce DEFAULT_AUTO_REBUILD=$DEFAULT_AUTO_REBUILD on every monitored set"
+        [ "$_verbose_health" = "1" ] && step "Check 2/9: Enforce DEFAULT_AUTO_REBUILD=$DEFAULT_AUTO_REBUILD on every monitored set"
         for u in $(resolve_monitored_sets 2>/dev/null); do
             enforce_default_ar_for_uuid "$u" || true
         done
     else
-        [ "$_verbose_health" = "1" ] && step "Check 2/8: AutoRebuild enforcement DISABLED (DEFAULT_AUTO_REBUILD is empty)"
+        [ "$_verbose_health" = "1" ] && step "Check 2/9: AutoRebuild enforcement DISABLED (DEFAULT_AUTO_REBUILD is empty)"
     fi
 
-    [ "$_verbose_health" = "1" ] && step "Check 3/8: Auto-baseline sets (add long-present sets to baseline)"
+    [ "$_verbose_health" = "1" ] && step "Check 3/9: Auto-baseline sets (add long-present sets to baseline)"
     check_auto_baseline_sets
-    [ "$_verbose_health" = "1" ] && step "Check 4/8: Auto-baseline disks (add long-present disks to baseline)"
+    [ "$_verbose_health" = "1" ] && step "Check 4/9: Auto-baseline disks (add long-present disks to baseline)"
     check_auto_baseline_disks
-    [ "$_verbose_health" = "1" ] && step "Check 5/8: RAID set presence (every set in REQUIRED_SETS still present?)"
+    [ "$_verbose_health" = "1" ] && step "Check 5/9: RAID set presence (every set in REQUIRED_SETS still present?)"
     check_set_presence
-    [ "$_verbose_health" = "1" ] && step "Check 6/8: Disk presence (every disk in REQUIRED_DISKS still attached?)"
+    [ "$_verbose_health" = "1" ] && step "Check 6/9: Disk presence (every disk in REQUIRED_DISKS still attached?)"
     check_disk_presence
-    [ "$_verbose_health" = "1" ] && step "Check 7/8: SMART attributes + temperature (rate-limited by SMART_POLL_INTERVAL)"
+    [ "$_verbose_health" = "1" ] && step "Check 7/9: Optional disk sets (rule a: full-or-empty per group; rule b: at least one group fully present)"
+    check_optional_disk_sets
+    [ "$_verbose_health" = "1" ] && step "Check 8/9: SMART attributes + temperature (rate-limited by SMART_POLL_INTERVAL)"
     check_smart
-    [ "$_verbose_health" = "1" ] && step "Check 8/8: Scheduled SMART self-tests (short / long per SELFTEST_*_SCHEDULE)"
+    [ "$_verbose_health" = "1" ] && step "Check 9/9: Scheduled SMART self-tests (short / long per SELFTEST_*_SCHEDULE)"
     run_selftests
 
     # Detect resolved problems: anything in state file not seen this run.
@@ -2940,6 +3175,7 @@ cmd_show_config() {
         REQUIRED_SETS ALERT_ON_MISSING_SET MISSING_SET_SEVERITY MISSING_SET_GRACE_PERIOD \
         MONITOR_DISKS MONITOR_DISKS_EXCLUDE \
         REQUIRED_DISKS ALERT_ON_MISSING_DISK MISSING_DISK_SEVERITY MISSING_DISK_GRACE_PERIOD \
+        OPTIONAL_DISK_SETS ALERT_ON_OPTIONAL_DISK_SETS OPTIONAL_DISK_SET_SEVERITY OPTIONAL_DISK_SET_GRACE_PERIOD \
         AUTO_BASELINE_FOR_SETS_ON_CREATE AUTO_BASELINE_FOR_SETS_ON_DESTROY \
         AUTO_BASELINE_FOR_SETS_ON_HEALTH AUTO_BASELINE_FOR_DISKS_ON_HEALTH \
         AUTO_BASELINE_GRACE_PERIOD \
@@ -3171,6 +3407,86 @@ MISSING_DISK_SEVERITY=crit
 # Debounce: how long a disk must be missing before alerting.
 # Accepts duration suffixes.
 MISSING_DISK_GRACE_PERIOD=5m
+
+
+# --- Optional disk sets (named rotation groups) ---------------------
+#
+# WHEN TO USE THIS:
+#   This feature is for ROTATING EXTRA BACKUP DISK SETS - the standard
+#   3-2-1-style offsite-backup workflow where you keep two (or more)
+#   identical sets of backup disks and physically rotate them between
+#   "on-site, plugged in" and "off-site / in a safe / at another
+#   location". One set is connected and being written to; the other is
+#   somewhere else providing disaster-recovery isolation. You swap them
+#   on a cadence (weekly, monthly, etc).
+#
+#   Without this feature, a swapped-out set would (a) trip the standard
+#   "required disk missing" alert, and (b) you'd have no automated
+#   confirmation that you actually plugged in the OTHER set after
+#   pulling the first one. This feature handles both cases cleanly.
+#
+# Define one or more NAMED groups of disks (one group per backup set).
+# For each group:
+#
+#   (a) If ANY member of the group is currently present, ALL members
+#       must be present together (no partial group attached).
+#
+# Across the LIST of groups:
+#
+#   (b) At least ONE group must be fully present at any time. (Otherwise
+#       you have nothing on-line in the rotation.)
+#
+# Members of any optional disk set are EXCLUDED from REQUIRED_DISKS
+# resolution, so swapping out a rotation disk does NOT also fire a
+# stand-alone disk-missing alert. The optional-set checker is the
+# authoritative source of truth for those disks' presence.
+#
+# Format: multi-line. Each non-empty, non-'#' line:
+#
+#     <name> = <disk-spec>, <disk-spec>, ...
+#
+# A disk-spec may be a tagged baseline id (preferred for rotation):
+#
+#     SN:<serial>     - ATA/NVMe serial. Stable across reboot/replug.
+#     PART:<gpt-uuid> - GPT partition entry GUID. Stable, baked into
+#                       partition table.
+#     USB:<srl>:<bytes> - USB bridge serial + size in bytes.
+#     VOL:<uuid>      - Volume UUID (last resort).
+#
+# ...or a bare disk-node form (disk7, /dev/disk7) - TRANSIENT, may
+# match a different physical disk after replug. Run 'appleRAID disks'
+# to discover stable ids; the SERIAL column (with -V) shows the raw
+# serial that you'd write as 'SN:<serial>'.
+#
+# Example: two pairs of rotating offsite-backup mirror disks.
+# RotationA lives on-site; RotationB lives in a safe at another
+# location. Once a week you swap them. The daemon enforces:
+#   - exactly one of RotationA / RotationB must be plugged in,
+#   - and ALL members of whichever set you plugged in must be present
+#     (no half-attached pair).
+#
+#     OPTIONAL_DISK_SETS="
+#     RotationA = SN:WD-AAA1, SN:WD-AAA2
+#     RotationB = SN:WD-BBB1, SN:WD-BBB2
+#     "
+#
+# Default empty -> feature disabled.
+OPTIONAL_DISK_SETS=""
+
+# Master switch for the optional-disk-set checker. "no" disables both
+# rule (a) and rule (b) alerts without losing the OPTIONAL_DISK_SETS
+# definition.
+ALERT_ON_OPTIONAL_DISK_SETS=yes
+
+# Severity of optional-set alerts (partial group, or no group fully
+# present). warn -> log + email; crit -> log + email + audible alarm.
+OPTIONAL_DISK_SET_SEVERITY=crit
+
+# Debounce: how long a partial-group / no-group-fully-present condition
+# must persist before alerting. Covers the swap window: while you are
+# physically pulling group A and plugging in group B, both rules will
+# briefly be violated. Accepts duration suffixes.
+OPTIONAL_DISK_SET_GRACE_PERIOD=5m
 
 
 # --- Auto-baseline ---------------------------------------------------
@@ -7140,6 +7456,10 @@ EOF
         shift
     done
 
+    # Load config so OPTIONAL_DISK_SETS (used to annotate the Role
+    # column and emit the per-group summary block) is in scope.
+    cfg_load 2>/dev/null
+
     if [ "$DEBUG" = "1" ]; then
         step "Listing all disks (full diskutil list)"
         explain "Command: diskutil list"
@@ -7248,6 +7568,18 @@ EOF
                 esac
             fi
         fi
+        # Annotate with optional disk set membership (if configured).
+        # Skipped for virtual devices: only physical members can belong.
+        if [ -n "${OPTIONAL_DISK_SETS:-}" ] && [ "$virtual" != "Yes" ]; then
+            optname=$(optional_set_for_bsd "$d" 2>/dev/null)
+            if [ -n "$optname" ]; then
+                if [ "$role" = "-" ]; then
+                    role="opt:$optname"
+                else
+                    role="$role [opt:$optname]"
+                fi
+            fi
+        fi
 
         if [ "$VERBOSE" = "1" ]; then
             serial=$(disk_serial "$d")
@@ -7329,6 +7661,51 @@ EOF
                 "$d" "${loc:-?}" "$kind" "$size" "$model_c" "$age" "$role"
         fi
     done
+
+    # ------------------------------------------------------------------
+    # Optional disk sets summary
+    # ------------------------------------------------------------------
+    if [ -n "${OPTIONAL_DISK_SETS:-}" ]; then
+        echo
+        step "Optional disk sets"
+        explain "Per-group rule (a): if any member is present, ALL must be (else PARTIAL)."
+        explain "Across the list rule (b): at least ONE group must be fully present."
+        echo
+        printf '  %-16s %-9s %s\n' "GROUP" "STATE" "MEMBERS (spec -> bsd or MISSING)"
+        printf '  %-16s %-9s %s\n' "-----" "-----" "--------------------------------"
+        any_full=0
+        for n in $(optional_sets_names); do
+            members=$(optional_set_members "$n")
+            total=$(printf '%s\n' "$members" | awk 'NF>0' | wc -l | tr -d ' ')
+            present=0
+            line=""
+            for s in $members; do
+                [ -n "$s" ] || continue
+                bsd=$(optional_spec_to_bsd "$s")
+                if [ -n "$bsd" ]; then
+                    present=$((present + 1))
+                    line="$line ${s}->${bsd}"
+                else
+                    line="$line ${s}=MISSING"
+                fi
+            done
+            if [ "$present" = "$total" ] && [ "$total" -gt 0 ]; then
+                state="FULL"
+                any_full=1
+            elif [ "$present" -gt 0 ]; then
+                state="PARTIAL"
+            else
+                state="ABSENT"
+            fi
+            printf '  %-16s %-9s %s\n' "$n" "${state}(${present}/${total})" "${line# }"
+        done
+        echo
+        if [ "$any_full" = "1" ]; then
+            ok "Rule (b) OK: at least one optional set is fully present."
+        else
+            warn "Rule (b) VIOLATED: no optional disk set is fully present."
+        fi
+    fi
 }
 
 # ----------------------------------------------------------------------
