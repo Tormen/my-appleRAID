@@ -4259,7 +4259,13 @@ cmd_baseline_optsets() {
         || die "mktemp failed in $STATE_DIR"
     _cache=$(mktemp "$STATE_DIR/.optsets-cache.XXXXXX") \
         || { rm -f "$_wf"; die "mktemp failed in $STATE_DIR"; }
-    trap 'rm -f "$_wf" "$_cache"' EXIT INT TERM
+    # On normal EXIT just clean up. On INT/TERM clean up AND exit:
+    # otherwise the trap deletes the work files but control returns to
+    # the menu loop, which then tries to awk a vanished file. Common
+    # path: user Ctrl+C-s out of an interactive child (bash readline,
+    # confirm, etc.) - the SIGINT hits both the child and us.
+    trap 'rm -f "$_wf" "$_cache"' EXIT
+    trap 'rm -f "$_wf" "$_cache"; trap - EXIT; exit 130' INT TERM
 
     # Seed the work file from the current OPTIONAL_DISK_SETS value.
     optional_sets_iter > "$_wf" 2>/dev/null || true
@@ -4350,19 +4356,21 @@ _optsets_prompt_completing() {
     done > "$_hf"
     # The bash subshell MUST be interactive (-i) for `bind` to be
     # accepted. macOS bash insists --norc/--noprofile come BEFORE -i.
-    # `read -p` writes the prompt to stderr, which we leave attached
-    # to the controlling tty so the user sees it. Stdout is captured
-    # via $(...). The "no job control" notice on stderr is harmless;
-    # we suppress it.
-    _ANS=$(MY_PROMPT="$(printf '%s%s%s ' "${C_YELLOW}" "$_prompt" "${C_RESET}")" \
-           HISTFILE="$_hf" \
-           bash --norc --noprofile -i -c '
+    # bash -i emits a harmless "no job control in this shell" notice
+    # on stderr; we'd like to silence it. But `read -p` ALSO writes
+    # the prompt to stderr, so a blanket 2>/dev/null hides the prompt
+    # too and the user sees nothing while bash waits. Workaround:
+    # print the prompt ourselves (to the tty) BEFORE invoking bash,
+    # use `read -er` without -p (no extra prompt from bash), and then
+    # we can safely drop bash's stderr.
+    printf '%s%s%s ' "${C_YELLOW}" "$_prompt" "${C_RESET}" >&2
+    _ANS=$(HISTFILE="$_hf" bash --norc --noprofile -i -c '
         set +o history
         history -r 2>/dev/null
         bind "set show-all-if-ambiguous on" 2>/dev/null
         bind "set completion-ignore-case on" 2>/dev/null
         bind "\"\\C-i\":dynamic-complete-history" 2>/dev/null
-        read -er -p "$MY_PROMPT" reply
+        read -er reply
         printf "%s\n" "$reply"
     ' 2>/dev/null)
     rm -f "$_hf"
