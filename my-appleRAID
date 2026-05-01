@@ -1642,6 +1642,12 @@ baseline_write_disks() {
         echo "# The bsd (/dev/diskN node), size, and model in the comment"
         echo "# are human hints. The bsd may shuffle on replug; size and"
         echo "# model are intrinsic to the disk and stay stable."
+        # Pre-compute the set of optset specs so the per-disk filter
+        # below is O(1) instead of re-running awk N times.
+        _optspecs=""
+        if [ -n "${OPTIONAL_DISK_SETS:-}" ]; then
+            _optspecs=$(optional_sets_all_specs)
+        fi
         list_all_physical_disks | while IFS= read -r d; do
             [ -n "$d" ] || continue
             id=$(disk_baseline_id "$d" 2>/dev/null)
@@ -1654,6 +1660,14 @@ baseline_write_disks() {
                 | sed 's/[[:space:]]*$//')
             if [ -z "$id" ]; then
                 log_warn "Skipping $d in baseline: no stable identifier discoverable (size: ${size:-unknown}, model: ${model:-unknown})"
+                continue
+            fi
+            # Skip if this id is governed by an optset: it's checked by
+            # the rotation rules (a)+(b), not the plain baseline-disks
+            # presence check. Listing it in both places is at best
+            # redundant and at worst confusing in 'baseline --show'.
+            if [ -n "$_optspecs" ] && printf '%s\n' "$_optspecs" | grep -qxF "$id"; then
+                log_debug "Skipping $d ($id) in baseline: member of OPTIONAL_DISK_SETS"
                 continue
             fi
             printf '%-24s # %-7s %-9s %s\n' "$id" "$d" "${size:-?}" "${model:-?}"
