@@ -1610,11 +1610,22 @@ disk_baseline_id() {
 }
 
 # Emit EVERY readable on-disk identifier for a physical disk, one tag
-# per line in priority order:
-#   SN:<serial>      (if disk_serial succeeded)
-#   PART:<gpt-uuid>  (if disk has a GPT data partition with a readable UUID)
-# Returns 0 if at least one tag was emitted, 1 if neither was readable.
-# Bus identifiers (USB:, VOL:) are not emitted: enclosure/filesystem
+# per line in priority order. Tag types:
+#
+#   SN:<serial>          ATA/NVMe IDENTIFY serial (disk_serial).
+#   WWN:<hex>            ATA WWN / NVMe EUI-64 / NGUID (disk_wwn).
+#   PART:<gpt-uuid>      GPT partition entry GUID of the main data
+#                        partition (GPT-partitioned disks).
+#   MBRSIG:<8-hex>       MBR disk signature at byte 0x1B8
+#                        (MBR-partitioned disks only).
+#
+# PART vs MBRSIG is auto-selected per disk by inspecting the partition
+# scheme reported by diskutil. A disk with a GUID_partition_scheme can
+# yield SN, WWN, PART (any subset readable). A disk with the older
+# FDisk_partition_scheme can yield SN, WWN, MBRSIG.
+#
+# Returns 0 if at least one tag was emitted, 1 if none. Bus identifiers
+# (USB:, VOL:) are intentionally not emitted - enclosure/filesystem
 # scope, not disk scope.
 _disk_all_baseline_ids_uncached() {
     bsd="${1#/dev/}"
@@ -1628,31 +1639,57 @@ _disk_all_baseline_ids_uncached() {
         _emitted=1
     fi
 
-    # 2. GPT partition entry GUID of the disk's main data partition
-    #    (first non-EFI, non-Apple_Boot partition). Written into the
-    #    partition table on disk; travels with the disk across replug.
-    main_part=$(diskutil list "/dev/$bsd" 2>/dev/null | awk '
-        NR > 2 && /^[[:space:]]+[0-9]+:/ {
-            ident = $NF
-            ptype = $2
-            if (ptype == "EFI") next
-            if (ptype ~ /^Apple_Boot/) next
-            if (ptype ~ /partition_scheme$/) next
-            if (ident ~ /^disk[0-9]+s[0-9]+$/) {
-                print ident
-                exit
-            }
-        }
-    ')
-    if [ -n "$main_part" ]; then
-        s=$(diskutil info "/dev/$main_part" 2>/dev/null \
-            | awk -F': +' '/Disk \/ Partition UUID:/ {print $2; exit}' \
-            | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
-        if [ -n "$s" ]; then
-            echo "PART:$s"
-            _emitted=1
-        fi
+    # 2. WWN / NVMe EUI-64 / NGUID via disk_wwn. Independent firmware
+    #    field from SN; some bridges expose one but not the other.
+    s=$(disk_wwn "$bsd" 2>/dev/null)
+    if [ -n "$s" ]; then
+        echo "WWN:$s"
+        _emitted=1
     fi
+
+    # 3. Partition-scheme-dependent on-disk identifier.
+    _scheme=$(diskutil info "/dev/$bsd" 2>/dev/null \
+        | awk -F': +' '/Content \(IOContent\):/ {print $2; exit}' \
+        | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+    case "$_scheme" in
+        GUID_partition_scheme)
+            # GPT: take the first non-EFI, non-Apple_Boot data partition
+            # and emit its partition entry GUID as PART:.
+            main_part=$(diskutil list "/dev/$bsd" 2>/dev/null | awk '
+                NR > 2 && /^[[:space:]]+[0-9]+:/ {
+                    ident = $NF
+                    ptype = $2
+                    if (ptype == "EFI") next
+                    if (ptype ~ /^Apple_Boot/) next
+                    if (ptype ~ /partition_scheme$/) next
+                    if (ident ~ /^disk[0-9]+s[0-9]+$/) {
+                        print ident
+                        exit
+                    }
+                }
+            ')
+            if [ -n "$main_part" ]; then
+                s=$(diskutil info "/dev/$main_part" 2>/dev/null \
+                    | awk -F': +' '/Disk \/ Partition UUID:/ {print $2; exit}' \
+                    | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+                if [ -n "$s" ]; then
+                    echo "PART:$s"
+                    _emitted=1
+                fi
+            fi
+            ;;
+        FDisk_partition_scheme)
+            # MBR (BIOS-style): emit the 32-bit disk signature.
+            s=$(disk_mbrsig "$bsd" 2>/dev/null)
+            if [ -n "$s" ]; then
+                echo "MBRSIG:$s"
+                _emitted=1
+            fi
+            ;;
+        *)
+            # Unknown / no partition table: nothing to emit at this rank.
+            ;;
+    esac
 
     [ "$_emitted" = "1" ] && return 0
     return 1
@@ -6705,6 +6742,66 @@ disk_serial() {
 
     # No serial available.
     return 0
+}
+
+# World-Wide Name / NVMe namespace identifier of a physical disk.
+# Source priority:
+#   1. smartctl 'LU WWN Device Id'        (SATA / SAS disks)
+#   2. smartctl 'Namespace 1 IEEE EUI-64' (NVMe)
+#   3. smartctl 'Namespace 1 NGUID'       (NVMe, 128-bit)
+# Whitespace-stripped output (smartctl spaces the WWN in groups). Empty
+# string when nothing is readable. Same root/permission story as
+# disk_serial: smartctl needs raw-device access.
+disk_wwn() {
+    dev="/dev/${1#/dev/}"
+    command -v smartctl >/dev/null 2>&1 || return 0
+    for _dt in "" "-d sat" "-d usbjmicron" "-d usbprolific" "-d nvme"; do
+        # shellcheck disable=SC2086
+        _out=$(smartctl -i $_dt "$dev" </dev/null 2>/dev/null)
+        [ -n "$_out" ] || continue
+        # SATA / SAS: "LU WWN Device Id:   5 000c50 0..."
+        s=$(printf '%s\n' "$_out" \
+            | awk -F': +' '/^LU WWN Device Id:/ {print $2; exit}' \
+            | tr -d ' ' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+        if [ -n "$s" ]; then printf '%s' "$s"; return 0; fi
+        # NVMe: "Namespace 1 IEEE EUI-64:   00080d 02..."
+        s=$(printf '%s\n' "$_out" \
+            | awk -F': +' '/^Namespace [0-9]+ IEEE EUI-64:/ {print $2; exit}' \
+            | tr -d ' ' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+        if [ -n "$s" ] && [ "$s" != "0000000000000000" ]; then
+            printf '%s' "$s"
+            return 0
+        fi
+        # NVMe NGUID (128-bit).
+        s=$(printf '%s\n' "$_out" \
+            | awk -F': +' '/^Namespace [0-9]+ NGUID:/ {print $2; exit}' \
+            | tr -d ' ' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+        if [ -n "$s" ] && [ "$s" != "00000000000000000000000000000000" ]; then
+            printf '%s' "$s"
+            return 0
+        fi
+    done
+    return 0
+}
+
+# MBR disk-signature (4 bytes at LBA0 + 0x1B8 = decimal 440). 32-bit
+# value written by the OS when it formats the disk as MBR; Windows
+# preserves it, macOS and Linux don't touch it unless the partition
+# table is recreated. Returns 8-char lowercase hex, or empty when the
+# disk has no readable MBR (GPT-only disks, raw, or read failed).
+#
+# Filters: all-zeros and all-ones are sentinel values (never validly
+# written) and treated as "no signature". Requires raw read access:
+# the dd will silently return empty for non-root callers on macOS.
+disk_mbrsig() {
+    dev="/dev/${1#/dev/}"
+    sig=$(dd if="$dev" bs=1 count=4 skip=440 status=none 2>/dev/null \
+        | od -An -tx1 2>/dev/null \
+        | tr -d ' \n')
+    case "$sig" in
+        ""|00000000|ffffffff) return 0 ;;
+        *) printf '%s' "$sig"; return 0 ;;
+    esac
 }
 
 # Stable short hash of a disk's serial number (first 16 chars of SHA1).
