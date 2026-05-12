@@ -82,8 +82,8 @@ SCRIPT_NAME="$(basename "$0")"
 # the commit they were built from. The companion 'stamp-version'
 # subcommand updates SCRIPT_COMMIT to the current HEAD sha and
 # amends - run it as the last step before deploying.
-SCRIPT_VERSION="v7.4"
-SCRIPT_COMMIT="7574206"
+SCRIPT_VERSION="v7.5"
+SCRIPT_COMMIT="1a19590"
 SCRIPT_COPYRIGHT="Copyright (C) 2026 Tormen <tormen@mail.ch>"
 SCRIPT_LICENSE_SHORT="GPL-3.0-or-later (copyleft)"
 SCRIPT_LICENSE_URL="https://www.gnu.org/licenses/gpl-3.0.html"
@@ -1561,36 +1561,65 @@ _DISKID_CACHE_FILE=""
 # returns immediately if the cache already exists.
 # Writes one row per (bsd, tag) pair, in priority order; a disk with no
 # readable identifier gets a single bsd|__NONE__ row.
+#
+# Filename: single deterministic path "$STATE_DIR/.diskid-cache". One
+# file per host, atomically rewritten each priming. Old mktemp-style
+# leftovers ".diskid-cache.XXXXXX" from prior versions are swept on
+# every init so they don't accumulate (a kill -9 in an old build could
+# orphan files indefinitely).
 _diskid_cache_init() {
     if [ -n "${_DISKID_CACHE_FILE:-}" ] && [ -f "$_DISKID_CACHE_FILE" ]; then
         return 0
     fi
     [ -n "${STATE_DIR:-}" ] || return 1
-    _DISKID_CACHE_FILE=$(mktemp "$STATE_DIR/.diskid-cache.XXXXXX" 2>/dev/null) \
-        || { _DISKID_CACHE_FILE=""; return 1; }
+
+    # Sweep legacy mktemp leftovers from prior versions. Cheap (one
+    # `rm -f` glob); silent if nothing matches. Safe to run repeatedly.
+    rm -f "$STATE_DIR"/.diskid-cache.[A-Za-z0-9]* 2>/dev/null || true
+    rm -f "$STATE_DIR"/.diskid-disks.[A-Za-z0-9]* 2>/dev/null || true
+    rm -f "$STATE_DIR"/.disk-for-id.[A-Za-z0-9]* 2>/dev/null || true
+
+    _DISKID_CACHE_FILE="$STATE_DIR/.diskid-cache"
+    _tmp="${_DISKID_CACHE_FILE}.tmp.$$"
+    {
+        printf '# diskid-cache | generated %s | pid %s\n' \
+            "$(now_iso 2>/dev/null || date)" "$$"
+    } > "$_tmp" 2>/dev/null || {
+        _DISKID_CACHE_FILE=""
+        return 1
+    }
     # list_all_physical_disks via tmpfile so the loop runs in the parent
     # shell (avoids the cmd|while subshell trap when we accumulate state).
-    _tmp_disks=$(mktemp "$STATE_DIR/.diskid-disks.XXXXXX" 2>/dev/null) \
-        || { rm -f "$_DISKID_CACHE_FILE"; _DISKID_CACHE_FILE=""; return 1; }
-    list_all_physical_disks > "$_tmp_disks"
+    _tmp_disks="${_DISKID_CACHE_FILE}.disks.$$"
+    list_all_physical_disks > "$_tmp_disks" 2>/dev/null
     while IFS= read -r _d; do
         [ -n "$_d" ] || continue
         _ids=$(_disk_all_baseline_ids_uncached "$_d" 2>/dev/null)
         if [ -z "$_ids" ]; then
-            printf '%s|__NONE__\n' "$_d" >> "$_DISKID_CACHE_FILE"
+            printf '%s|__NONE__\n' "$_d" >> "$_tmp"
             continue
         fi
         printf '%s\n' "$_ids" | while IFS= read -r _id; do
             [ -n "$_id" ] || continue
-            printf '%s|%s\n' "$_d" "$_id" >> "$_DISKID_CACHE_FILE"
+            printf '%s|%s\n' "$_d" "$_id" >> "$_tmp"
         done
     done < "$_tmp_disks"
     rm -f "$_tmp_disks"
+    mv "$_tmp" "$_DISKID_CACHE_FILE" || {
+        rm -f "$_tmp"
+        _DISKID_CACHE_FILE=""
+        return 1
+    }
 }
 
+# Cache cleanup is a no-op now (single deterministic filename - the
+# next process's init overwrites it). Kept as a function so existing
+# `trap '_diskid_cache_clear' EXIT INT TERM` call sites stay valid;
+# they're harmless. We intentionally do NOT delete the file on exit so
+# adjacent processes (e.g. cmd_status invoked while cmd_health runs)
+# can share the prime, and a kill -9 leaves at most one stale file
+# which the next sweep cleans up.
 _diskid_cache_clear() {
-    [ -n "${_DISKID_CACHE_FILE:-}" ] || return 0
-    rm -f "$_DISKID_CACHE_FILE" 2>/dev/null || true
     _DISKID_CACHE_FILE=""
 }
 
@@ -2149,7 +2178,7 @@ alert_email() {
 # severity: warn|crit. Only crit triggers alarm sound; warn logs+emails only.
 # ----------------------------------------------------------------------
 handle_problem() {
-    kind="$1"; target="$2"; detail="$3"; sev="$4"; summary="$5"
+    kind="$1"; target="$2"; detail="$3"; sev="$4"; summary="$5"; body="${6:-}"
     h=$(problem_hash "$kind" "$target" "$detail")
     now=$(now_iso)
     existing=$(state_get "$h")
@@ -2157,6 +2186,11 @@ handle_problem() {
     if [ -z "$existing" ]; then
         # NEW problem
         log_error "NEW $sev: $summary"
+        if [ -n "$body" ]; then
+            # Indent the multi-line body so it stays visually grouped
+            # with the log_error one-liner above.
+            printf '%s\n' "$body" | sed 's/^/    /' >&2
+        fi
         [ -n "${HEALTH_RUN_LOG:-}" ] && \
             printf 'new|%s|%s\n' "$sev" "$summary" >> "$HEALTH_RUN_LOG"
         [ "$sev" = "crit" ] && alert_sound
@@ -2167,7 +2201,9 @@ Kind:     $kind
 Target:   $target
 Detail:   $detail
 Severity: $sev
-
+${body:+
+$body
+}
 $(diskutil appleRAID list 2>/dev/null)
 "
         state_put "$h" "$sev" "$now" "$now" "$now" "$summary"
@@ -2207,7 +2243,9 @@ Kind:     $kind
 Target:   $target
 Detail:   $detail
 Severity: $sev
-
+${body:+
+$body
+}
 $(diskutil appleRAID list 2>/dev/null)
 "
             new_le="$now"
@@ -2896,6 +2934,216 @@ resolve_monitored_disks() {
     done
 }
 
+# Build an enriched human-readable body for a missing-disk alert.
+# Args:
+#   $1 = entry text (whitespace-separated tags as recorded in baseline-disks)
+#   $2 = stable key for state tracking (typically the entry's first tag)
+# Output (multi-line, on stdout): Member-of line, baselined-as line,
+# first-missing timestamp, possible-reasons block, verify commands.
+# Used by check_disk_presence to enrich the missing-disk message; the
+# same body is also passed through handle_problem into the email body
+# and into the sidecar health.problems.txt file (consistency).
+_describe_missing_entry() {
+    _entry="$1"
+    _first="$2"
+
+    # Look up the recorded line for this entry to pull bsd-hint / size / model.
+    _f=$(baseline_disks_file)
+    _comment=""; _bsd_hint=""; _size=""; _model=""
+    if [ -f "$_f" ]; then
+        _line=$(awk -v e="$_entry" 'NF>0 && !/^#/ {
+            tags=$0
+            sub(/[[:space:]]*#.*$/, "", tags)
+            sub(/^[[:space:]]+/, "", tags)
+            sub(/[[:space:]]+$/, "", tags)
+            if (tags == e) { print; exit }
+        }' "$_f")
+        if [ -n "$_line" ]; then
+            _comment=$(printf '%s' "$_line" | awk -F'#' 'NF>1 {sub(/^[[:space:]]+/, "", $2); print $2}')
+            _bsd_hint=$(printf '%s' "$_comment" | awk '{print $1}')
+            _size=$(printf '%s' "$_comment" | awk '{print $2, $3}')
+            _model=$(printf '%s' "$_comment" | awk '{for (i=4; i<=NF; i++) printf "%s ", $i}' \
+                | sed 's/[[:space:]]*$//')
+        fi
+    fi
+
+    # Membership: AppleRAID set (by bsd-hint match against live RAID list).
+    _raid_member=""
+    if [ -n "$_bsd_hint" ]; then
+        _raid_member=$(diskutil appleRAID list 2>/dev/null | awk -F': +' -v b="$_bsd_hint" '
+            /^Name:/ { setname = $2; sub(/ +$/, "", setname) }
+            /^[ ]*[0-9]+[ \t]+disk[0-9]+/ {
+                nf = split($0, parts, /[ \t]+/)
+                for (i = 1; i <= nf; i++) {
+                    if (parts[i] ~ /^disk[0-9]+(s[0-9]+)?$/) {
+                        dev = parts[i]; sub(/s[0-9]+$/, "", dev)
+                        if (dev == b) { print setname; exit }
+                    }
+                }
+            }
+        ')
+    fi
+
+    # Membership: optset (by any tag matching an optset spec).
+    _optset_member=""
+    if [ -n "${OPTIONAL_DISK_SETS:-}" ]; then
+        for _t in $_entry; do
+            case "$_t" in
+                SN:*|WWN:*|PART:*|MBRSIG:*) ;;
+                *) continue ;;
+            esac
+            _found=$(optional_sets_iter | awk -F'|' -v t="$_t" '$3==t {print $1 "/" $2; exit}')
+            if [ -n "$_found" ]; then _optset_member="$_found"; break; fi
+        done
+    fi
+
+    if [ -n "$_raid_member" ]; then
+        _membership="AppleRAID set '$_raid_member'"
+    elif [ -n "$_optset_member" ]; then
+        _membership="Optional disk set '$_optset_member'"
+    else
+        _membership="Standalone baseline entry (no AppleRAID set, no optional disk set)"
+    fi
+
+    # First-missing time from pending file (epoch seconds).
+    _first_missing=""
+    _pf="${STATE_DIR}/pending-disk-${_first}"
+    if [ -f "$_pf" ]; then
+        _epoch=$(cat "$_pf" 2>/dev/null)
+        case "$_epoch" in
+            ''|*[!0-9]*) ;;
+            *)
+                _human=$(date -r "$_epoch" '+%Y-%m-%d %H:%M:%S %Z' 2>/dev/null)
+                _now_s=$(date +%s)
+                _ago=$((_now_s - _epoch))
+                _ah=$((_ago / 3600))
+                _am=$(((_ago % 3600) / 60))
+                _first_missing="$_human  (${_ah}h ${_am}m ago)"
+                ;;
+        esac
+    fi
+
+    printf 'Recorded tags:    %s\n' "$_entry"
+    printf 'Member of:        %s\n' "$_membership"
+    if [ -n "$_bsd_hint" ]; then
+        printf 'Baselined as:     /dev/%s, %s, %s\n' \
+            "$_bsd_hint" "${_size:-?}" "${_model:-?}"
+    fi
+    if [ -n "$_first_missing" ]; then
+        printf 'First missing:    %s\n' "$_first_missing"
+    fi
+    if [ -n "${DISK_ID_MATCH:-}" ]; then
+        printf 'Active policy:    DISK_ID_MATCH="%s"\n' "$DISK_ID_MATCH"
+    fi
+    printf '\n'
+    printf 'Possible reasons:\n'
+    printf '  - The disk has been physically disconnected (cable, dock, enclosure).\n'
+    printf '  - The enclosure or USB/Thunderbolt hub lost power or failed to enumerate.\n'
+    printf '  - The drive has failed (mechanical/firmware) and is no longer detected.\n'
+    printf '  - The disk was reformatted, invalidating its PART/MBRSIG identifier\n'
+    printf '    (firmware SN/WWN are unaffected by reformat; only PART changes).\n'
+    printf '  - smartctl is no longer able to read the firmware identifiers\n'
+    printf '    (typically a permission flux: daemon as root vs. CLI as user).\n'
+    printf '\n'
+    printf 'Verify:\n'
+    printf '  diskutil list                       (is the disk visible at all?)\n'
+    printf '  my-appleRAID disks                  (live inventory + RAID role column)\n'
+    printf '  my-appleRAID baseline --diff        (preview what would change)\n'
+    printf '  my-appleRAID baseline --diff --raw  (unified diff of forensic snapshot)\n'
+}
+
+# ----------------------------------------------------------------------
+# Sidecar problems file + status/disks banner.
+#
+# health.problems.txt is a world-readable (mode 0644) digest of the
+# state DB at the end of every health pass. Each open problem becomes
+# one block: '## [sev] summary' header, the recorded first-seen
+# timestamp, and (for disk-missing problems) the same enriched body
+# that handle_problem emitted to log + email. Non-disk problems get
+# the header only.
+#
+# Two display helpers (intro + detail) are called by cmd_status and
+# cmd_disks. Intro goes at the TOP (so it's the first thing the user
+# sees on a scroll), detail at the BOTTOM (so it's the LAST thing on
+# screen when the command finishes - hardest to skip past).
+# ----------------------------------------------------------------------
+_health_problems_file() { echo "${STATE_DIR}/health.problems.txt"; }
+
+# Iterate state DB and write a fresh health.problems.txt. Removes the
+# file entirely if no open problems. Called at the tail of cmd_health.
+_write_health_problems_file() {
+    _f=$(_health_problems_file)
+    _tmp="${_f}.tmp.$$"
+    _count=0
+    {
+        printf '# my-appleRAID health.problems.txt\n'
+        printf '# Generated: %s\n' "$(now_iso)"
+        printf '#\n'
+        printf '# Each open problem block:\n'
+        printf '#     ## [<sev>] <summary>\n'
+        printf '#     First seen:    <iso-timestamp>\n'
+        printf '#     [enriched body for disk-missing entries]\n'
+        printf '#\n'
+        for h in $(state_list_hashes); do
+            line=$(state_get "$h")
+            [ -n "$line" ] || continue
+            _sev=$(echo     "$line" | awk -F'|' '{print $2}')
+            _first=$(echo   "$line" | awk -F'|' '{print $3}')
+            _summary=$(echo "$line" | awk -F'|' '{print $6}')
+            _count=$((_count + 1))
+            printf '\n## [%s] %s\n' "$_sev" "$_summary"
+            printf 'First seen:    %s\n' "$_first"
+            case "$_summary" in
+                "Expected disk with id '"*)
+                    _entry=${_summary#Expected disk with id \'}
+                    _entry=${_entry%%\'*}
+                    if [ -n "$_entry" ]; then
+                        _key=$(printf '%s' "$_entry" | awk '{print $1}')
+                        printf '\n'
+                        _describe_missing_entry "$_entry" "$_key"
+                    fi
+                    ;;
+            esac
+        done
+    } > "$_tmp" 2>/dev/null
+    if [ "$_count" -gt 0 ]; then
+        mv "$_tmp" "$_f" || { rm -f "$_tmp"; return 1; }
+        chmod 0644 "$_f" 2>/dev/null || true
+    else
+        rm -f "$_tmp" "$_f" 2>/dev/null || true
+    fi
+}
+
+# Count open problems by reading the sidecar. Returns the count via stdout.
+_health_problems_count() {
+    _f=$(_health_problems_file)
+    [ -f "$_f" ] || { echo 0; return 0; }
+    grep -c '^## ' "$_f" 2>/dev/null || echo 0
+}
+
+# Intro banner at the TOP of cmd_status / cmd_disks output. Silent
+# when there are no open problems.
+_health_problems_intro() {
+    _n=$(_health_problems_count)
+    [ "${_n:-0}" -gt 0 ] || return 0
+    printf '%s>>>  %d open my-appleRAID health problem(s) detected.%s\n' \
+        "${C_YELLOW:-}" "$_n" "${C_RESET:-}"
+    printf '     Details at the END of this output (or run: %s health -V).\n' "$SCRIPT_NAME"
+    printf '     Sidecar:  %s\n\n' "$(_health_problems_file)"
+}
+
+# Detail block at the BOTTOM of cmd_status / cmd_disks output.
+_health_problems_detail() {
+    _n=$(_health_problems_count)
+    [ "${_n:-0}" -gt 0 ] || return 0
+    _f=$(_health_problems_file)
+    printf '\n%s================ %d open health problem(s) ================%s\n' \
+        "${C_YELLOW:-}" "$_n" "${C_RESET:-}"
+    cat "$_f"
+    printf '%s===========================================================%s\n' \
+        "${C_YELLOW:-}" "${C_RESET:-}"
+}
+
 # Presence check for disks. Fires alerts when a disk in REQUIRED_DISKS is
 # not currently attached. Uses a grace period to debounce transient
 # disappearances (Thunderbolt enclosure waking, USB re-enumeration).
@@ -2961,8 +3209,10 @@ check_disk_presence() {
                     if grace_check "disk" "$first" "$grace"; then
                         h=$(problem_hash "disk-missing" "$first" "not-present")
                         seen_add "$h"
+                        _body=$(_describe_missing_entry "$r" "$first")
                         handle_problem "disk-missing" "$first" "not-present" "$sev" \
-                            "Expected disk with id '$r' is NOT attached"
+                            "Expected disk with id '$r' is NOT attached" \
+                            "$_body"
                     fi
                 fi
                 ;;
@@ -3614,6 +3864,11 @@ cmd_health() {
         # is not a clean run. Promote to at least warn (1).
         [ "$worst" -lt 1 ] && worst=1
     fi
+
+    # Refresh the sidecar BEFORE seen_cleanup (state DB read is still
+    # valid here). status / disks invocations read this file for their
+    # top-banner + bottom-detail blocks.
+    _write_health_problems_file 2>/dev/null || true
 
     seen_cleanup
     trap - EXIT INT TERM
@@ -4755,7 +5010,9 @@ _baseline_write_raw() {
         else
             printf 'smartctl:        NOT INSTALLED\n'
         fi
-        printf 'diskutil:        %s\n' "$(diskutil --version 2>/dev/null | awk 'NR==1')"
+        printf 'macOS:           %s (build %s)\n' \
+            "$(sw_vers -productVersion 2>/dev/null)" \
+            "$(sw_vers -buildVersion 2>/dev/null)"
         printf '================================================================================\n'
         # Per-disk section, in the order baseline-disks lists them.
         _bf=$(baseline_disks_file)
@@ -9457,6 +9714,10 @@ EOF
     # column and emit the per-group summary block) is in scope.
     cfg_load 2>/dev/null
 
+    # Surface any open health problems at the top so they're impossible
+    # to miss; the full detail block goes at the bottom of the output.
+    _health_problems_intro
+
     # Pre-populate the bsd -> tagged-id cache: the per-row optset
     # annotation calls disk_baseline_id once per disk, and the optset
     # summary block calls optional_spec_to_bsd / disk_for_baseline_id
@@ -9711,6 +9972,8 @@ EOF
             echo
         done
     fi
+
+    _health_problems_detail
 }
 
 # ----------------------------------------------------------------------
@@ -9761,14 +10024,20 @@ EOF
 
     cfg_load 2>/dev/null
 
+    # Surface any open health problems at the top so they're impossible
+    # to miss; the full detail block goes at the bottom of the output.
+    _health_problems_intro
+
     if [ -z "$arg" ]; then
         n=$(raid_count)
         if [ "$n" -eq 0 ]; then
             warn "No AppleRAID sets found."
+            _health_problems_detail
             return 1
         fi
         if [ "$n" -ge 2 ]; then
             cmd_list
+            _health_problems_detail
             return 0
         fi
         SELECTED_UUID=$(raid_list_uuids | head -1)
@@ -10073,6 +10342,8 @@ EOF
             run diskutil info "/dev/$dev"
         fi
     fi
+
+    _health_problems_detail
 }
 
 # ----------------------------------------------------------------------
