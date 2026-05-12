@@ -1852,6 +1852,200 @@ disk_for_baseline_id() {
 }
 
 # ----------------------------------------------------------------------
+# DISK_ID_MATCH policy parser and evaluator.
+#
+# DISK_ID_MATCH is a required config variable that controls how the
+# matcher decides whether a baselined disk is present. Grammar:
+#
+#     DISK_ID_MATCH = ALL | spec ( "," spec )*
+#     spec          = LETTER  |  "ONE-OF(" LETTER ( "," LETTER )+ ")"
+#     LETTER        = S | W | P
+#
+# Letters:
+#   S   SN:    (ATA/NVMe IDENTIFY serial)
+#   W   WWN:   (LU WWN / NVMe EUI-64 / NGUID)
+#   P   PART:  for GPT, MBRSIG: for MBR (auto-selected by writer)
+#
+# Top-level commas mean AND. Letters inside ONE-OF(...) mean OR.
+# 'ALL' is shorthand for "every recorded tag must match".
+#
+# disk_match_parse normalizes the raw config string into a
+# space-separated sequence of tokens, one per spec:
+#   all              -> entry matches when ALL recorded tags resolve
+#   req=<L>          -> letter L must match (its recorded tag must
+#                       resolve to an attached disk)
+#   oneof=<L>,<L>... -> at least one of the listed letters must match
+# Errors print to stderr and return non-zero.
+# ----------------------------------------------------------------------
+disk_match_parse() {
+    _raw="$1"
+    _raw=$(printf '%s' "$_raw" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+    [ -n "$_raw" ] || { echo "DISK_ID_MATCH is empty" >&2; return 1; }
+    if [ "$_raw" = "ALL" ]; then
+        echo "all"
+        return 0
+    fi
+    _depth=0
+    _cur=""
+    _out=""
+    _i=1
+    _len=${#_raw}
+    while [ "$_i" -le "$_len" ]; do
+        _c=$(printf '%s' "$_raw" | cut -c"$_i")
+        case "$_c" in
+            "(") _depth=$((_depth+1)); _cur="${_cur}(" ;;
+            ")") _depth=$((_depth-1)); _cur="${_cur})" ;;
+            ",")
+                if [ "$_depth" = "0" ]; then
+                    _norm=$(_disk_match_norm_spec "$_cur") || return 1
+                    _out="$_out $_norm"
+                    _cur=""
+                else
+                    _cur="${_cur},"
+                fi
+                ;;
+            *) _cur="${_cur}${_c}" ;;
+        esac
+        _i=$((_i+1))
+    done
+    if [ "$_depth" != "0" ]; then
+        echo "DISK_ID_MATCH: unbalanced parentheses in '$_raw'" >&2
+        return 1
+    fi
+    if [ -n "$_cur" ]; then
+        _norm=$(_disk_match_norm_spec "$_cur") || return 1
+        _out="$_out $_norm"
+    fi
+    printf '%s\n' "$_out" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//'
+}
+
+_disk_match_norm_spec() {
+    _s=$(printf '%s' "$1" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+    [ -n "$_s" ] || { echo "DISK_ID_MATCH: empty spec" >&2; return 1; }
+    case "$_s" in
+        S|W|P) printf 'req=%s' "$_s" ;;
+        ONE-OF\(*\))
+            _inner=${_s#ONE-OF\(}
+            _inner=${_inner%\)}
+            _inner=$(printf '%s' "$_inner" | tr -d ' ')
+            _count=0
+            for _L in $(printf '%s' "$_inner" | tr ',' ' '); do
+                case "$_L" in
+                    S|W|P) _count=$((_count+1)) ;;
+                    *) echo "DISK_ID_MATCH: invalid letter '$_L' in ONE-OF (expected S, W, or P)" >&2; return 1 ;;
+                esac
+            done
+            if [ "$_count" -lt 2 ]; then
+                echo "DISK_ID_MATCH: ONE-OF must list at least 2 letters" >&2
+                return 1
+            fi
+            printf 'oneof=%s' "$_inner"
+            ;;
+        *)
+            echo "DISK_ID_MATCH: unrecognized spec '$_s' (expected S, W, P, or ONE-OF(...))" >&2
+            return 1
+            ;;
+    esac
+}
+
+# Evaluate a parsed DISK_ID_MATCH policy against one baseline-disks
+# entry (the part before '#', possibly carrying multiple tags).
+# Args:
+#   $1 = parsed policy (output of disk_match_parse, space-separated)
+#   $2 = entry text (one or more whitespace-separated tags)
+# Side effects: none (read-only against the cache).
+# Output: if the entry is present under the policy, prints the bsd of
+# the first disk that proved presence. If missing, prints nothing.
+# Return: 0 = present, 1 = missing.
+disk_match_evaluate() {
+    _policy="$1"
+    _entry="$2"
+    _matched_bsd=""
+    # Map letter -> first recorded tag of that type in the entry.
+    _t_S=""; _t_W=""; _t_P=""
+    for _tok in $_entry; do
+        case "$_tok" in
+            SN:*)            [ -z "$_t_S" ] && _t_S="$_tok" ;;
+            WWN:*)           [ -z "$_t_W" ] && _t_W="$_tok" ;;
+            PART:*|MBRSIG:*) [ -z "$_t_P" ] && _t_P="$_tok" ;;
+        esac
+    done
+
+    for _spec in $_policy; do
+        case "$_spec" in
+            all)
+                _all_ok=1
+                for _tok in $_entry; do
+                    case "$_tok" in
+                        SN:*|WWN:*|PART:*|MBRSIG:*) ;;
+                        *) continue ;;
+                    esac
+                    _b=$(disk_for_baseline_id "$_tok" 2>/dev/null)
+                    if [ -z "$_b" ]; then
+                        _all_ok=0
+                        break
+                    fi
+                    [ -z "$_matched_bsd" ] && _matched_bsd="$_b"
+                done
+                [ "$_all_ok" = "1" ] || return 1
+                ;;
+            req=*)
+                _L=${_spec#req=}
+                eval "_tag=\$_t_$_L"
+                [ -n "$_tag" ] || return 1
+                _b=$(disk_for_baseline_id "$_tag" 2>/dev/null)
+                [ -n "$_b" ] || return 1
+                [ -z "$_matched_bsd" ] && _matched_bsd="$_b"
+                ;;
+            oneof=*)
+                _letters=${_spec#oneof=}
+                _found=0
+                for _L in $(printf '%s' "$_letters" | tr ',' ' '); do
+                    eval "_tag=\$_t_$_L"
+                    [ -n "$_tag" ] || continue
+                    _b=$(disk_for_baseline_id "$_tag" 2>/dev/null)
+                    if [ -n "$_b" ]; then
+                        _found=1
+                        [ -z "$_matched_bsd" ] && _matched_bsd="$_b"
+                        break
+                    fi
+                done
+                [ "$_found" = "1" ] || return 1
+                ;;
+        esac
+    done
+
+    [ -n "$_matched_bsd" ] && echo "$_matched_bsd"
+    return 0
+}
+
+# Return the parsed DISK_ID_MATCH policy (caching on first call).
+# Errors out + aborts if DISK_ID_MATCH is unset OR fails to parse.
+# Callers should treat this as a hard precondition before invoking
+# disk_match_evaluate.
+_DISK_ID_MATCH_PARSED_CACHE=""
+disk_match_require() {
+    if [ -n "$_DISK_ID_MATCH_PARSED_CACHE" ]; then
+        printf '%s\n' "$_DISK_ID_MATCH_PARSED_CACHE"
+        return 0
+    fi
+    if [ -z "${DISK_ID_MATCH:-}" ]; then
+        die "DISK_ID_MATCH is not set in $LOADED_CONFIG.
+Required: declares which on-disk identifiers must match for a baselined
+disk to count as present. Suggested default for most users:
+
+    DISK_ID_MATCH=\"ONE-OF(S,W),P\"
+
+See the DISK_ID_MATCH section in the example config for the full
+grammar (S/W/P letters, ONE-OF(...) for OR, comma for AND, 'ALL' for
+strictest)."
+    fi
+    _parsed=$(disk_match_parse "$DISK_ID_MATCH") || die "DISK_ID_MATCH=\"$DISK_ID_MATCH\" failed to parse (see error above)."
+    _DISK_ID_MATCH_PARSED_CACHE="$_parsed"
+    printf '%s\n' "$_parsed"
+}
+
+# ----------------------------------------------------------------------
 # Alerting: sound + email.
 # alert_sound plays ALARM_SOUND using afplay, respecting ALARM_VOLUME_MODE.
 # ----------------------------------------------------------------------
@@ -2716,13 +2910,17 @@ check_disk_presence() {
         log_debug "Disk presence check skipped: REQUIRED_DISKS resolves to empty"
         return 0
     fi
-    log_debug "Disk presence: $(echo "$required" | wc -l | tr -d ' ') required entries, grace=${grace}s, severity=$sev"
+    # Pre-validate DISK_ID_MATCH (errors out if unset/invalid). Cached.
+    _policy=$(disk_match_require)
+    log_debug "Disk presence: $(echo "$required" | wc -l | tr -d ' ') required entries, grace=${grace}s, severity=$sev, policy='$DISK_ID_MATCH' -> '$_policy'"
 
     # Each required entry is either:
     #   - A multi-tag baseline entry (e.g. "SN:X PART:Y") from
     #     baseline_read_disks - one or more tags whitespace-separated.
-    #     Matched via disk_for_baseline_id per tag; any-tag-matches
-    #     means the entry is present.
+    #     Matched via disk_match_evaluate against the DISK_ID_MATCH
+    #     policy: the entry is present iff the policy's rule (AND of
+    #     specs, where each spec is a single letter or a ONE-OF group)
+    #     is satisfied by the entry's recorded tags + the current cache.
     #   - A bare disk-node name (disk2, disk3 - from explicit comma-list
     #     REQUIRED_DISKS) - looked up via diskutil info /dev/<name>.
     # Bare disk-node entries are TRANSIENT and may match a different
@@ -2740,26 +2938,12 @@ check_disk_presence() {
         first=$(printf '%s' "$r" | awk '{print $1}')
         case "$first" in
             SN:*|WWN:*|PART:*|MBRSIG:*)
-                # Multi-tag entry: try each tag; any match = present.
-                cur=""
-                matched_tag=""
-                for tag in $r; do
-                    case "$tag" in
-                        SN:*|WWN:*|PART:*|MBRSIG:*) ;;
-                        *) continue ;;
-                    esac
-                    _b=$(disk_for_baseline_id "$tag" 2>/dev/null)
-                    if [ -n "$_b" ]; then
-                        cur="$_b"
-                        matched_tag="$tag"
-                        break
-                    fi
-                done
+                cur=$(disk_match_evaluate "$_policy" "$r")
                 if [ -n "$cur" ]; then
-                    log_debug "  $r -> /dev/$cur (present, matched $matched_tag)"
+                    log_debug "  $r -> /dev/$cur (present, policy satisfied)"
                     grace_clear "disk" "$first"
                 else
-                    log_debug "  $r -> NOT attached"
+                    log_debug "  $r -> NOT attached (policy '$DISK_ID_MATCH' not satisfied)"
                     if grace_check "disk" "$first" "$grace"; then
                         h=$(problem_hash "disk-missing" "$first" "not-present")
                         seen_add "$h"
