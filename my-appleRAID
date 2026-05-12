@@ -82,8 +82,8 @@ SCRIPT_NAME="$(basename "$0")"
 # the commit they were built from. The companion 'stamp-version'
 # subcommand updates SCRIPT_COMMIT to the current HEAD sha and
 # amends - run it as the last step before deploying.
-SCRIPT_VERSION="v7.3"
-SCRIPT_COMMIT="3487917"
+SCRIPT_VERSION="v7.4"
+SCRIPT_COMMIT="7574206"
 SCRIPT_COPYRIGHT="Copyright (C) 2026 Tormen <tormen@mail.ch>"
 SCRIPT_LICENSE_SHORT="GPL-3.0-or-later (copyleft)"
 SCRIPT_LICENSE_URL="https://www.gnu.org/licenses/gpl-3.0.html"
@@ -1492,7 +1492,7 @@ baseline_write_sets() {
     {
         echo "# appleRAID baseline: RAID sets expected to exist."
         echo "# Written: $(now_iso)"
-        echo "# Update with: appleRAID baseline --sets"
+        echo "# Update with: appleRAID baseline --update --sets"
         diskutil appleRAID list 2>/dev/null | awk -F': +' '
             /^Name:/ { n=$2; sub(/ +$/,"",n); if (n!="") print n }
         '
@@ -1723,12 +1723,12 @@ _disk_baseline_id_uncached() {
 # are skipped with a warning; baseline integrity requires at least
 # one on-disk identifier.
 baseline_write_disks() {
-    require_smartctl_usable "baseline --disks (identifier snapshot)"
+    require_smartctl_usable "baseline --update --disks (identifier snapshot)"
     f=$(baseline_disks_file)
     {
         echo "# appleRAID baseline: disks expected to be attached."
         echo "# Written: $(now_iso)"
-        echo "# Update with: appleRAID baseline --disks"
+        echo "# Update with: appleRAID baseline --update --disks"
         echo "#"
         echo "# Format: <tag> [<tag> ...]  # <bsd-at-baseline>  <size>  <model>"
         echo "#"
@@ -2759,7 +2759,7 @@ resolve_required_disks() {
                 if baseline_disks_is_legacy 2>/dev/null; then
                     log_warn "baseline-disks is in legacy disk-node format (e.g. 'disk2')."
                     log_warn "Disk-node names are TRANSIENT and shuffle across reboots/replugs."
-                    log_warn "Re-run 'my-appleRAID baseline --disks' to switch to stable serials."
+                    log_warn "Re-run 'my-appleRAID baseline --update --disks' to switch to stable serials."
                 fi
                 baseline_read_disks
                 ;;
@@ -3173,7 +3173,7 @@ check_auto_baseline_sets() {
     # NOTE: we intentionally do NOT auto-remove sets that have been
     # missing-and-grace-expired. Auto-removal of persistent items is
     # riskier than auto-adding of long-present ones - the user can
-    # always force a refresh with 'appleRAID baseline --sets'. The
+    # always force a refresh with 'appleRAID baseline --update --sets'. The
     # AUTO_BASELINE_FOR_SETS_ON_DESTROY path handles the clean case
     # where the user deliberately destroyed a set.
     return 0
@@ -3827,7 +3827,7 @@ MONITOR_SETS_EXCLUDE=""
 #
 #   "all"              -> snapshot current sets as the baseline; alert
 #                         if any of them later goes missing. Run
-#                         'appleRAID baseline --sets' after deliberately
+#                         'appleRAID baseline --update --sets' after deliberately
 #                         adding or removing a RAID set.
 #   "NameA,NameB"      -> explicit list; compared directly, no snapshot.
 #   ""                 -> disabled (no presence check for sets).
@@ -3951,7 +3951,7 @@ MISSING_DISK_GRACE_PERIOD=5m
 # serial that you'd write as 'SN:<serial>'.
 #
 # INTERACTIVE MANAGER: instead of hand-editing this section, run
-# 'appleRAID baseline --optsets'. It lists currently-attached disks and
+# 'appleRAID baseline --update --optsets'. It lists currently-attached disks and
 # disks in the baseline-but-missing list, lets you create / rename /
 # delete sets and groups, assign disks via menu pick, and writes the
 # result back into this config file atomically.
@@ -4259,75 +4259,133 @@ cmd_baseline() {
 
     # Build the bsd -> tagged-id cache ONCE for this run. baseline
     # walks attached disks several times (write-disks filter, optsets
-    # rendering, Added/Removed annotation, '--show'), each of which
-    # would otherwise call disk_baseline_id per disk and trip
-    # system_profiler. Single init means single sweep. Trap cleans up.
+    # rendering, Added/Removed annotation, show). Single init means
+    # single sweep. Trap cleans up.
     _diskid_cache_init
     trap '_diskid_cache_clear' EXIT INT TERM
 
-    do_sets=1
-    do_disks=1
-    show_only=0
-    do_optsets=0
+    # Mode flags (mutually exclusive at the top level): show/update/raw/diff.
+    # Scope flags only apply under --update.
+    do_update=0
+    do_raw=0
+    do_diff=0
+    do_sets_scope=0
+    do_disks_scope=0
+    do_optsets_scope=0
     for a in "$@"; do
         case "$a" in
-            --sets)    do_sets=1; do_disks=0; do_optsets=0 ;;
-            --disks)   do_sets=0; do_disks=1; do_optsets=0 ;;
-            --show)    show_only=1 ;;
-            --optsets) do_sets=0; do_disks=0; do_optsets=1 ;;
+            --update)  do_update=1 ;;
+            --raw)     do_raw=1 ;;
+            --diff)    do_diff=1 ;;
+            --sets)    do_sets_scope=1 ;;
+            --disks)   do_disks_scope=1 ;;
+            --optsets) do_optsets_scope=1 ;;
             -h|--help)
                 cat <<EOF
-Usage: $SCRIPT_NAME baseline [--sets|--disks|--show|--optsets]
+Usage: $SCRIPT_NAME baseline [--update [--sets|--disks|--optsets]
+                              | --diff [--raw]
+                              | --raw]
 
-Snapshots the currently-existing RAID sets and/or attached disks into
-the "expected baseline" used by REQUIRED_SETS=all / REQUIRED_DISKS=all,
-or interactively manages OPTIONAL_DISK_SETS for rotating-backup
+Snapshot manager for the "expected baseline" used by REQUIRED_SETS=all
+and REQUIRED_DISKS=all, and for OPTIONAL_DISK_SETS rotating-backup
 workflows.
 
-  (no args)   Update both set and disk baselines.
-  --sets      Update the RAID set baseline only.
-  --disks     Update the disk baseline only.
-  --show      Print the current baseline files without modifying them.
-  --optsets   Interactive manager for OPTIONAL_DISK_SETS (SETs of
-              GROUPs of DISKs - the rotating-backup feature). Lets you
-              create/rename/delete named SETs and named GROUPs within
-              them, and assign currently-attached or
-              missing-from-baseline disks to a chosen Set/Group via
-              menu pick. Writes the result back into the loaded
-              config file atomically.
+Modes:
+  (no args)        Show the current recorded baseline (read-only).
+  --update         Refresh baseline from currently-attached state.
+                   Without scope flags: updates sets AND disks AND runs
+                   the interactive OPTIONAL_DISK_SETS manager (skipped
+                   automatically when stdin is not a terminal).
+    --sets           restrict --update to the RAID set baseline.
+    --disks          restrict --update to the disk baseline.
+                     This also rewrites baseline.raw (forensic snapshot).
+    --optsets        only run the interactive OPTIONAL_DISK_SETS manager.
+  --diff           Show what would change if --update were run now,
+                   relative to the recorded baseline. Read-only.
+    --raw            diff the baseline.raw forensic snapshot instead of
+                     the tagged-id files.
+  --raw            (alone) Dump the recorded baseline.raw to stdout.
 
-              Three-level model:
-                DISK  - one physical disk (SN:/PART:/USB:/VOL: or diskN)
-                GROUP - bundle of disks. Rule (a): if any member is
-                        present, ALL must be present together.
-                SET   - collection of groups (one rotation pool).
-                        Rule (b): within the set, at least ONE group
-                        must be fully present.
-              Different SETs are independent (one rotation does not
-              constrain another).
+Identifier tag types recorded by --update --disks:
+  SN:<serial>      ATA/NVMe firmware serial (smartctl)
+  WWN:<hex>        LU WWN / NVMe EUI-64 / NGUID (smartctl)
+  PART:<gpt-uuid>  GPT partition entry GUID
+  MBRSIG:<8-hex>   MBR disk signature (BIOS-style disks)
+Each disk's line records every readable identifier; the matcher uses
+DISK_ID_MATCH (in the config) to decide which identifiers must be
+satisfied for the disk to count as present.
 
-              Members of optional groups are excluded from
-              REQUIRED_DISKS resolution, so a swapped-out rotation
-              disk does not also fire a disk-missing alert.
+OPTIONAL_DISK_SETS (rotating-backup pools):
+  DISK   one physical disk (tag or diskN)
+  GROUP  bundle of disks. Rule (a): if any member present, ALL must be.
+  SET    collection of groups (one pool). Rule (b): within the set,
+         at least ONE group must be fully present.
+  Group members are excluded from REQUIRED_DISKS so swapping doesn't
+  fire a disk-missing alert.
 
 Baseline files:
   $(baseline_sets_file)
   $(baseline_disks_file)
+  $(_baseline_raw_file)
 EOF
                 return 0
                 ;;
             *)
-                die "Unknown baseline option: $a (try: --sets | --disks | --show | --optsets | --help)"
+                die "Unknown baseline option: $a
+Try: $SCRIPT_NAME baseline --help"
                 ;;
         esac
     done
 
-    if [ "$do_optsets" = "1" ]; then
+    # Mutually-exclusive top-level mode check.
+    _mode_count=$((do_update + do_raw + do_diff))
+    if [ "$_mode_count" -gt 1 ] && ! { [ "$do_diff" = "1" ] && [ "$do_raw" = "1" ] && [ "$do_update" = "0" ]; }; then
+        die "Modes --update, --raw, and --diff are mutually exclusive (except '--diff --raw')."
+    fi
+
+    # Scope flags only allowed under --update.
+    if [ "$do_update" = "0" ] \
+       && { [ "$do_sets_scope" = "1" ] || [ "$do_disks_scope" = "1" ] || [ "$do_optsets_scope" = "1" ]; }; then
+        die "--sets/--disks/--optsets are only valid with --update.
+Use 'baseline --update --sets' (etc.) to refresh, or 'baseline' alone to show."
+    fi
+
+    # Dispatch.
+    if [ "$do_raw" = "1" ] && [ "$do_diff" = "1" ]; then
+        _baseline_diff_raw
+        return $?
+    fi
+    if [ "$do_raw" = "1" ]; then
+        _baseline_show_raw
+        return $?
+    fi
+    if [ "$do_diff" = "1" ]; then
+        _baseline_diff
+        return $?
+    fi
+    if [ "$do_update" = "1" ]; then
+        # Resolve scope. No scope flag = update all three (sets + disks
+        # + interactive optsets).
+        if [ "$do_sets_scope" = "0" ] && [ "$do_disks_scope" = "0" ] && [ "$do_optsets_scope" = "0" ]; then
+            do_sets_scope=1; do_disks_scope=1; do_optsets_scope=1
+        fi
+        do_sets="$do_sets_scope"
+        do_disks="$do_disks_scope"
+        do_optsets="$do_optsets_scope"
+    else
+        # Default: show only.
+        show_only=1
+    fi
+
+    # Optsets-only fast-path under --update (preserve existing
+    # interactive-manager entry point).
+    if [ "$do_update" = "1" ] && [ "$do_optsets" = "1" ] \
+       && [ "$do_sets" = "0" ] && [ "$do_disks" = "0" ]; then
         cmd_baseline_optsets
         return $?
     fi
 
-    if [ "$show_only" = "1" ]; then
+    if [ "${show_only:-0}" = "1" ]; then
         step "Current baseline"
         f=$(baseline_sets_file)
         if [ -f "$f" ]; then
@@ -4379,6 +4437,12 @@ EOF
             info "Disk specs excluded from REQUIRED_DISKS (governed by optset rules):"
             optional_sets_all_specs | sed 's/^/    /'
         fi
+        echo
+        info "Read-only view. Other modes:"
+        explain "    $SCRIPT_NAME baseline --update            refresh baseline"
+        explain "    $SCRIPT_NAME baseline --diff              preview --update changes"
+        explain "    $SCRIPT_NAME baseline --raw               cat baseline.raw"
+        explain "    $SCRIPT_NAME baseline --diff --raw        diff baseline.raw"
         return 0
     fi
 
@@ -4417,14 +4481,14 @@ EOF
     # the plain-disk baselines so the output reads as a complete
     # picture of what the daemon will track. Read-only: the optsets
     # are stored in $LOADED_CONFIG (OPTIONAL_DISK_SETS), not in a
-    # baseline file - edit them with 'baseline --optsets'.
+    # baseline file - edit them with 'baseline --update --optsets'.
     if [ "$do_disks" = "1" ] || [ "$do_sets" = "1" ]; then
         step "Optional Disk Sets / Groups baseline"
         if [ -z "${OPTIONAL_DISK_SETS:-}" ]; then
-            explain "Empty. Define rotation pools with 'baseline --optsets'."
+            explain "Empty. Define rotation pools with 'baseline --update --optsets'."
         else
             explain "Rules: (a) within a group: all members present together; (b) within a set: >=1 group fully present."
-            explain "Read-only here. Source: OPTIONAL_DISK_SETS in ${LOADED_CONFIG:-<no config>} (edit via 'baseline --optsets')."
+            explain "Read-only here. Source: OPTIONAL_DISK_SETS in ${LOADED_CONFIG:-<no config>} (edit via 'baseline --update --optsets')."
             for _setn in $(optional_sets_set_names); do
                 printf '  %sSet:%s %s\n' "${C_BOLD}" "${C_RESET}" "$_setn"
                 _any_full=0
@@ -4622,14 +4686,216 @@ EOF
                 info "Disk baseline unchanged."
             fi
         fi
+
+        # Refresh the forensic raw snapshot whenever the disk baseline
+        # is rewritten. Same atomicity contract: write to .tmp, rename.
+        _baseline_write_raw
+        info "Forensic snapshot refreshed: $(_baseline_raw_file)"
     fi
 
-    ok "Baseline check complete."
+    # End of --update --sets/--disks path. If --update was given without
+    # any scope flags (do_optsets=1 alongside), launch the interactive
+    # OPTIONAL_DISK_SETS manager too, with an "(s)kip" prompt so non-tty
+    # contexts (daemon, scripted) don't hang.
+    if [ "${do_update:-0}" = "1" ] && [ "${do_optsets:-0}" = "1" ]; then
+        if [ "$do_sets" = "1" ] || [ "$do_disks" = "1" ]; then
+            # Came via the "no scope = all three" path. Offer to skip.
+            echo
+            if [ -t 0 ] && [ -t 1 ]; then
+                printf '%s' "Now run the interactive OPTIONAL_DISK_SETS manager? [Y/n/s(kip)]: "
+                read -r _ans
+                case "$_ans" in
+                    n|N|s|S|skip|SKIP)
+                        info "Skipped --optsets step."
+                        ;;
+                    *)
+                        cmd_baseline_optsets
+                        ;;
+                esac
+            else
+                info "Skipping --optsets step (non-interactive; stdin is not a terminal)."
+            fi
+        fi
+    fi
+
+    ok "Baseline update complete."
     info "REQUIRED_SETS=all and REQUIRED_DISKS=all use the files above; OPTIONAL_DISK_SETS rules (a)+(b) use the config."
 }
 
 # ----------------------------------------------------------------------
-# `baseline --optsets` - interactive OPTIONAL_DISK_SETS manager.
+# Forensic baseline.raw: per-disk dump of diskutil + smartctl +
+# system_profiler output, plus a header with timestamp/host/version.
+# Written atomically every time --update --disks (or full --update)
+# runs. Never read by runtime code paths - purely diagnostic.
+# ----------------------------------------------------------------------
+_baseline_raw_file() { echo "${STATE_DIR}/baseline.raw"; }
+
+# Render one section: print the command line, then a separator, then
+# the command's stdout. Used by _baseline_write_raw.
+_baseline_raw_cmd() {
+    _label="$1"; shift
+    printf '\n----- $ %s -----\n' "$_label"
+    "$@" 2>&1 || printf '(command exited %d)\n' "$?"
+}
+
+# Atomically rewrite $STATE_DIR/baseline.raw from current system state.
+# Caller is responsible for require_smartctl_usable / cache priming.
+_baseline_write_raw() {
+    _raw=$(_baseline_raw_file)
+    _tmp="${_raw}.tmp.$$"
+    {
+        printf '================================================================================\n'
+        printf 'my-appleRAID baseline.raw\n'
+        printf 'Generated:       %s\n' "$(now_iso)"
+        printf 'Host:            %s  (%s %s)\n' \
+            "$(hostname -s 2>/dev/null)" "$(uname -s)" "$(uname -r)"
+        printf 'my-appleRAID:    %s (%s)\n' "${SCRIPT_VERSION:-?}" "${SCRIPT_COMMIT:-?}"
+        if command -v smartctl >/dev/null 2>&1; then
+            printf 'smartctl:        %s\n' "$(smartctl --version 2>/dev/null | awk 'NR==1')"
+        else
+            printf 'smartctl:        NOT INSTALLED\n'
+        fi
+        printf 'diskutil:        %s\n' "$(diskutil --version 2>/dev/null | awk 'NR==1')"
+        printf '================================================================================\n'
+        # Per-disk section, in the order baseline-disks lists them.
+        _bf=$(baseline_disks_file)
+        if [ ! -f "$_bf" ]; then
+            printf '\n(no baseline-disks file yet; nothing to dump)\n'
+        else
+            _idx=0
+            _total=$(awk 'NF>0 && !/^#/' "$_bf" | wc -l | tr -d ' ')
+            awk 'NF>0 && !/^#/' "$_bf" | while IFS= read -r _line; do
+                _idx=$((_idx + 1))
+                # Tags (pre-#) and bsd-hint (post-#).
+                _tags=$(printf '%s' "$_line" | awk '{sub(/[[:space:]]*#.*$/,""); print}')
+                _comment=$(printf '%s' "$_line" | awk -F'#' 'NF>1 {print $2}' \
+                    | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+                _bsd=$(printf '%s' "$_comment" | awk '{print $1}')
+                printf '\n##############################################################################\n'
+                printf '# Disk %d/%d  -- baseline entry: %s\n' \
+                    "$_idx" "$_total" "$_tags"
+                printf '# Hint: %s\n' "$_comment"
+                printf '##############################################################################\n'
+                if [ -z "$_bsd" ] || ! diskutil info "/dev/$_bsd" >/dev/null 2>&1; then
+                    # The recorded bsd no longer exists; try to resolve
+                    # via the cache (a tag from the entry).
+                    _try=$(echo "$_tags" | awk '{print $1}')
+                    _bsd=$(disk_for_baseline_id "$_try" 2>/dev/null)
+                    if [ -n "$_bsd" ]; then
+                        printf '(bsd hint stale; resolved via tag to /dev/%s)\n' "$_bsd"
+                    else
+                        printf '(disk not currently attached; tag lookup failed)\n'
+                        continue
+                    fi
+                fi
+                _baseline_raw_cmd "diskutil info /dev/$_bsd" \
+                    diskutil info "/dev/$_bsd"
+                _baseline_raw_cmd "diskutil list /dev/$_bsd" \
+                    diskutil list "/dev/$_bsd"
+                if command -v smartctl >/dev/null 2>&1; then
+                    _baseline_raw_cmd "smartctl -i /dev/$_bsd" \
+                        smartctl -i "/dev/$_bsd"
+                    _baseline_raw_cmd "smartctl -a /dev/$_bsd" \
+                        smartctl -a "/dev/$_bsd"
+                fi
+            done
+        fi
+    } > "$_tmp" 2>/dev/null
+    mv "$_tmp" "$_raw" || { rm -f "$_tmp"; die "Failed to write $_raw"; }
+    chmod 0644 "$_raw" 2>/dev/null || true
+}
+
+# baseline --raw: cat the recorded forensic snapshot.
+_baseline_show_raw() {
+    _raw=$(_baseline_raw_file)
+    if [ ! -f "$_raw" ]; then
+        die "No forensic snapshot recorded yet.
+Run '$SCRIPT_NAME baseline --update --disks' to create $_raw."
+    fi
+    cat "$_raw"
+}
+
+# baseline --diff: show what --update would change relative to the
+# recorded baseline files. Read-only.
+_baseline_diff() {
+    step "Baseline diff (recorded vs. live)"
+    # Sets.
+    _sets_f=$(baseline_sets_file)
+    _prev_sets=""
+    [ -f "$_sets_f" ] && _prev_sets=$(awk 'NF>0 && !/^#/' "$_sets_f")
+    _live_sets=$(diskutil appleRAID list 2>/dev/null | awk -F': +' '
+        /^Name:/ { n=$2; sub(/ +$/,"",n); if (n!="") print n }')
+    _added_s=$(printf '%s\n' "$_live_sets" "$_prev_sets" "$_prev_sets" \
+        | awk 'NF>0' | sort | uniq -u)
+    _removed_s=$(printf '%s\n' "$_prev_sets" "$_live_sets" "$_live_sets" \
+        | awk 'NF>0' | sort | uniq -u)
+    info "RAID sets:"
+    if [ -z "$_added_s" ] && [ -z "$_removed_s" ]; then
+        echo "    (no changes)"
+    else
+        [ -n "$_added_s" ]   && echo "$_added_s"   | sed 's/^/    + /'
+        [ -n "$_removed_s" ] && echo "$_removed_s" | sed 's/^/    - /'
+    fi
+    echo
+
+    # Disks: compare recorded entries vs. live entries the writer
+    # would produce. Both are entry-text (tags + bsd-hint).
+    require_smartctl_usable "baseline --diff (live disk snapshot)"
+    info "Disks:"
+    _disks_f=$(baseline_disks_file)
+    _prev_disks_full=""
+    [ -f "$_disks_f" ] && _prev_disks_full=$(awk 'NF>0 && !/^#/' "$_disks_f")
+    # Generate the live disk-entry list into a tmpfile (same path
+    # baseline_write_disks would take, minus the actual write).
+    _live_tmp=$(mktemp "${STATE_DIR}/.baseline-diff-disks.XXXXXX")
+    _orig_f=$(baseline_disks_file)
+    baseline_disks_file() { echo "$_live_tmp"; }
+    baseline_write_disks
+    baseline_disks_file() { echo "$_orig_f"; }
+    _live_disks_full=$(awk 'NF>0 && !/^#/' "$_live_tmp")
+    rm -f "$_live_tmp"
+    # Compare ENTRY TEXT (full line minus comment). A line is "changed"
+    # if its first-tag key is present in both but the entries differ;
+    # added if only in live; removed if only in prev.
+    _diff_disks_added=$(printf '%s\n%s\n%s\n' "$_live_disks_full" "$_prev_disks_full" "$_prev_disks_full" \
+        | awk 'NF>0' | sort | uniq -u)
+    _diff_disks_removed=$(printf '%s\n%s\n%s\n' "$_prev_disks_full" "$_live_disks_full" "$_live_disks_full" \
+        | awk 'NF>0' | sort | uniq -u)
+    if [ -z "$_diff_disks_added" ] && [ -z "$_diff_disks_removed" ]; then
+        echo "    (no changes)"
+    else
+        [ -n "$_diff_disks_removed" ] && echo "$_diff_disks_removed" | sed 's/^/    - /'
+        [ -n "$_diff_disks_added" ]   && echo "$_diff_disks_added"   | sed 's/^/    + /'
+    fi
+    echo
+    info "Read-only. Run 'baseline --update --disks' to apply changes."
+}
+
+# baseline --diff --raw: unified diff of the forensic snapshot.
+_baseline_diff_raw() {
+    _raw=$(_baseline_raw_file)
+    if [ ! -f "$_raw" ]; then
+        die "No forensic snapshot recorded yet.
+Run '$SCRIPT_NAME baseline --update --disks' to create $_raw, then re-diff."
+    fi
+    require_smartctl_usable "baseline --diff --raw (live forensic snapshot)"
+    step "Baseline raw diff (recorded vs. live)"
+    info "Recorded: $(awk '/^Generated:/ {sub(/^Generated:[[:space:]]*/, ""); print; exit}' "$_raw")"
+    info "Live:     $(now_iso)"
+    # Generate the live raw snapshot into a tmpfile by temporarily
+    # redirecting _baseline_raw_file.
+    _live_tmp=$(mktemp "${STATE_DIR}/.baseline-diff-raw.XXXXXX")
+    _orig_f="$_raw"
+    _baseline_raw_file() { echo "$_live_tmp"; }
+    _baseline_write_raw
+    _baseline_raw_file() { echo "$_orig_f"; }
+    echo
+    diff -u "$_raw" "$_live_tmp" | sed 's/^/    /'
+    rm -f "$_live_tmp"
+}
+
+# ----------------------------------------------------------------------
+# `baseline --update --optsets` - interactive OPTIONAL_DISK_SETS manager.
 #
 # Lets the user define named rotation groups and assign disks to them
 # without hand-editing the config file. Operates on a session-local
@@ -4747,7 +5013,7 @@ _optsets_save_to_config() {
     ' "$_conf" > "$_tmp" || { rm -f "$_tmp"; errmsg "awk rewrite failed"; return 1; }
     # Append the new block (with a leading blank line for readability).
     {
-        printf '\n# Updated by %s baseline --optsets on %s\n' "$SCRIPT_NAME" "$(now_iso 2>/dev/null || date)"
+        printf '\n# Updated by %s baseline --update --optsets on %s\n' "$SCRIPT_NAME" "$(now_iso 2>/dev/null || date)"
         printf 'OPTIONAL_DISK_SETS=%s' "$(cat "$_new_value_file")"
     } >> "$_tmp"
     # Preserve perms/ownership.
@@ -4923,7 +5189,7 @@ _optsets_show_state() {
 # Interactive entry point.
 cmd_baseline_optsets() {
     if [ ! -t 0 ] || [ ! -t 1 ]; then
-        die "baseline --optsets is interactive; needs a TTY on stdin/stdout."
+        die "baseline --update --optsets is interactive; needs a TTY on stdin/stdout."
     fi
     _ensure_state_dir_writable
     _wf=$(mktemp "$STATE_DIR/.optsets-work.XXXXXX") \
@@ -8569,17 +8835,21 @@ ${C_BOLD}COMMANDS${C_RESET}
   ${C_CYAN}create-config${C_RESET} <path>        Write an annotated default config file to
                               <path>. Example:
                                 ${SCRIPT_NAME} create-config ~/.my-appleRAID.conf
-  ${C_CYAN}baseline${C_RESET} [--sets|--disks|--show]
-                              Snapshot the currently-existing RAID sets
-                              and/or attached disks into the "expected
-                              baseline" used by REQUIRED_SETS=all /
-                              REQUIRED_DISKS=all. Run this after
-                              deliberately adding or removing a RAID
-                              set, or changing your disk lineup.
-                              Does NOT affect SMART monitoring.
-                                --sets   only update the set baseline
-                                --disks  only update the disk baseline
-                                --show   print current baselines only
+  ${C_CYAN}baseline${C_RESET} [--update [--sets|--disks|--optsets] | --raw | --diff [--raw]]
+                              Manage the "expected baseline" used by
+                              REQUIRED_SETS=all / REQUIRED_DISKS=all.
+                              Default (no args) shows the recorded
+                              baseline read-only; --update refreshes it.
+                                --update         refresh sets+disks
+                                                 (+interactive optsets)
+                                --update --sets  restrict to RAID sets
+                                --update --disks restrict to disks
+                                --update --optsets only the interactive
+                                                  OPTIONAL_DISK_SETS UI
+                                --raw            cat baseline.raw
+                                --diff           preview --update changes
+                                --diff --raw     unified diff of raw
+                                                 forensic snapshot
   ${C_CYAN}test-alerts${C_RESET}                 Exercise every alerting channel (sound,
                               email, log). Run once after setup to
                               verify alerts reach you.
@@ -10656,7 +10926,7 @@ cmd_create() {
         info "auto-baseline: '$name' added to $(baseline_sets_file)"
     else
         info "tip: if you're using the health daemon with REQUIRED_SETS=all, run:"
-        info "       $SCRIPT_NAME baseline --sets"
+        info "       $SCRIPT_NAME baseline --update --sets"
         info "     to include '$name' in the expected-set baseline."
     fi
 }
@@ -11790,7 +12060,7 @@ EOF
         info "auto-baseline: $(baseline_sets_file) updated (name changed)"
     else
         info "tip: if you're using the health daemon with REQUIRED_SETS=all, run:"
-        info "       $SCRIPT_NAME baseline --sets"
+        info "       $SCRIPT_NAME baseline --update --sets"
         info "     so the daemon picks up the new name."
     fi
 }
@@ -11869,7 +12139,7 @@ cmd_destroy() {
         info "auto-baseline: $(baseline_sets_file) updated (destroyed set removed)"
     else
         info "tip: if you're using the health daemon with REQUIRED_SETS=all, run:"
-        info "       $SCRIPT_NAME baseline --sets"
+        info "       $SCRIPT_NAME baseline --update --sets"
         info "     so the daemon stops alerting about the removed set."
     fi
 }
@@ -12003,10 +12273,12 @@ _my-appleRAID() {
                     ;;
                 baseline)
                     _arguments \
-                        '--sets[Only update set baseline]' \
-                        '--disks[Only update disk baseline]' \
-                        '--show[Print current baselines only]' \
-                        '--optsets[Interactive manager for OPTIONAL_DISK_SETS (SETs of GROUPs of DISKs)]'
+                        '--update[Refresh baseline from current state]' \
+                        '--raw[Cat baseline.raw forensic snapshot]' \
+                        '--diff[Show diff between recorded baseline and live]' \
+                        '--sets[(with --update) restrict to set baseline]' \
+                        '--disks[(with --update) restrict to disk baseline]' \
+                        '--optsets[(with --update) interactive OPTIONAL_DISK_SETS manager]'
                     ;;
                 *)
                     _files
