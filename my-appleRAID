@@ -82,8 +82,8 @@ SCRIPT_NAME="$(basename "$0")"
 # the commit they were built from. The companion 'stamp-version'
 # subcommand updates SCRIPT_COMMIT to the current HEAD sha and
 # amends - run it as the last step before deploying.
-SCRIPT_VERSION="v8.0"
-SCRIPT_COMMIT="861a728"
+SCRIPT_VERSION="v8.1"
+SCRIPT_COMMIT="23ab99e"
 SCRIPT_COPYRIGHT="Copyright (C) 2026 Tormen <tormen@mail.ch>"
 SCRIPT_LICENSE_SHORT="GPL-3.0-or-later (copyleft)"
 SCRIPT_LICENSE_URL="https://www.gnu.org/licenses/gpl-3.0.html"
@@ -3106,12 +3106,12 @@ _write_health_problems_file() {
             esac
         done
     } > "$_tmp" 2>/dev/null
-    if [ "$_count" -gt 0 ]; then
-        mv "$_tmp" "$_f" || { rm -f "$_tmp"; return 1; }
-        chmod 0644 "$_f" 2>/dev/null || true
-    else
-        rm -f "$_tmp" "$_f" 2>/dev/null || true
-    fi
+    # Always publish the sidecar (even when 0 problems) so cmd_status /
+    # cmd_disks can show "[ OK ] ... last check: <timestamp>" instead
+    # of "[WARN] no recent check". The grep for '^## ' in the readers
+    # still returns 0 when there are no problem blocks.
+    mv "$_tmp" "$_f" || { rm -f "$_tmp"; return 1; }
+    chmod 0644 "$_f" 2>/dev/null || true
 }
 
 # Count open problems by reading the sidecar. Returns the count via stdout.
@@ -3121,15 +3121,81 @@ _health_problems_count() {
     grep -c '^## ' "$_f" 2>/dev/null || echo 0
 }
 
-# Intro banner at the TOP of cmd_status / cmd_disks output. Silent
-# when there are no open problems.
+# Count open problems directly from state.db (the authoritative store
+# that health writes to). Only readable as root (mode 0600). Returns
+# the count on stdout, or empty when state.db is unreadable.
+_state_db_problem_count() {
+    [ -n "${STATE_FILE:-}" ] || return 0
+    [ -r "$STATE_FILE" ] || return 0
+    awk -F'|' '
+        /^#/ { next }
+        NF>=1 && $1 != "" { n++ }
+        END { print n+0 }
+    ' "$STATE_FILE" 2>/dev/null
+}
+
+# Health-status banner at the TOP of cmd_status / cmd_disks output.
+# Always emits exactly one of:
+#   [ OK ]  N==0, sidecar exists  -> green confirmation + last-check time
+#   [WARN]  N==0, sidecar missing -> yellow "no recent check" + how to run
+#   >>>     N>0                   -> yellow problem-count, points to detail
+#   [!!!]   sidecar/state.db disagree (root only) -> red discrepancy error
+# The detail block (_health_problems_detail) only emits when N>0; together
+# they frame the surrounding command's output.
 _health_problems_intro() {
-    _n=$(_health_problems_count)
-    [ "${_n:-0}" -gt 0 ] || return 0
-    printf '%s>>>  %d open my-appleRAID health problem(s) detected.%s\n' \
-        "${C_YELLOW:-}" "$_n" "${C_RESET:-}"
-    printf '     Details at the END of this output (or run: %s health -V).\n' "$SCRIPT_NAME"
-    printf '     Sidecar:  %s\n\n' "$(_health_problems_file)"
+    _side=$(_health_problems_count)
+    _db=""
+    if [ "$(id -u 2>/dev/null)" = "0" ]; then
+        _db=$(_state_db_problem_count)
+    fi
+
+    # Discrepancy check (root only). The two should ALWAYS agree because
+    # the sidecar is rewritten from state.db at the tail of every health
+    # pass. A mismatch flags a malformed health run.
+    if [ -n "$_db" ] && [ "$_db" != "$_side" ]; then
+        printf '%s[!!!] my-appleRAID health: SIDECAR / STATE-DB DISCREPANCY%s\n' \
+            "${C_RED:-}" "${C_RESET:-}"
+        printf '      sidecar count:  %s  (%s)\n' \
+            "$_side" "$(_health_problems_file)"
+        printf '      state-db count: %s  (%s)\n' \
+            "$_db" "$STATE_FILE"
+        printf '      They should always agree - sidecar is written from\n'
+        printf '      state.db at the end of every health pass. A mismatch\n'
+        printf '      usually means a previous health run died after\n'
+        printf '      updating state.db but before rewriting the sidecar.\n'
+        printf '      Fix: sudo %s health    (re-runs and refreshes both)\n\n' \
+            "$SCRIPT_NAME"
+        return 0
+    fi
+
+    _n=$_side
+    _f=$(_health_problems_file)
+    _last=""
+    if [ -f "$_f" ]; then
+        _last=$(awk '/^# Generated:/ {sub(/^# Generated:[[:space:]]*/, ""); print; exit}' "$_f")
+    fi
+
+    if [ "${_n:-0}" -gt 0 ]; then
+        printf '%s>>>  %d open my-appleRAID health problem(s) detected.%s\n' \
+            "${C_YELLOW:-}" "$_n" "${C_RESET:-}"
+        printf '     Details at the END of this output (or run: %s health -V).\n' \
+            "$SCRIPT_NAME"
+        printf '     Sidecar:  %s%s\n\n' \
+            "$_f" "${_last:+  (generated: $_last)}"
+        return 0
+    fi
+
+    # No open problems. Distinguish "checked recently and clean" from
+    # "no sidecar at all" (daemon not running, fresh install, etc.).
+    if [ -f "$_f" ]; then
+        printf '%s[ OK ] my-appleRAID health: 0 open problems%s%s\n\n' \
+            "${C_GREEN:-}" "${_last:+  (last check: $_last)}" "${C_RESET:-}"
+    else
+        printf '%s[WARN] my-appleRAID health: no recent health check (sidecar missing).%s\n' \
+            "${C_YELLOW:-}" "${C_RESET:-}"
+        printf '       Run:  sudo %s health    (to populate %s)\n\n' \
+            "$SCRIPT_NAME" "$_f"
+    fi
 }
 
 # Detail block at the BOTTOM of cmd_status / cmd_disks output.
