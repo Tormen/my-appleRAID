@@ -1491,57 +1491,68 @@ baseline_write_sets() {
     } > "$f"
 }
 
-# Pick the best stable identifier for a physical disk, tagged with its
-# source so we know how to match it back later. Tags, in priority order:
+# Identifier policy.
 #
-#   SN:<serial>             ATA/SATA/NVMe IDENTIFY serial number.
-#                           Strongest: stable across reboots, replugs,
-#                           hub swaps, AND reformats - the serial is
-#                           baked into the drive firmware.
-#   PART:<gpt-uuid>         GPT partition entry GUID of the disk's main
-#                           data partition (first non-EFI, non-Apple_Boot
-#                           partition). Baked into the partition table
-#                           on disk, so it travels with the disk across
-#                           reboots, replugs, and hub swaps. Lost only
-#                           on a full reformat (partition table rewrite).
-#                           Used when SN is unavailable - typically
-#                           USB-SAT bridges that don't pass IDENTIFY
-#                           through.
-#   USB:<srl>:<bytes>       Bridge serial PLUS size-in-bytes. Used only
-#                           if the disk has no GPT data partition (raw,
-#                           wiped, or non-GPT scheme). Stable across
-#                           replug; ambiguous if two identically-sized
-#                           disks share the same multi-bay enclosure.
-#   VOL:<uuid>              Volume UUID of the first mounted partition.
-#                           Last resort - lost on volume recreation
-#                           even when the GPT survives.
+# On-disk tag types (recorded into baseline-disks):
+#   SN:<serial>      ATA/SATA/NVMe IDENTIFY serial. Burned into drive
+#                    firmware. Stable across reboots, replugs, hub swaps,
+#                    and reformats.
+#   PART:<gpt-uuid>  GPT partition entry GUID of the disk's main data
+#                    partition (first non-EFI, non-Apple_Boot partition).
+#                    Written into the partition table on disk. Stable
+#                    across reboots/replugs; invalidated only by a
+#                    partition-table rewrite.
 #
-# Empty output means the disk has no stable identifier and cannot be
-# baselined; the caller should skip it with a warning.
+# Bus-info identifiers (USB bridge serial, Volume UUID) are intentionally
+# NOT used: the bridge serial belongs to the enclosure, not the disk,
+# and a Volume UUID is filesystem-level and changes on reformat. Either
+# would generate false-missing alerts when the disk is moved between
+# enclosures or its volumes are recreated.
+#
+# Multi-tag model:
+#   - At baseline write time we record EVERY readable on-disk identifier
+#     per disk (always). Lines in baseline-disks can therefore carry
+#     multiple whitespace-separated tags before the '#' comment.
+#   - At match time, an entry is "present" if ANY of its recorded tags
+#     matches ANY currently-readable tag of any attached disk; "missing"
+#     if every tag in the entry fails to match every tag of every
+#     attached disk.
+#   - This makes presence detection robust against single-identifier
+#     flux (e.g. smartctl availability changing, a partition being
+#     rewritten while the disk's firmware identifiers remain) without
+#     auto-rebasing the baseline.
 # ----------------------------------------------------------------------
 # bsd -> tagged-id cache (process-wide, file-backed).
 #
-# Computing a stable id for a disk hits disk_serial (smartctl), then
-# diskutil for GPT GUID, then `system_profiler SPUSBDataType`. The
-# last one is the slow one - hundreds of ms per call. cmd_baseline
-# previously called disk_baseline_id once per attached disk inside
-# baseline_write_disks AND once per (set, group, member) inside the
-# optsets-section renderer (via optional_spec_to_bsd ->
-# disk_for_baseline_id, which itself walks every attached disk
-# calling disk_baseline_id). With ~10 disks and ~5 optset specs that
-# is ~50 system_profiler invocations per `baseline` run.
+# Cache file format: one row per (bsd, tag) pair, in priority order
+# (SN: rows before PART: rows for the same disk):
+#   disk0|SN:C0714…
+#   disk0|PART:113FA7C2-…
+#   disk6|SN:Z0F0A2XLFWTG
+#   …
+# A disk with no readable identifier gets one row: bsd|__NONE__.
 #
-# Solution: populate a file-backed cache once per process. The file
-# is plain "<bsd>|<id-or-__NONE__>" lines, so subshell-spawned
-# pipelines (e.g. `... | while read`) can read it too - in-memory
-# variables would be lost across the pipe. cmd_baseline,
-# cmd_baseline_optsets, cmd_disks, and cmd_health all populate the
-# cache early; trap removes the file on exit.
+# Lookup modes (both use a single awk pass over the file):
+#   - "bsd -> preferred tag":  awk '$1 == b { print $2; exit }'
+#       returns the first row's tag for that bsd = the highest-priority
+#       tag the disk currently presents. Used by disk_baseline_id for
+#       display and for writing the preferred tag into legacy single-tag
+#       baseline lines.
+#   - "tag -> bsd":  awk '$2 == t { print $1; exit }'
+#       any row whose tag column matches the target wins. Used by
+#       disk_for_baseline_id (the presence-check matcher).
+#
+# Computing identifiers hits smartctl and diskutil; a single process-wide
+# cache built once at startup amortizes the cost across baseline writes,
+# optset rendering, and presence checks. Callers prime the cache with
+# _diskid_cache_init early and clear it via trap.
 # ----------------------------------------------------------------------
 _DISKID_CACHE_FILE=""
 
 # Build the cache for every currently-attached physical disk. Idempotent:
 # returns immediately if the cache already exists.
+# Writes one row per (bsd, tag) pair, in priority order; a disk with no
+# readable identifier gets a single bsd|__NONE__ row.
 _diskid_cache_init() {
     if [ -n "${_DISKID_CACHE_FILE:-}" ] && [ -f "$_DISKID_CACHE_FILE" ]; then
         return 0
@@ -1549,11 +1560,24 @@ _diskid_cache_init() {
     [ -n "${STATE_DIR:-}" ] || return 1
     _DISKID_CACHE_FILE=$(mktemp "$STATE_DIR/.diskid-cache.XXXXXX" 2>/dev/null) \
         || { _DISKID_CACHE_FILE=""; return 1; }
-    list_all_physical_disks | while IFS= read -r _d; do
+    # list_all_physical_disks via tmpfile so the loop runs in the parent
+    # shell (avoids the cmd|while subshell trap when we accumulate state).
+    _tmp_disks=$(mktemp "$STATE_DIR/.diskid-disks.XXXXXX" 2>/dev/null) \
+        || { rm -f "$_DISKID_CACHE_FILE"; _DISKID_CACHE_FILE=""; return 1; }
+    list_all_physical_disks > "$_tmp_disks"
+    while IFS= read -r _d; do
         [ -n "$_d" ] || continue
-        _id=$(_disk_baseline_id_uncached "$_d" 2>/dev/null)
-        printf '%s|%s\n' "$_d" "${_id:-__NONE__}" >> "$_DISKID_CACHE_FILE"
-    done
+        _ids=$(_disk_all_baseline_ids_uncached "$_d" 2>/dev/null)
+        if [ -z "$_ids" ]; then
+            printf '%s|__NONE__\n' "$_d" >> "$_DISKID_CACHE_FILE"
+            continue
+        fi
+        printf '%s\n' "$_ids" | while IFS= read -r _id; do
+            [ -n "$_id" ] || continue
+            printf '%s|%s\n' "$_d" "$_id" >> "$_DISKID_CACHE_FILE"
+        done
+    done < "$_tmp_disks"
+    rm -f "$_tmp_disks"
 }
 
 _diskid_cache_clear() {
@@ -1585,25 +1609,28 @@ disk_baseline_id() {
     return $_rc
 }
 
-# Original implementation, renamed. Kept as an internal entry point
-# for the cache initializer (which populates the cache by walking
-# every disk) and as a fallback when cache hasn't been initialized.
-_disk_baseline_id_uncached() {
+# Emit EVERY readable on-disk identifier for a physical disk, one tag
+# per line in priority order:
+#   SN:<serial>      (if disk_serial succeeded)
+#   PART:<gpt-uuid>  (if disk has a GPT data partition with a readable UUID)
+# Returns 0 if at least one tag was emitted, 1 if neither was readable.
+# Bus identifiers (USB:, VOL:) are not emitted: enclosure/filesystem
+# scope, not disk scope.
+_disk_all_baseline_ids_uncached() {
     bsd="${1#/dev/}"
     [ -n "$bsd" ] || return 1
+    _emitted=0
 
-    # 1. ATA/NVMe serial via the existing disk_serial helper.
+    # 1. ATA/NVMe serial via disk_serial (smartctl + diskutil).
     s=$(disk_serial "$bsd" 2>/dev/null)
     if [ -n "$s" ]; then
         echo "SN:$s"
-        return 0
+        _emitted=1
     fi
 
-    # 2. GPT partition entry GUID of the disk's main data partition.
-    #    The GUID is baked into the partition table at format time and
-    #    travels with the disk regardless of which port it lands on.
-    #    We pick the first partition that isn't a macOS-template EFI
-    #    or Apple_Boot, and isn't the whole-disk "scheme" pseudo-entry.
+    # 2. GPT partition entry GUID of the disk's main data partition
+    #    (first non-EFI, non-Apple_Boot partition). Written into the
+    #    partition table on disk; travels with the disk across replug.
     main_part=$(diskutil list "/dev/$bsd" 2>/dev/null | awk '
         NR > 2 && /^[[:space:]]+[0-9]+:/ {
             ident = $NF
@@ -1623,62 +1650,21 @@ _disk_baseline_id_uncached() {
             | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
         if [ -n "$s" ]; then
             echo "PART:$s"
-            return 0
+            _emitted=1
         fi
     fi
 
-    # 3. USB bridge serial + size-in-bytes. system_profiler SPUSBDataType
-    #    groups disks under their bridge, with the bridge's "Serial
-    #    Number" appearing above the BSD Name(s) it owns. Take the most
-    #    recent non-trivial "Serial Number:" line that precedes "BSD
-    #    Name: <bsd>". Size is appended so two different disks in the
-    #    same multi-bay enclosure don't collide on the same USB id.
-    s=$(system_profiler SPUSBDataType 2>/dev/null | awk -v target="$bsd" '
-        /Serial Number:/ {
-            line = $0
-            sub(/^[[:space:]]*Serial Number:[[:space:]]*/, "", line)
-            sub(/[[:space:]]+$/, "", line)
-            # Skip obvious placeholder values that hubs report.
-            if (line ~ /^0+$/ || line == "") next
-            recent = line
-        }
-        /BSD Name:/ {
-            line = $0
-            sub(/^[[:space:]]*BSD Name:[[:space:]]*/, "", line)
-            sub(/[[:space:]]+$/, "", line)
-            if (line == target && recent != "") {
-                print recent
-                exit
-            }
-        }
-    ')
-    if [ -n "$s" ]; then
-        bytes=$(disk_size_bytes "/dev/$bsd" 2>/dev/null)
-        if [ -n "$bytes" ]; then
-            echo "USB:$s:$bytes"
-        else
-            # Size unreadable - emit unsuffixed (will collide with
-            # any same-bridge sibling but better than nothing).
-            echo "USB:$s"
-        fi
-        return 0
-    fi
-
-    # 3. Volume UUID of any mounted partition on this disk.
-    s=$(diskutil info "/dev/${bsd}s1" 2>/dev/null \
-        | awk -F': +' '/Volume UUID:/ {print $2; exit}' \
-        | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
-    if [ -z "$s" ]; then
-        s=$(diskutil info "/dev/${bsd}s2" 2>/dev/null \
-            | awk -F': +' '/Volume UUID:/ {print $2; exit}' \
-            | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
-    fi
-    if [ -n "$s" ]; then
-        echo "VOL:$s"
-        return 0
-    fi
-
+    [ "$_emitted" = "1" ] && return 0
     return 1
+}
+
+# Single-tag accessor: emit the highest-priority readable tag (SN
+# preferred, PART fallback). Used by callers that need ONE id for
+# display or for writing the preferred tag into a legacy single-tag
+# baseline line. New code should prefer reading the multi-row cache
+# directly via disk_for_baseline_id.
+_disk_baseline_id_uncached() {
+    _disk_all_baseline_ids_uncached "$1" 2>/dev/null | head -n 1
 }
 
 # Write the currently-attached physical disks to the baseline file,
@@ -1750,30 +1736,42 @@ baseline_write_disks() {
 # Map a tagged baseline id back to the currently-attached /dev/diskN
 # node, or empty if no current disk matches. Used by the presence
 # check.
+#
+# Multi-tag aware: the target tag matches if ANY attached disk currently
+# presents it (under any of its readable identifier types).
 disk_for_baseline_id() {
     target="$1"
     [ -n "$target" ] || return 1
-    # Cache fast-path: read the bsd column for the row whose tagged-id
-    # matches the target. ~1ms vs ~hundreds of ms for the slow path.
+    # Cache fast-path: with one row per (bsd, tag), this awk naturally
+    # finds the bsd whose tag column equals the target, regardless of
+    # whether the target is SN: / PART: / etc.
     if [ -n "${_DISKID_CACHE_FILE:-}" ] && [ -f "$_DISKID_CACHE_FILE" ]; then
         _hit=$(awk -F'|' -v t="$target" '$2==t {print $1; exit}' "$_DISKID_CACHE_FILE")
         if [ -n "$_hit" ]; then
             echo "$_hit"
             return 0
         fi
+        # Cache primed but target not present = genuinely not attached.
         return 1
     fi
-    # Slow path: cache uninitialized. Walk all disks and compute their
-    # ids one at a time. disk_baseline_id will memoize each, so a
-    # subsequent call is fast even without explicit init.
-    list_all_physical_disks | while IFS= read -r d; do
+    # Slow path: cache uninitialized. Walk all disks, enumerate ALL
+    # their readable tags, match any of them against the target.
+    _tmp_dl=$(mktemp "${STATE_DIR:-/tmp}/.disk-for-id.XXXXXX" 2>/dev/null) || return 1
+    list_all_physical_disks > "$_tmp_dl"
+    _found=""
+    while IFS= read -r d; do
         [ -n "$d" ] || continue
-        cur=$(disk_baseline_id "$d" 2>/dev/null)
-        if [ "$cur" = "$target" ]; then
-            echo "$d"
-            return 0
+        if _disk_all_baseline_ids_uncached "$d" 2>/dev/null | grep -qxF "$target"; then
+            _found="$d"
+            break
         fi
-    done
+    done < "$_tmp_dl"
+    rm -f "$_tmp_dl"
+    if [ -n "$_found" ]; then
+        echo "$_found"
+        return 0
+    fi
+    return 1
 }
 
 # ----------------------------------------------------------------------
