@@ -83,7 +83,7 @@ SCRIPT_NAME="$(basename "$0")"
 # subcommand updates SCRIPT_COMMIT to the current HEAD sha and
 # amends - run it as the last step before deploying.
 SCRIPT_VERSION="v8.1"
-SCRIPT_COMMIT="23ab99e"
+SCRIPT_COMMIT="fa0607a"
 SCRIPT_COPYRIGHT="Copyright (C) 2026 Tormen <tormen@mail.ch>"
 SCRIPT_LICENSE_SHORT="GPL-3.0-or-later (copyleft)"
 SCRIPT_LICENSE_URL="https://www.gnu.org/licenses/gpl-3.0.html"
@@ -3118,7 +3118,11 @@ _write_health_problems_file() {
 _health_problems_count() {
     _f=$(_health_problems_file)
     [ -f "$_f" ] || { echo 0; return 0; }
-    grep -c '^## ' "$_f" 2>/dev/null || echo 0
+    # Use awk, not `grep -c ... || echo 0`. grep -c PRINTS the count
+    # AND exits 1 when there are zero matches, so the `|| echo 0`
+    # fallback duplicates the output to "0\n0" - which then breaks
+    # the `[ -gt 0 ]` test in callers with "Illegal number: 0".
+    awk '/^## / { n++ } END { print n+0 }' "$_f" 2>/dev/null
 }
 
 # Count open problems directly from state.db (the authoritative store
