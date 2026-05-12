@@ -528,6 +528,123 @@ surface every transition.
 
 ---
 
+## Disk identifier tracking — `baseline` + `DISK_ID_MATCH`
+
+To detect a disk going missing (vs. a temporary replug), my-appleRAID
+keeps a baseline of every disk it expects to see, identified by
+**on-disk** identifiers that survive reboot, replug, and enclosure
+swaps. Bus-info identifiers (USB bridge serial, Volume UUID) are
+deliberately NOT used — they belong to the enclosure or filesystem,
+not the disk.
+
+### Identifier types
+
+| Tag | Source | Stable across |
+|-----|--------|---------------|
+| `SN:<serial>`     | ATA/NVMe IDENTIFY Serial Number via `smartctl -i` | reboot, replug, reformat |
+| `WWN:<hex>`       | ATA LU WWN / NVMe EUI-64 / NGUID via `smartctl -i` | reboot, replug, reformat |
+| `PART:<gpt-uuid>` | GPT partition entry GUID of the main data partition (`diskutil info`) | reboot, replug; lost on partition-table rewrite |
+| `MBRSIG:<8-hex>`  | MBR disk signature at byte 0x1B8 (auto-selected for non-GPT disks) | reboot, replug; lost on MBR rewrite |
+
+Each line in `baseline-disks` records **every** identifier readable
+at baseline-write time. Example after running `baseline --update --disks`:
+
+```
+SN:Z0F0A2XLFWTG WWN:5000039a98cbc38b PART:8299CB9A-A410-4EB3-843E-ACA554D91840 # disk6  16.0 TB  TOSHIBA MG08ACA16TE
+```
+
+### `DISK_ID_MATCH` — required config
+
+A required config variable that decides which identifiers must match
+for a baselined disk to count as present at `health` time. Grammar:
+
+```
+DISK_ID_MATCH = ALL | spec (,spec)*
+spec          = LETTER  |  ONE-OF(LETTER,LETTER,...)
+LETTER        = S | W | P
+```
+
+- `S` = SN, `W` = WWN, `P` = PART (or MBRSIG, depending on the disk).
+- Top-level commas mean **AND**.
+- Letters inside `ONE-OF(...)` mean **OR**.
+- `ALL` is shorthand for "every recorded identifier must match" (strictest).
+
+The matcher operates on **whatever tags are recorded** in the baseline
+line: a line written under an old release with only PART still matches
+when the policy can be satisfied by PART; a line with all three tags
+survives any single-identifier loss.
+
+Examples:
+
+| Setting | Meaning |
+|---------|---------|
+| `ONE-OF(S,W,P)`  | At least one of SN/WWN/PART matches. Most lenient. |
+| `ONE-OF(S,W),P`  | (SN or WWN) AND PART. Recommended default — catches in-place repartitions while tolerating smartctl flux. |
+| `S`              | SN must match. Strict; fragile to smartctl/permission flux. |
+| `S,P`            | Both SN and PART must match. Paranoid. |
+| `ALL`            | Every recorded identifier must match. |
+
+Missing or invalid `DISK_ID_MATCH` causes `cfg_load` to error out and
+abort — there is no implicit default in the code path. Pick a value
+in your config; the `--create-config` template suggests `ONE-OF(S,W),P`.
+
+### `baseline` subcommand UX
+
+```
+my-appleRAID baseline                          # show recorded baseline (read-only)
+my-appleRAID baseline --update                 # refresh sets+disks (+ interactive optsets)
+my-appleRAID baseline --update --sets          # restrict to RAID set baseline
+my-appleRAID baseline --update --disks         # restrict to disk baseline
+my-appleRAID baseline --update --optsets       # interactive OPTIONAL_DISK_SETS manager
+my-appleRAID baseline --diff                   # preview what --update would change
+my-appleRAID baseline --raw                    # cat baseline.raw (forensic snapshot)
+my-appleRAID baseline --diff --raw             # unified diff of forensic snapshot
+```
+
+`baseline --update --disks` writes both `baseline-disks` (the
+tagged-id file the matcher reads) and `baseline.raw` (a per-disk
+forensic dump of `diskutil info`, `diskutil list`, `smartctl -i`,
+`smartctl -a` with the exact command line above each block — useful
+when investigating an alert or comparing pre/post a hardware change).
+
+The interactive optsets manager prompts before launching when
+`baseline --update` is run with no scope flags; it auto-skips when
+stdin is not a TTY (daemon path).
+
+### Sidecar: `health.problems.txt` + banners in `status`/`disks`
+
+When `health` finishes a pass with open problems, it writes a
+world-readable digest to `$STATE_DIR/health.problems.txt`. Each
+problem block:
+
+```
+## [crit] Expected disk with id 'SN:X PART:Y' is NOT attached
+First seen:    2026-05-12T06:17:16+0200
+Recorded tags:    SN:X PART:Y
+Member of:        AppleRAID set 'backup'
+Baselined as:     /dev/disk6, 16.0 TB, TOSHIBA MG08ACA16TE
+First missing:    2026-05-12 06:17:16 CEST  (3h 42m ago)
+Active policy:    DISK_ID_MATCH="ONE-OF(S,W),P"
+
+Possible reasons:
+  - ...
+  - ...
+
+Verify:
+  diskutil list
+  my-appleRAID disks
+  my-appleRAID baseline --diff
+  my-appleRAID baseline --diff --raw
+```
+
+`my-appleRAID disks` and `my-appleRAID status` show a one-line
+**intro banner at the top** and the **full detail block at the
+bottom** whenever this file exists — designed so a clean run shows
+no banner (silent when healthy) and a problem run is impossible to
+miss on a scroll.
+
+---
+
 ## Test harnesses
 
 Two scripts live in `tests/`:

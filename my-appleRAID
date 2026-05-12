@@ -82,8 +82,8 @@ SCRIPT_NAME="$(basename "$0")"
 # the commit they were built from. The companion 'stamp-version'
 # subcommand updates SCRIPT_COMMIT to the current HEAD sha and
 # amends - run it as the last step before deploying.
-SCRIPT_VERSION="v7.5"
-SCRIPT_COMMIT="1a19590"
+SCRIPT_VERSION="v7.6"
+SCRIPT_COMMIT="3bd4397"
 SCRIPT_COPYRIGHT="Copyright (C) 2026 Tormen <tormen@mail.ch>"
 SCRIPT_LICENSE_SHORT="GPL-3.0-or-later (copyleft)"
 SCRIPT_LICENSE_URL="https://www.gnu.org/licenses/gpl-3.0.html"
@@ -2621,8 +2621,8 @@ list_all_physical_disks() {
 #
 # Three-level structure:
 #
-#   DISK          one physical disk, identified by stable id (SN:/PART:/
-#                 USB:/VOL:) or bare disk-node name.
+#   DISK          one physical disk, identified by stable id (SN:/WWN:/
+#                 PART:/MBRSIG:) or bare disk-node name.
 #   GROUP         named bundle of disks. Rule (a): if ANY member is
 #                 present, ALL members must be present (no partial group).
 #   SET           named collection of GROUPs (a "rotation"). Rule (b):
@@ -2644,8 +2644,8 @@ list_all_physical_disks() {
 # preserved exactly: rule (b) "across the whole list" was a single
 # implicit set.
 #
-# A <disk-spec> may be a tagged baseline id (SN:..., PART:..., USB:...,
-# VOL:...) OR a bare disk-node form (disk7, /dev/disk7, 7). Tagged ids
+# A <disk-spec> may be a tagged baseline id (SN:..., WWN:..., PART:...,
+# MBRSIG:...) OR a bare disk-node form (disk7, /dev/disk7, 7). Tagged ids
 # are STRONGLY preferred for rotation use cases since the bsd shuffles
 # across replug/reboot.
 #
@@ -4153,6 +4153,49 @@ MISSING_DISK_SEVERITY=crit
 MISSING_DISK_GRACE_PERIOD=5m
 
 
+# --- Disk identifier matching (DISK_ID_MATCH) -----------------------
+#
+# Required. Decides which on-disk identifiers must match for a
+# baselined disk to count as present. Operates on the multi-tag
+# entries written by 'baseline --update --disks' (each line records
+# every readable identifier; the matcher then evaluates this policy).
+#
+# Letters (single character codes used in the grammar below):
+#   S   SN:    ATA/NVMe firmware serial. Stable across
+#              reboot/replug/reformat. Requires smartctl + root.
+#   W   WWN:   LU WWN / NVMe EUI-64 / NGUID. Firmware-burned,
+#              separate field from SN; some bridges expose one
+#              but not the other.
+#   P   PART:  GPT partition entry GUID (for GPT-partitioned disks)
+#       /MBRSIG: MBR disk signature (for BIOS-style disks).
+#              On-disk; stable until partition table is rewritten.
+#
+# Grammar:
+#     DISK_ID_MATCH = ALL | spec ( "," spec )*
+#     spec          = LETTER  |  "ONE-OF(" LETTER ( "," LETTER )+ ")"
+#     LETTER        = S | W | P
+#
+# Top-level commas mean AND. Letters inside ONE-OF(...) mean OR.
+# 'ALL' = every recorded identifier must match (strictest).
+#
+# Examples:
+#   DISK_ID_MATCH="ONE-OF(S,W,P)"  - present if ANY recorded id matches.
+#                                    Most lenient: survives smartctl
+#                                    flux AND partition rewrites.
+#   DISK_ID_MATCH="ONE-OF(S,W),P"  - (SN or WWN) AND PART. Recommended
+#                                    default: catches in-place
+#                                    repartitions while tolerating
+#                                    single-firmware-reader failures.
+#   DISK_ID_MATCH="S"              - SN must match. Strict; fragile to
+#                                    smartctl/permission flux.
+#   DISK_ID_MATCH="S,P"            - both SN and PART must match. Paranoid.
+#   DISK_ID_MATCH="ALL"            - every recorded id must match.
+#
+# Failure mode: missing from config OR fails to parse -> hard error
+# at cfg_load. Pick a value explicitly; there is no implicit default.
+DISK_ID_MATCH="ONE-OF(S,W),P"
+
+
 # --- Optional disk sets (SETs of GROUPs of DISKs) -------------------
 #
 # WHEN TO USE THIS:
@@ -4171,8 +4214,9 @@ MISSING_DISK_GRACE_PERIOD=5m
 #
 # THREE LEVELS:
 #
-#   DISK    one physical disk, identified by stable id (SN:/PART:/USB:/
-#           VOL:) or bare disk-node name.
+#   DISK    one physical disk, identified by stable id (SN:/WWN:/PART:/
+#           MBRSIG:) or bare disk-node name. See DISK_ID_MATCH above
+#           for what each identifier represents.
 #   GROUP   a named bundle of disks (e.g. a mirror pair). Rule (a):
 #           if ANY member of the group is currently present, ALL members
 #           must be present together (no partial group attached).
@@ -4194,11 +4238,10 @@ MISSING_DISK_GRACE_PERIOD=5m
 #
 # A disk-spec may be a tagged baseline id (preferred for rotation):
 #
-#     SN:<serial>     - ATA/NVMe serial. Stable across reboot/replug.
-#     PART:<gpt-uuid> - GPT partition entry GUID. Stable, baked into
-#                       partition table.
-#     USB:<srl>:<bytes> - USB bridge serial + size in bytes.
-#     VOL:<uuid>      - Volume UUID (last resort).
+#     SN:<serial>      - ATA/NVMe firmware serial.
+#     WWN:<hex>        - LU WWN / NVMe EUI-64 / NGUID.
+#     PART:<gpt-uuid>  - GPT partition entry GUID.
+#     MBRSIG:<8-hex>   - MBR disk signature (non-GPT disks).
 #
 # ...or a bare disk-node form (disk7, /dev/disk7) - TRANSIENT, may
 # match a different physical disk after replug. Run 'appleRAID disks'
