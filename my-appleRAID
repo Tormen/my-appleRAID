@@ -1452,29 +1452,37 @@ baseline_read_sets() {
     awk 'NF>0 && !/^#/ {print}' "$f"
 }
 
-# Read the disk baseline. Returns one serial per line (the first
-# whitespace-separated token of each non-comment line). Lines whose
-# first token still looks like a /dev/diskN node are flagged as a
-# legacy baseline that needs re-baselining via 'appleRAID baseline
-# --disks'.
+# Read the disk baseline. Each line in baseline-disks is one entry,
+# possibly multi-tag (e.g. "SN:X PART:Y # disk0 ..."). Returns the
+# FULL pre-'#' content of each non-comment line, trimmed - one entry
+# per output line, whitespace-separated tags within an entry. Callers
+# that want only the first tag should pipe to `awk '{print $1}'`.
 baseline_read_disks() {
     f=$(baseline_disks_file)
     [ -f "$f" ] || return 0
-    awk 'NF>0 && !/^#/ { print $1 }' "$f"
+    awk '
+        NF>0 && !/^#/ {
+            sub(/[[:space:]]*#.*$/, "")
+            sub(/^[[:space:]]+/, "")
+            sub(/[[:space:]]+$/, "")
+            if (length($0) > 0) print
+        }
+    ' "$f"
 }
 
-# True if the baseline file appears to be in any pre-tagged format
-# (legacy disk-node names like "disk2", or earlier serial-only entries
-# without a SN:/USB:/VOL: tag). Used to nudge the user to rebaseline
-# after the upgrade that switched to tagged stable identifiers.
+# True if the baseline file appears to be in a pre-tagged format
+# (legacy disk-node names like "disk2", or any line whose first token
+# is not one of the supported tag types). Used to nudge the user to
+# rebaseline after the upgrade that switched to tagged stable
+# identifiers.
 baseline_disks_is_legacy() {
     f=$(baseline_disks_file)
     [ -f "$f" ] || return 1
     first=$(awk 'NF>0 && !/^#/ { print $1; exit }' "$f")
     [ -n "$first" ] || return 1
     case "$first" in
-        SN:*|PART:*|USB:*|VOL:*) return 1 ;;
-        *)                       return 0 ;;
+        SN:*|WWN:*|PART:*|MBRSIG:*) return 1 ;;
+        *)                          return 0 ;;
     esac
 }
 
@@ -1704,14 +1712,16 @@ _disk_baseline_id_uncached() {
     _disk_all_baseline_ids_uncached "$1" 2>/dev/null | head -n 1
 }
 
-# Write the currently-attached physical disks to the baseline file,
-# keyed by their best stable identifier. Format per non-comment line:
+# Write the currently-attached physical disks to the baseline file.
+# Each line records EVERY readable on-disk identifier for the disk,
+# whitespace-separated, before a trailing '# <bsd>  <size>  <model>'
+# human-hint comment.
 #
-#   <tagged-id>    # <bsd-at-baseline>  <model>
+#   <tag1> [<tag2> ...]    # <bsd-at-baseline>  <size>  <model>
 #
-# tagged-id is one of  SN:<serial> | USB:<bridge-serial> | VOL:<uuid>
-# (see disk_baseline_id). Disks for which none of those is discoverable
-# are skipped with a warning.
+# Tags are SN:/WWN:/PART:/MBRSIG:. Disks where no tag is readable
+# are skipped with a warning; baseline integrity requires at least
+# one on-disk identifier.
 baseline_write_disks() {
     f=$(baseline_disks_file)
     {
@@ -1719,33 +1729,54 @@ baseline_write_disks() {
         echo "# Written: $(now_iso)"
         echo "# Update with: appleRAID baseline --disks"
         echo "#"
-        echo "# Format: <tagged-id>  # <bsd-at-baseline>  <size>  <model>"
-        echo "# The tagged-id is the stable identifier we match against."
-        echo "# Tags:"
-        echo "#   SN:                ATA/NVMe IDENTIFY serial. Preferred, fully stable."
-        echo "#   PART:              GPT partition entry GUID of the disk's main data"
-        echo "#                      partition (first non-EFI, non-Apple_Boot). Baked"
-        echo "#                      into the partition table on disk; survives reboot,"
-        echo "#                      replug, hub swap. Lost only on full reformat."
-        echo "#   USB:<srl>:<bytes>  USB bridge serial + disk size in bytes. Used only"
-        echo "#                      when neither SN nor PART is available (raw or"
-        echo "#                      non-GPT disks behind a USB bridge). Size is"
-        echo "#                      appended so two disks in a multi-bay enclosure"
-        echo "#                      don't collide on the same bridge serial."
-        echo "#   VOL:               Volume UUID of first partition. Last resort,"
-        echo "#                      stable per-filesystem, lost on volume recreation."
-        echo "# The bsd (/dev/diskN node), size, and model in the comment"
-        echo "# are human hints. The bsd may shuffle on replug; size and"
-        echo "# model are intrinsic to the disk and stay stable."
+        echo "# Format: <tag> [<tag> ...]  # <bsd-at-baseline>  <size>  <model>"
+        echo "#"
+        echo "# Each line records every on-disk identifier readable at"
+        echo "# baseline-write time. The matcher (controlled by DISK_ID_MATCH)"
+        echo "# evaluates these tags against currently-attached disks."
+        echo "#"
+        echo "# Tag types:"
+        echo "#   SN:<serial>      ATA/NVMe IDENTIFY serial. Firmware-burned."
+        echo "#                    Stable across reboot/replug/reformat."
+        echo "#                    Requires smartctl + raw-device access (root)."
+        echo "#   WWN:<hex>        ATA LU WWN / NVMe EUI-64 / NGUID."
+        echo "#                    Firmware-burned, separate field from SN."
+        echo "#                    Some USB bridges expose one but not the other."
+        echo "#   PART:<gpt-uuid>  GPT partition entry GUID of the disk's main"
+        echo "#                    data partition (first non-EFI, non-Apple_Boot)."
+        echo "#                    Written into the partition table on disk."
+        echo "#                    Stable across replug; invalidated only by a"
+        echo "#                    partition-table rewrite."
+        echo "#   MBRSIG:<8-hex>   MBR disk signature (byte 0x1B8). Used for"
+        echo "#                    BIOS-style (FDisk_partition_scheme) disks"
+        echo "#                    where GPT is absent."
+        echo "#"
+        echo "# The bsd / size / model fields in the trailing comment are"
+        echo "# human hints. bsd may shuffle on replug; size and model are"
+        echo "# intrinsic to the disk and stay stable."
         # Pre-compute the set of optset specs so the per-disk filter
         # below is O(1) instead of re-running awk N times.
         _optspecs=""
         if [ -n "${OPTIONAL_DISK_SETS:-}" ]; then
             _optspecs=$(optional_sets_all_specs)
         fi
-        list_all_physical_disks | while IFS= read -r d; do
+        # Use the multi-row cache (one row per (bsd, tag)) so each disk's
+        # complete tag list comes from a single awk lookup.
+        _tmp_dl=$(mktemp "${STATE_DIR}/.baseline-write-disks.XXXXXX" 2>/dev/null)
+        list_all_physical_disks > "$_tmp_dl"
+        while IFS= read -r d; do
             [ -n "$d" ] || continue
-            id=$(disk_baseline_id "$d" 2>/dev/null)
+            # All readable tags for this disk, in priority order.
+            tags=""
+            if [ -n "${_DISKID_CACHE_FILE:-}" ] && [ -f "$_DISKID_CACHE_FILE" ]; then
+                tags=$(awk -F'|' -v b="$d" '
+                    $1==b && $2!="__NONE__" { printf "%s ", $2 }
+                ' "$_DISKID_CACHE_FILE" | sed 's/[[:space:]]*$//')
+            else
+                tags=$(_disk_all_baseline_ids_uncached "$d" 2>/dev/null \
+                    | awk 'NF>0 {printf "%s ", $0}' \
+                    | sed 's/[[:space:]]*$//')
+            fi
             model=$(diskutil info "/dev/$d" 2>/dev/null \
                 | awk -F': +' '/Device \/ Media Name:/ {print $2; exit}' \
                 | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
@@ -1753,20 +1784,29 @@ baseline_write_disks() {
                 | awk -F': +' '/Disk Size:/ {print $2; exit}' \
                 | awk '{print $1, $2}' \
                 | sed 's/[[:space:]]*$//')
-            if [ -z "$id" ]; then
-                log_warn "Skipping $d in baseline: no stable identifier discoverable (size: ${size:-unknown}, model: ${model:-unknown})"
+            if [ -z "$tags" ]; then
+                log_warn "Skipping $d in baseline: no stable identifier readable (size: ${size:-unknown}, model: ${model:-unknown})"
                 continue
             fi
-            # Skip if this id is governed by an optset: it's checked by
-            # the rotation rules (a)+(b), not the plain baseline-disks
-            # presence check. Listing it in both places is at best
-            # redundant and at worst confusing in 'baseline --show'.
-            if [ -n "$_optspecs" ] && printf '%s\n' "$_optspecs" | grep -qxF "$id"; then
-                log_debug "Skipping $d ($id) in baseline: member of OPTIONAL_DISK_SETS"
-                continue
+            # Skip if any tag is governed by an optset: presence of those
+            # disks is checked by the rotation rules (a)+(b), not the
+            # plain baseline-disks presence check.
+            if [ -n "$_optspecs" ]; then
+                _is_optset=0
+                for t in $tags; do
+                    if printf '%s\n' "$_optspecs" | grep -qxF "$t"; then
+                        _is_optset=1
+                        break
+                    fi
+                done
+                if [ "$_is_optset" = "1" ]; then
+                    log_debug "Skipping $d ($tags) in baseline: member of OPTIONAL_DISK_SETS"
+                    continue
+                fi
             fi
-            printf '%-24s # %-7s %-9s %s\n' "$id" "$d" "${size:-?}" "${model:-?}"
-        done
+            printf '%-44s # %-7s %-9s %s\n' "$tags" "$d" "${size:-?}" "${model:-?}"
+        done < "$_tmp_dl"
+        rm -f "$_tmp_dl"
     } > "$f"
 }
 
@@ -1998,15 +2038,26 @@ handle_resolved() {
 
     still_missing=0
 
-    # disk-missing, tagged-id form.
+    # disk-missing, tagged-id form. sub may carry MULTIPLE
+    # whitespace-separated tags (multi-tag baseline entry); the disk is
+    # considered re-attached if ANY of those tags resolves now.
     case "$summary" in
         "Expected disk with id '"*)
             sub=${summary#Expected disk with id \'}
             sub=${sub%%\'*}
             if [ -n "$sub" ]; then
-                if ! cur=$(disk_for_baseline_id "$sub") || [ -z "$cur" ]; then
-                    still_missing=1
-                fi
+                _any_present=0
+                for _t in $sub; do
+                    case "$_t" in
+                        SN:*|WWN:*|PART:*|MBRSIG:*) ;;
+                        *) continue ;;
+                    esac
+                    if cur=$(disk_for_baseline_id "$_t") && [ -n "$cur" ]; then
+                        _any_present=1
+                        break
+                    fi
+                done
+                [ "$_any_present" = "1" ] || still_missing=1
             fi
             ;;
     esac
@@ -2019,7 +2070,7 @@ handle_resolved() {
             sub=${summary#Expected disk /dev/}
             sub=${sub% is NOT attached}
             case "$sub" in
-                SN:*|PART:*|USB:*|VOL:*)
+                SN:*|WWN:*|PART:*|MBRSIG:*)
                     if ! cur=$(disk_for_baseline_id "$sub") || [ -z "$cur" ]; then
                         still_missing=1
                     fi
@@ -2427,7 +2478,7 @@ optional_spec_to_bsd() {
     _s="$1"
     [ -n "$_s" ] || return 0
     case "$_s" in
-        SN:*|PART:*|USB:*|VOL:*)
+        SN:*|WWN:*|PART:*|MBRSIG:*)
             disk_for_baseline_id "$_s"
             ;;
         *)
@@ -2446,12 +2497,19 @@ optional_set_for_bsd() {
     _b="${1#/dev/}"
     [ -n "$_b" ] || return 0
     [ -n "${OPTIONAL_DISK_SETS:-}" ] || return 0
-    _id=$(disk_baseline_id "$_b" 2>/dev/null)
+    # Collect ALL tags this disk currently presents (multi-tag aware).
+    _all_ids=""
+    if [ -n "${_DISKID_CACHE_FILE:-}" ] && [ -f "$_DISKID_CACHE_FILE" ]; then
+        _all_ids=$(awk -F'|' -v b="$_b" '$1==b && $2!="__NONE__" {print $2}' \
+            "$_DISKID_CACHE_FILE")
+    else
+        _all_ids=$(_disk_all_baseline_ids_uncached "$_b" 2>/dev/null)
+    fi
     optional_sets_iter | while IFS='|' read -r _setn _grpn _spec; do
         [ -n "$_setn" ] || continue
         case "$_spec" in
-            SN:*|PART:*|USB:*|VOL:*)
-                if [ -n "$_id" ] && [ "$_spec" = "$_id" ]; then
+            SN:*|WWN:*|PART:*|MBRSIG:*)
+                if [ -n "$_all_ids" ] && printf '%s\n' "$_all_ids" | grep -qxF "$_spec"; then
                     printf '%s/%s\n' "$_setn" "$_grpn"; return 0
                 fi
                 ;;
@@ -2517,16 +2575,24 @@ resolve_required_disks() {
     )
     # Subtract any disk that is a member of an optional disk set:
     # presence of those is governed by check_optional_disk_sets, not the
-    # plain disk-missing alert. Match on verbatim spec equality (covers
-    # tagged baseline ids when both sides use SN:/PART:/USB:/VOL: form).
+    # plain disk-missing alert. An entry is now possibly multi-tag (e.g.
+    # "SN:X PART:Y"); an entry is suppressed if ANY of its tags matches
+    # an optset spec.
     _optspecs=$(optional_sets_all_specs)
     if [ -z "$_optspecs" ]; then
         printf '%s\n' "$_raw" | awk 'NF>0'
         return 0
     fi
     printf '%s\n' "$_raw" | awk 'NF>0' | while IFS= read -r _r; do
-        if printf '%s\n' "$_optspecs" | grep -qxF "$_r"; then
-            log_debug "  required disk '$_r' suppressed (member of an optional disk set)"
+        _is_optset=0
+        for _t in $_r; do
+            if printf '%s\n' "$_optspecs" | grep -qxF "$_t"; then
+                _is_optset=1
+                break
+            fi
+        done
+        if [ "$_is_optset" = "1" ]; then
+            log_debug "  required disk entry '$_r' suppressed (member of an optional disk set)"
             continue
         fi
         echo "$_r"
@@ -2653,28 +2719,51 @@ check_disk_presence() {
     log_debug "Disk presence: $(echo "$required" | wc -l | tr -d ' ') required entries, grace=${grace}s, severity=$sev"
 
     # Each required entry is either:
-    #   - A tagged baseline id (SN:..., PART:..., USB:..., VOL:...) -
-    #     resolved via disk_for_baseline_id, which scans currently-
-    #     attached disks for one with that identifier.
+    #   - A multi-tag baseline entry (e.g. "SN:X PART:Y") from
+    #     baseline_read_disks - one or more tags whitespace-separated.
+    #     Matched via disk_for_baseline_id per tag; any-tag-matches
+    #     means the entry is present.
     #   - A bare disk-node name (disk2, disk3 - from explicit comma-list
     #     REQUIRED_DISKS) - looked up via diskutil info /dev/<name>.
     # Bare disk-node entries are TRANSIENT and may match a different
     # physical disk after replug; they exist here for backward
     # compatibility with explicit user lists.
-    echo "$required" | awk 'NF>0 && !seen[$0]++' | while read -r r; do
+    #
+    # For state-tracking (grace files, problem hashes) we identify each
+    # entry by its FIRST tag - a stable, file-name-safe key. Entries
+    # with multiple tags share state under that single key.
+    echo "$required" | awk 'NF>0 && !seen[$0]++' | while IFS= read -r r; do
         [ -n "$r" ] || continue
-        case "$r" in
-            SN:*|PART:*|USB:*|VOL:*)
-                cur=$(disk_for_baseline_id "$r")
+        # The first token determines whether this is a tagged entry or
+        # a bare disk-node. For multi-tag entries the first token is one
+        # of the tag types; for legacy bare-node entries it's the BSD.
+        first=$(printf '%s' "$r" | awk '{print $1}')
+        case "$first" in
+            SN:*|WWN:*|PART:*|MBRSIG:*)
+                # Multi-tag entry: try each tag; any match = present.
+                cur=""
+                matched_tag=""
+                for tag in $r; do
+                    case "$tag" in
+                        SN:*|WWN:*|PART:*|MBRSIG:*) ;;
+                        *) continue ;;
+                    esac
+                    _b=$(disk_for_baseline_id "$tag" 2>/dev/null)
+                    if [ -n "$_b" ]; then
+                        cur="$_b"
+                        matched_tag="$tag"
+                        break
+                    fi
+                done
                 if [ -n "$cur" ]; then
-                    log_debug "  $r -> /dev/$cur (present)"
-                    grace_clear "disk" "$r"
+                    log_debug "  $r -> /dev/$cur (present, matched $matched_tag)"
+                    grace_clear "disk" "$first"
                 else
                     log_debug "  $r -> NOT attached"
-                    if grace_check "disk" "$r" "$grace"; then
-                        h=$(problem_hash "disk-missing" "$r" "not-present")
+                    if grace_check "disk" "$first" "$grace"; then
+                        h=$(problem_hash "disk-missing" "$first" "not-present")
                         seen_add "$h"
-                        handle_problem "disk-missing" "$r" "not-present" "$sev" \
+                        handle_problem "disk-missing" "$first" "not-present" "$sev" \
                             "Expected disk with id '$r' is NOT attached"
                     fi
                 fi
