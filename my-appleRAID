@@ -1723,6 +1723,7 @@ _disk_baseline_id_uncached() {
 # are skipped with a warning; baseline integrity requires at least
 # one on-disk identifier.
 baseline_write_disks() {
+    require_smartctl_usable "baseline --disks (identifier snapshot)"
     f=$(baseline_disks_file)
     {
         echo "# appleRAID baseline: disks expected to be attached."
@@ -1785,8 +1786,20 @@ baseline_write_disks() {
                 | awk '{print $1, $2}' \
                 | sed 's/[[:space:]]*$//')
             if [ -z "$tags" ]; then
-                log_warn "Skipping $d in baseline: no stable identifier readable (size: ${size:-unknown}, model: ${model:-unknown})"
-                continue
+                die "Cannot baseline disk $d (size: ${size:-unknown}, model: ${model:-unknown}):
+no stable on-disk identifier is readable (tried SN, WWN, PART, MBRSIG).
+
+A baselined disk must expose at least one on-disk identifier; without
+one, the matcher has no way to confirm presence after replug. Likely
+causes:
+  - smartctl can't read SN/WWN for this disk (USB bridge that hides
+    IDENTIFY pass-through) AND the disk has no partition table (raw
+    or wiped).
+  - The disk uses a non-GPT, non-MBR partition scheme my-appleRAID
+    doesn't recognize.
+
+To proceed: either partition the disk (gpt scheme), use an enclosure
+that exposes SAT passthrough, or exclude this disk from REQUIRED_DISKS."
             fi
             # Skip if any tag is governed by an optset: presence of those
             # disks is checked by the rotation rules (a)+(b), not the
@@ -2910,7 +2923,8 @@ check_disk_presence() {
         log_debug "Disk presence check skipped: REQUIRED_DISKS resolves to empty"
         return 0
     fi
-    # Pre-validate DISK_ID_MATCH (errors out if unset/invalid). Cached.
+    # Hard preconditions for the matcher: smartctl + valid DISK_ID_MATCH.
+    require_smartctl_usable "health (disk presence check)"
     _policy=$(disk_match_require)
     log_debug "Disk presence: $(echo "$required" | wc -l | tr -d ' ') required entries, grace=${grace}s, severity=$sev, policy='$DISK_ID_MATCH' -> '$_policy'"
 
@@ -7075,6 +7089,52 @@ disk_mbrsig() {
         ""|00000000|ffffffff) return 0 ;;
         *) printf '%s' "$sig"; return 0 ;;
     esac
+}
+
+# Hard-fail if smartctl isn't usable for identifier reads:
+#   - not installed: die with brew-install hint.
+#   - installed but Serial Number not readable on any physical disk:
+#     die with "needs root" hint (most common cause on macOS).
+# Called from correctness-critical paths (baseline --update,
+# check_disk_presence). Cosmetic paths (disks, status, --version)
+# do NOT invoke this and just degrade gracefully with empty SN columns.
+#
+# Note: the probe uses the FIRST physical disk only - we just need to
+# confirm that smartctl works AT ALL, not that it works for every disk
+# (some bridges hide SN even with root; that's a per-disk condition
+# already covered by the zero-readable-id check at baseline-write
+# time).
+require_smartctl_usable() {
+    _ctx="${1:-this operation}"
+    if ! command -v smartctl >/dev/null 2>&1; then
+        die "smartctl not installed. $_ctx needs smartctl to read disk
+identifiers (SN, WWN). Install with:
+
+    brew install smartmontools
+
+Then re-run."
+    fi
+    _probe_disk=$(list_all_physical_disks 2>/dev/null | head -1)
+    [ -n "$_probe_disk" ] || return 0
+    # Try the no-flag invocation first, then common -d types.
+    for _dt in "" "-d sat" "-d nvme" "-d usbjmicron"; do
+        # shellcheck disable=SC2086  # intentional word-split on _dt
+        if smartctl -i $_dt "/dev/$_probe_disk" </dev/null 2>/dev/null \
+            | grep -q '^Serial Number:'; then
+            return 0
+        fi
+    done
+    die "smartctl is installed but cannot read Serial Number from
+/dev/$_probe_disk (probed: -i, -d sat, -d nvme, -d usbjmicron).
+
+On macOS, smartctl requires raw-device access (root). $_ctx needs
+that to read disk identifiers used by DISK_ID_MATCH.
+
+Try re-running with:
+
+    sudo $0 ...
+
+If you know smartctl is broken for another reason, fix that first."
 }
 
 # Stable short hash of a disk's serial number (first 16 chars of SHA1).
