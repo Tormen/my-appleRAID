@@ -703,3 +703,4 @@ Two scripts live in `tests/`:
   severing), not a transient-missing simulation.
 
 Both write timestamped logs to `/tmp/raid-behavior-*.log`.
+

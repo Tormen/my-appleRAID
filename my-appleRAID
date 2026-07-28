@@ -82,6 +82,7 @@ fi
 
 SCRIPT_NAME="$(basename "$0")"
 
+<<<<<<< HEAD
 # Version: bump in lockstep with the git tag.
 # SCRIPT_COMMIT is baked into the file itself so deployed copies
 # (e.g. on ada, which has no .git alongside the script) still print
@@ -109,6 +110,36 @@ done
 export PATH
 unset _hbprefix
 
+||||||| 5ac8308
+=======
+# Version: bump in lockstep with the git tag.
+# SCRIPT_COMMIT is baked into the file itself so deployed copies
+# (e.g. on ada, which has no .git alongside the script) still print
+# the commit they were built from. The companion 'stamp-version'
+# subcommand updates SCRIPT_COMMIT to the current HEAD sha and
+# amends - run it as the last step before deploying.
+SCRIPT_VERSION="v8.2"
+SCRIPT_COMMIT="b475f2f"
+SCRIPT_COPYRIGHT="Copyright (C) 2026 Tormen <tormen@mail.ch>"
+SCRIPT_LICENSE_SHORT="GPL-3.0-or-later (copyleft)"
+SCRIPT_LICENSE_URL="https://www.gnu.org/licenses/gpl-3.0.html"
+
+# Augment PATH for the launchd context.
+# launchd starts daemons with a minimal PATH (/usr/bin:/bin:/usr/sbin:/sbin)
+# that excludes both Homebrew prefixes - which means smartctl, msmtp,
+# and any other Homebrew-installed tool would be invisible to the
+# health daemon even when present on the box. Append both Homebrew
+# bin dirs (no-op when already in PATH or when the dir doesn't exist).
+for _hbprefix in /opt/homebrew/bin /usr/local/bin; do
+    case ":${PATH:-}:" in
+        *":$_hbprefix:"*) ;;
+        *) [ -d "$_hbprefix" ] && PATH="${PATH:-}${PATH:+:}$_hbprefix" ;;
+    esac
+done
+export PATH
+unset _hbprefix
+
+>>>>>>> 2dd898e42b065bbaca74af88849fb53912aad281
 # ----------------------------------------------------------------------
 # Global verbosity flags.
 # Set by parse_global_flags(), which is called both at the top of main()
@@ -211,6 +242,7 @@ die() {
 }
 
 # ----------------------------------------------------------------------
+<<<<<<< HEAD
 # err - hard-fail with a UNIQUE numeric error code so post-mortem
 # debugging can grep the source for the exact origin of any error
 # the user sees in the terminal. Use this for any newly-added
@@ -379,6 +411,168 @@ If you control the box, you can also widen the log dir once:
 }
 
 # ----------------------------------------------------------------------
+||||||| 5ac8308
+=======
+# err - hard-fail with a UNIQUE numeric error code so post-mortem
+# debugging can grep the source for the exact origin of any error
+# the user sees in the terminal. Use this for any newly-added
+# failure path. The 'errmsg' helper above is the non-exiting
+# message-only variant, kept for the existing log-style call sites
+# whose flow continues past the message.
+#
+# Usage:   err <code> [<msg>] [<exitCode>]
+# Output:  "ERROR <code> [<exitCode>]: <msg>" on stderr, then exit.
+#          (no message form: "ERROR <code> [<exitCode>]")
+#
+# Idiomatic call site:
+#
+#       command || err 022 "optional message"
+#
+# Error-code registry (keep in sync with the call sites; grep for
+# 'err 0' / 'err [0-9]'). When adding a new err call site, take the
+# NEXT unused 3-digit number and bump _ERR_HIGHEST below.
+#
+#   010   STATE_DIR not writable AND fallback under TMPDIR also failed
+#   011   LOG_FILE parent dir not writable (reserved; soft-fallback)
+#   012   smart-dtype-cache: mktemp for atomic rewrite failed
+#   013   smart-dtype-cache: awk rewrite OR write of cache row failed
+#   014   install-daemon: writing the LaunchDaemon plist failed
+#   015   install-daemon: chown root:wheel of plist failed
+#   016   install-daemon: chmod 644 of plist failed
+#   017   uninstall-daemon: rm of LaunchDaemon plist failed
+#   018   state-DB: mktemp for state-put atomic rewrite failed
+#   019   state-DB: awk rewrite during state-put failed
+#   020   state-DB: append of new row during state-put failed
+#   021   state-DB: atomic rename during state-put failed
+#   022   state-DB: awk rewrite during state-delete failed
+#   023   state-DB: atomic rename during state-delete failed
+#
+# _ERR_HIGHEST=023
+# ----------------------------------------------------------------------
+err() {
+    _ec_code="$1"
+    _ec_msg="${2:-}"
+    _ec_exit="${3:-1}"
+    if [ -n "$_ec_msg" ]; then
+        printf '\n%sERROR %s [%s]: %s%s\n' \
+            "${C_RED}" "$_ec_code" "$_ec_exit" "$_ec_msg" "${C_RESET}" >&2
+    else
+        printf '\n%sERROR %s [%s]%s\n' \
+            "${C_RED}" "$_ec_code" "$_ec_exit" "${C_RESET}" >&2
+    fi
+    exit "$_ec_exit"
+}
+
+# ----------------------------------------------------------------------
+# State-dir + log-file writability gate
+# ----------------------------------------------------------------------
+# When the daemon runs (root via launchd), STATE_DIR=/var/db/my-appleRAID
+# and LOG_FILE=/var/log/.../my-appleRAID.log are owned by root and
+# fully writable. When a NON-root user runs the script for read-only
+# commands (e.g. 'my-appleRAID smart disk7') those paths are NOT
+# writable by them, and unguarded redirects produced cascades of
+# 'Permission denied' / 'mkstemp failed' / 'awk: can't open' spam.
+#
+# Solution: detect non-writability at startup and fall back to a
+# user-private path under TMPDIR. The daemon path is unchanged
+# (root can write the canonical paths). Both functions log a single
+# warning when the fallback kicks in, so the user knows what happened.
+
+# Make STATE_DIR a writable directory, falling back to a user-private
+# tmp dir when the configured value isn't writable by the current uid.
+#
+# We remember the FALLBACK TARGET in $_STATE_DIR_FALLBACK so this
+# function is idempotent across repeated calls AND across cfg_load
+# invocations (cfg_set_defaults unconditionally resets STATE_DIR to
+# the system default; without the saved-target re-apply step a
+# subsequent cfg_load would silently put STATE_DIR back to the
+# unwritable system path while the sentinel-style early-return
+# prevented re-detection).
+_STATE_DIR_FALLBACK=""
+_ensure_state_dir_writable() {
+    [ -n "${STATE_DIR:-}" ] || STATE_DIR="/var/db/my-appleRAID"
+    # If we already decided on a fallback path, re-apply it silently.
+    # Handles the cfg_set_defaults-reset-after-fallback case.
+    if [ -n "$_STATE_DIR_FALLBACK" ]; then
+        STATE_DIR="$_STATE_DIR_FALLBACK"
+        return 0
+    fi
+    # Already writable: done.
+    if [ -d "$STATE_DIR" ] && [ -w "$STATE_DIR" ]; then
+        return 0
+    fi
+    # Doesn't exist yet but we can create it.
+    if [ ! -d "$STATE_DIR" ] \
+       && mkdir -p "$STATE_DIR" 2>/dev/null \
+       && [ -w "$STATE_DIR" ]; then
+        return 0
+    fi
+    # Not writable. Fall back to user-private location.
+    _fb="${TMPDIR:-/tmp}/my-appleRAID-$(id -u 2>/dev/null || echo nobody)"
+    if [ ! -d "$_fb" ] && ! mkdir -p "$_fb" 2>/dev/null; then
+        err 010 "Cannot write to STATE_DIR='$STATE_DIR' AND fallback '$_fb' creation failed"
+    fi
+    if [ ! -w "$_fb" ]; then
+        err 010 "Fallback state dir '$_fb' is not writable"
+    fi
+    log_warn "STATE_DIR='$STATE_DIR' not writable by uid=$(id -u 2>/dev/null); using fallback: $_fb"
+    STATE_DIR="$_fb"
+    _STATE_DIR_FALLBACK="$_fb"
+    return 0
+}
+
+# Decide once whether LOG_FILE can be appended to. If it can't, NULL
+# the variable so log_write skips the file-append branch silently.
+# Avoids cascading 'cannot create <path>: Permission denied' messages
+# from the shell for every log line.
+#
+# Tri-state: $_LOG_FILE_DECIDED in {"", "ok", "skip"}.
+#   ""    = not yet decided
+#   "ok"  = LOG_FILE is the canonical writable path
+#   "skip"= file logging disabled for this run (LOG_FILE re-NULLed)
+# This makes the function idempotent across cfg_load calls
+# (cfg_set_defaults resets LOG_FILE to the system default; without
+# the saved-decision re-apply step a sentinel-style early-return
+# would let LOG_FILE come back as the unwritable canonical path,
+# re-triggering the redirect-open errors log_write tries to suppress).
+_LOG_FILE_DECIDED=""
+_ensure_log_file_writable() {
+    if [ "$_LOG_FILE_DECIDED" = "skip" ]; then
+        LOG_FILE=""
+        return 0
+    fi
+    [ "$_LOG_FILE_DECIDED" = "ok" ] && return 0
+    [ -n "${LOG_FILE:-}" ] || { _LOG_FILE_DECIDED=ok; return 0; }
+    _ld=$(dirname "$LOG_FILE")
+    # If the log file already exists, we can append iff it's writable.
+    if [ -f "$LOG_FILE" ] && [ -w "$LOG_FILE" ]; then
+        _LOG_FILE_DECIDED=ok
+        return 0
+    fi
+    # If parent dir exists and is writable, file can be created.
+    if [ -d "$_ld" ] && [ -w "$_ld" ]; then
+        _LOG_FILE_DECIDED=ok
+        return 0
+    fi
+    # Try to create the parent dir (only if path looks user-private).
+    case "$_ld" in
+        /var/*|/etc/*|/usr/*) ;; # don't create system paths from here
+        *)
+            if mkdir -p "$_ld" 2>/dev/null && [ -w "$_ld" ]; then
+                _LOG_FILE_DECIDED=ok
+                return 0
+            fi
+            ;;
+    esac
+    # Not writable. Disable file logging for this run and warn once.
+    log_warn "LOG_FILE='$LOG_FILE' not writable by uid=$(id -u 2>/dev/null); file logging disabled for this run (stderr still active)"
+    LOG_FILE=""
+    _LOG_FILE_DECIDED=skip
+    return 0
+}
+
+# ----------------------------------------------------------------------
+>>>>>>> 2dd898e42b065bbaca74af88849fb53912aad281
 # Preflight
 # ----------------------------------------------------------------------
 preflight() {
@@ -1125,19 +1319,38 @@ cfg_load() {
         LAUNCHD_LABEL="${_tmp%.plist}"  # strip extension
     fi
 
+<<<<<<< HEAD
     # No pre-emptive writability check here: configured paths are
     # authoritative, and read-only commands (status, baseline --show,
     # --diff) MUST be runnable as a non-root user even when STATE_DIR/
     # LOG_FILE aren't writable by them. Each command asserts what it
     # needs (writable vs readable) at the moment it needs it.
 
+||||||| 5ac8308
+=======
+    # Verify LOG_FILE + STATE_DIR are writable for the running uid;
+    # fall back / NULL respectively if not. Done once here so that any
+    # subsequent subshell ($(...) / pipeline) forked off the main shell
+    # INHERITS the corrected paths, instead of independently rerunning
+    # the checks (and re-printing the same warnings) per subshell.
+    # Sentinel inside each function keeps it idempotent in case
+    # cfg_load is invoked more than once per run.
+    _ensure_log_file_writable
+    _ensure_state_dir_writable
+
+>>>>>>> 2dd898e42b065bbaca74af88849fb53912aad281
     # Normalize duration-valued config keys: accept either a bare number
     # (seconds) or a suffix like 30s / 5m / 2h / 1d / 1w. Done once at
     # load time so the rest of the script can treat these as plain ints.
     ALARM_INTERVAL=$(parse_duration "$ALARM_INTERVAL" "ALARM_INTERVAL")
     EMAIL_INTERVAL=$(parse_duration "$EMAIL_INTERVAL" "EMAIL_INTERVAL")
+<<<<<<< HEAD
     EMAIL_HEARTBEAT_INTERVAL=$(parse_duration "${EMAIL_HEARTBEAT_INTERVAL:-604800}" "EMAIL_HEARTBEAT_INTERVAL")
     REBUILD_EMAIL_INTERVAL=$(parse_duration "${REBUILD_EMAIL_INTERVAL:-21600}" "REBUILD_EMAIL_INTERVAL")
+||||||| 5ac8308
+=======
+    REBUILD_EMAIL_INTERVAL=$(parse_duration "${REBUILD_EMAIL_INTERVAL:-21600}" "REBUILD_EMAIL_INTERVAL")
+>>>>>>> 2dd898e42b065bbaca74af88849fb53912aad281
     SMART_POLL_INTERVAL=$(parse_duration "$SMART_POLL_INTERVAL" "SMART_POLL_INTERVAL")
     LAUNCHD_INTERVAL=$(parse_duration "$LAUNCHD_INTERVAL" "LAUNCHD_INTERVAL")
     MISSING_SET_GRACE_PERIOD=$(parse_duration "$MISSING_SET_GRACE_PERIOD" "MISSING_SET_GRACE_PERIOD")
@@ -1232,6 +1445,7 @@ log_write() {
     line=$(printf '%s [%s] %s' "$ts" "$lvl" "$msg")
     # Always echo to stderr so launchd stderr log catches it.
     printf '%s\n' "$line" >&2
+<<<<<<< HEAD
     # File-append branch. Wrapped in a subshell whose entire stderr is
     # redirected so a redirect-open failure ('cannot create ...') from
     # the shell itself is also suppressed (a plain '>>... 2>/dev/null'
@@ -1241,6 +1455,17 @@ log_write() {
     # DIES on configured-but-unwritable LOG_FILE, so reaching here with
     # non-empty LOG_FILE means it was writable at startup. The subshell
     # guard handles the race where it gets deleted/chmoded mid-run.
+||||||| 5ac8308
+=======
+    # File-append branch. Wrapped in a subshell whose entire stderr is
+    # redirected so a redirect-open failure ('cannot create ...') from
+    # the shell itself is also suppressed (a plain '>>... 2>/dev/null'
+    # only suppresses the printf's stderr; the open-failure message is
+    # produced by dash itself BEFORE the printf runs and bypasses that
+    # redirect). _ensure_log_file_writable ought to have NULLed
+    # LOG_FILE already in the unwritable case, but the subshell guard
+    # is belt-and-braces.
+>>>>>>> 2dd898e42b065bbaca74af88849fb53912aad281
     if [ -n "${LOG_FILE:-}" ]; then
         ( printf '%s\n' "$line" >> "$LOG_FILE" ) 2>/dev/null || true
     fi
@@ -1268,9 +1493,17 @@ log_debug() { log_write debug "$@"; }
 STATE_FILE=""    # set by state_init based on STATE_DIR
 
 state_init() {
+<<<<<<< HEAD
     # state.db is authoritative state; require writable. _ensure dies
     # with a sudo hint if the configured STATE_DIR can't be written.
     _ensure_state_dir_writable
+||||||| 5ac8308
+=======
+    # _ensure_state_dir_writable may rewrite STATE_DIR to a user-
+    # private fallback if the canonical path isn't writable - run it
+    # FIRST so STATE_FILE picks up the corrected path.
+    _ensure_state_dir_writable
+>>>>>>> 2dd898e42b065bbaca74af88849fb53912aad281
     STATE_FILE="${STATE_DIR}/state.db"
     if [ ! -f "$STATE_FILE" ]; then
         {
@@ -1517,6 +1750,7 @@ baseline_write_sets() {
     } > "$f"
 }
 
+<<<<<<< HEAD
 # Identifier policy.
 #
 # On-disk tag types (recorded into baseline-disks):
@@ -1774,12 +2008,269 @@ _disk_baseline_id_uncached() {
 # Tags are SN:/WWN:/PART:/MBRSIG:. Disks where no tag is readable
 # are skipped with a warning; baseline integrity requires at least
 # one on-disk identifier.
+||||||| 5ac8308
+# Write the currently-attached physical disk identifiers to the baseline.
+=======
+# Identifier policy.
+#
+# On-disk tag types (recorded into baseline-disks):
+#   SN:<serial>      ATA/SATA/NVMe IDENTIFY serial. Burned into drive
+#                    firmware. Stable across reboots, replugs, hub swaps,
+#                    and reformats.
+#   PART:<gpt-uuid>  GPT partition entry GUID of the disk's main data
+#                    partition (first non-EFI, non-Apple_Boot partition).
+#                    Written into the partition table on disk. Stable
+#                    across reboots/replugs; invalidated only by a
+#                    partition-table rewrite.
+#
+# Bus-info identifiers (USB bridge serial, Volume UUID) are intentionally
+# NOT used: the bridge serial belongs to the enclosure, not the disk,
+# and a Volume UUID is filesystem-level and changes on reformat. Either
+# would generate false-missing alerts when the disk is moved between
+# enclosures or its volumes are recreated.
+#
+# Multi-tag model:
+#   - At baseline write time we record EVERY readable on-disk identifier
+#     per disk (always). Lines in baseline-disks can therefore carry
+#     multiple whitespace-separated tags before the '#' comment.
+#   - At match time, an entry is "present" if ANY of its recorded tags
+#     matches ANY currently-readable tag of any attached disk; "missing"
+#     if every tag in the entry fails to match every tag of every
+#     attached disk.
+#   - This makes presence detection robust against single-identifier
+#     flux (e.g. smartctl availability changing, a partition being
+#     rewritten while the disk's firmware identifiers remain) without
+#     auto-rebasing the baseline.
+# ----------------------------------------------------------------------
+# bsd -> tagged-id cache (process-wide, file-backed).
+#
+# Cache file format: one row per (bsd, tag) pair, in priority order
+# (SN: rows before PART: rows for the same disk):
+#   disk0|SN:C0714…
+#   disk0|PART:113FA7C2-…
+#   disk6|SN:Z0F0A2XLFWTG
+#   …
+# A disk with no readable identifier gets one row: bsd|__NONE__.
+#
+# Lookup modes (both use a single awk pass over the file):
+#   - "bsd -> preferred tag":  awk '$1 == b { print $2; exit }'
+#       returns the first row's tag for that bsd = the highest-priority
+#       tag the disk currently presents. Used by disk_baseline_id for
+#       display and for writing the preferred tag into legacy single-tag
+#       baseline lines.
+#   - "tag -> bsd":  awk '$2 == t { print $1; exit }'
+#       any row whose tag column matches the target wins. Used by
+#       disk_for_baseline_id (the presence-check matcher).
+#
+# Computing identifiers hits smartctl and diskutil; a single process-wide
+# cache built once at startup amortizes the cost across baseline writes,
+# optset rendering, and presence checks. Callers prime the cache with
+# _diskid_cache_init early and clear it via trap.
+# ----------------------------------------------------------------------
+_DISKID_CACHE_FILE=""
+
+# Build the cache for every currently-attached physical disk. Idempotent:
+# returns immediately if the cache already exists.
+# Writes one row per (bsd, tag) pair, in priority order; a disk with no
+# readable identifier gets a single bsd|__NONE__ row.
+#
+# Filename: single deterministic path "$STATE_DIR/.diskid-cache". One
+# file per host, atomically rewritten each priming. Old mktemp-style
+# leftovers ".diskid-cache.XXXXXX" from prior versions are swept on
+# every init so they don't accumulate (a kill -9 in an old build could
+# orphan files indefinitely).
+_diskid_cache_init() {
+    if [ -n "${_DISKID_CACHE_FILE:-}" ] && [ -f "$_DISKID_CACHE_FILE" ]; then
+        return 0
+    fi
+    [ -n "${STATE_DIR:-}" ] || return 1
+
+    # Sweep legacy mktemp leftovers from prior versions. Cheap (one
+    # `rm -f` glob); silent if nothing matches. Safe to run repeatedly.
+    rm -f "$STATE_DIR"/.diskid-cache.[A-Za-z0-9]* 2>/dev/null || true
+    rm -f "$STATE_DIR"/.diskid-disks.[A-Za-z0-9]* 2>/dev/null || true
+    rm -f "$STATE_DIR"/.disk-for-id.[A-Za-z0-9]* 2>/dev/null || true
+
+    _DISKID_CACHE_FILE="$STATE_DIR/.diskid-cache"
+    _tmp="${_DISKID_CACHE_FILE}.tmp.$$"
+    {
+        printf '# diskid-cache | generated %s | pid %s\n' \
+            "$(now_iso 2>/dev/null || date)" "$$"
+    } > "$_tmp" 2>/dev/null || {
+        _DISKID_CACHE_FILE=""
+        return 1
+    }
+    # list_all_physical_disks via tmpfile so the loop runs in the parent
+    # shell (avoids the cmd|while subshell trap when we accumulate state).
+    _tmp_disks="${_DISKID_CACHE_FILE}.disks.$$"
+    list_all_physical_disks > "$_tmp_disks" 2>/dev/null
+    while IFS= read -r _d; do
+        [ -n "$_d" ] || continue
+        _ids=$(_disk_all_baseline_ids_uncached "$_d" 2>/dev/null)
+        if [ -z "$_ids" ]; then
+            printf '%s|__NONE__\n' "$_d" >> "$_tmp"
+            continue
+        fi
+        printf '%s\n' "$_ids" | while IFS= read -r _id; do
+            [ -n "$_id" ] || continue
+            printf '%s|%s\n' "$_d" "$_id" >> "$_tmp"
+        done
+    done < "$_tmp_disks"
+    rm -f "$_tmp_disks"
+    mv "$_tmp" "$_DISKID_CACHE_FILE" || {
+        rm -f "$_tmp"
+        _DISKID_CACHE_FILE=""
+        return 1
+    }
+}
+
+# Cache cleanup is a no-op now (single deterministic filename - the
+# next process's init overwrites it). Kept as a function so existing
+# `trap '_diskid_cache_clear' EXIT INT TERM` call sites stay valid;
+# they're harmless. We intentionally do NOT delete the file on exit so
+# adjacent processes (e.g. cmd_status invoked while cmd_health runs)
+# can share the prime, and a kill -9 leaves at most one stale file
+# which the next sweep cleans up.
+_diskid_cache_clear() {
+    _DISKID_CACHE_FILE=""
+}
+
+# Public-facing disk_baseline_id: cache check, fall through to the
+# uncached implementation. Caches the result for next time.
+disk_baseline_id() {
+    bsd="${1#/dev/}"
+    [ -n "$bsd" ] || return 1
+    if [ -n "${_DISKID_CACHE_FILE:-}" ] && [ -f "$_DISKID_CACHE_FILE" ]; then
+        _hit=$(awk -F'|' -v b="$bsd" '$1==b {print $2; exit}' "$_DISKID_CACHE_FILE")
+        case "$_hit" in
+            "")        ;;  # not in cache, fall through
+            __NONE__)  return 1 ;;
+            *)         echo "$_hit"; return 0 ;;
+        esac
+    fi
+    _id=$(_disk_baseline_id_uncached "$bsd")
+    _rc=$?
+    # Memoize for next time (best-effort: any failure is silently ignored).
+    if [ -n "${_DISKID_CACHE_FILE:-}" ] && [ -f "$_DISKID_CACHE_FILE" ]; then
+        printf '%s|%s\n' "$bsd" "${_id:-__NONE__}" >> "$_DISKID_CACHE_FILE"
+    fi
+    [ -n "$_id" ] && echo "$_id"
+    return $_rc
+}
+
+# Emit EVERY readable on-disk identifier for a physical disk, one tag
+# per line in priority order. Tag types:
+#
+#   SN:<serial>          ATA/NVMe IDENTIFY serial (disk_serial).
+#   WWN:<hex>            ATA WWN / NVMe EUI-64 / NGUID (disk_wwn).
+#   PART:<gpt-uuid>      GPT partition entry GUID of the main data
+#                        partition (GPT-partitioned disks).
+#   MBRSIG:<8-hex>       MBR disk signature at byte 0x1B8
+#                        (MBR-partitioned disks only).
+#
+# PART vs MBRSIG is auto-selected per disk by inspecting the partition
+# scheme reported by diskutil. A disk with a GUID_partition_scheme can
+# yield SN, WWN, PART (any subset readable). A disk with the older
+# FDisk_partition_scheme can yield SN, WWN, MBRSIG.
+#
+# Returns 0 if at least one tag was emitted, 1 if none. Bus identifiers
+# (USB:, VOL:) are intentionally not emitted - enclosure/filesystem
+# scope, not disk scope.
+_disk_all_baseline_ids_uncached() {
+    bsd="${1#/dev/}"
+    [ -n "$bsd" ] || return 1
+    _emitted=0
+
+    # 1. ATA/NVMe serial via disk_serial (smartctl + diskutil).
+    s=$(disk_serial "$bsd" 2>/dev/null)
+    if [ -n "$s" ]; then
+        echo "SN:$s"
+        _emitted=1
+    fi
+
+    # 2. WWN / NVMe EUI-64 / NGUID via disk_wwn. Independent firmware
+    #    field from SN; some bridges expose one but not the other.
+    s=$(disk_wwn "$bsd" 2>/dev/null)
+    if [ -n "$s" ]; then
+        echo "WWN:$s"
+        _emitted=1
+    fi
+
+    # 3. Partition-scheme-dependent on-disk identifier.
+    _scheme=$(diskutil info "/dev/$bsd" 2>/dev/null \
+        | awk -F': +' '/Content \(IOContent\):/ {print $2; exit}' \
+        | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+    case "$_scheme" in
+        GUID_partition_scheme)
+            # GPT: take the first non-EFI, non-Apple_Boot data partition
+            # and emit its partition entry GUID as PART:.
+            main_part=$(diskutil list "/dev/$bsd" 2>/dev/null | awk '
+                NR > 2 && /^[[:space:]]+[0-9]+:/ {
+                    ident = $NF
+                    ptype = $2
+                    if (ptype == "EFI") next
+                    if (ptype ~ /^Apple_Boot/) next
+                    if (ptype ~ /partition_scheme$/) next
+                    if (ident ~ /^disk[0-9]+s[0-9]+$/) {
+                        print ident
+                        exit
+                    }
+                }
+            ')
+            if [ -n "$main_part" ]; then
+                s=$(diskutil info "/dev/$main_part" 2>/dev/null \
+                    | awk -F': +' '/Disk \/ Partition UUID:/ {print $2; exit}' \
+                    | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+                if [ -n "$s" ]; then
+                    echo "PART:$s"
+                    _emitted=1
+                fi
+            fi
+            ;;
+        FDisk_partition_scheme)
+            # MBR (BIOS-style): emit the 32-bit disk signature.
+            s=$(disk_mbrsig "$bsd" 2>/dev/null)
+            if [ -n "$s" ]; then
+                echo "MBRSIG:$s"
+                _emitted=1
+            fi
+            ;;
+        *)
+            # Unknown / no partition table: nothing to emit at this rank.
+            ;;
+    esac
+
+    [ "$_emitted" = "1" ] && return 0
+    return 1
+}
+
+# Single-tag accessor: emit the highest-priority readable tag (SN
+# preferred, PART fallback). Used by callers that need ONE id for
+# display or for writing the preferred tag into a legacy single-tag
+# baseline line. New code should prefer reading the multi-row cache
+# directly via disk_for_baseline_id.
+_disk_baseline_id_uncached() {
+    _disk_all_baseline_ids_uncached "$1" 2>/dev/null | head -n 1
+}
+
+# Write the currently-attached physical disks to the baseline file.
+# Each line records EVERY readable on-disk identifier for the disk,
+# whitespace-separated, before a trailing '# <bsd>  <size>  <model>'
+# human-hint comment.
+#
+#   <tag1> [<tag2> ...]    # <bsd-at-baseline>  <size>  <model>
+#
+# Tags are SN:/WWN:/PART:/MBRSIG:. Disks where no tag is readable
+# are skipped with a warning; baseline integrity requires at least
+# one on-disk identifier.
+>>>>>>> 2dd898e42b065bbaca74af88849fb53912aad281
 baseline_write_disks() {
     require_smartctl_usable "baseline --update --disks (identifier snapshot)"
     f=$(baseline_disks_file)
     {
         echo "# appleRAID baseline: disks expected to be attached."
         echo "# Written: $(now_iso)"
+<<<<<<< HEAD
         echo "# Update with: appleRAID baseline --update --disks"
         echo "#"
         echo "# Format: <tag> [<tag> ...]  # <bsd-at-baseline>  <size>  <model>"
@@ -1872,9 +2363,107 @@ that exposes SAT passthrough, or exclude this disk from REQUIRED_DISKS."
             printf '%-44s # %-7s %-9s %s\n' "$tags" "$d" "${size:-?}" "${model:-?}"
         done < "$_tmp_dl"
         rm -f "$_tmp_dl"
+||||||| 5ac8308
+        echo "# Update with: appleRAID baseline --disks"
+        list_all_physical_disks
+=======
+        echo "# Update with: appleRAID baseline --update --disks"
+        echo "#"
+        echo "# Format: <tag> [<tag> ...]  # <bsd-at-baseline>  <size>  <model>"
+        echo "#"
+        echo "# Each line records every on-disk identifier readable at"
+        echo "# baseline-write time. The matcher (controlled by DISK_ID_MATCH)"
+        echo "# evaluates these tags against currently-attached disks."
+        echo "#"
+        echo "# Tag types:"
+        echo "#   SN:<serial>      ATA/NVMe IDENTIFY serial. Firmware-burned."
+        echo "#                    Stable across reboot/replug/reformat."
+        echo "#                    Requires smartctl + raw-device access (root)."
+        echo "#   WWN:<hex>        ATA LU WWN / NVMe EUI-64 / NGUID."
+        echo "#                    Firmware-burned, separate field from SN."
+        echo "#                    Some USB bridges expose one but not the other."
+        echo "#   PART:<gpt-uuid>  GPT partition entry GUID of the disk's main"
+        echo "#                    data partition (first non-EFI, non-Apple_Boot)."
+        echo "#                    Written into the partition table on disk."
+        echo "#                    Stable across replug; invalidated only by a"
+        echo "#                    partition-table rewrite."
+        echo "#   MBRSIG:<8-hex>   MBR disk signature (byte 0x1B8). Used for"
+        echo "#                    BIOS-style (FDisk_partition_scheme) disks"
+        echo "#                    where GPT is absent."
+        echo "#"
+        echo "# The bsd / size / model fields in the trailing comment are"
+        echo "# human hints. bsd may shuffle on replug; size and model are"
+        echo "# intrinsic to the disk and stay stable."
+        # Pre-compute the set of optset specs so the per-disk filter
+        # below is O(1) instead of re-running awk N times.
+        _optspecs=""
+        if [ -n "${OPTIONAL_DISK_SETS:-}" ]; then
+            _optspecs=$(optional_sets_all_specs)
+        fi
+        # Use the multi-row cache (one row per (bsd, tag)) so each disk's
+        # complete tag list comes from a single awk lookup.
+        _tmp_dl=$(mktemp "${STATE_DIR}/.baseline-write-disks.XXXXXX" 2>/dev/null)
+        list_all_physical_disks > "$_tmp_dl"
+        while IFS= read -r d; do
+            [ -n "$d" ] || continue
+            # All readable tags for this disk, in priority order.
+            tags=""
+            if [ -n "${_DISKID_CACHE_FILE:-}" ] && [ -f "$_DISKID_CACHE_FILE" ]; then
+                tags=$(awk -F'|' -v b="$d" '
+                    $1==b && $2!="__NONE__" { printf "%s ", $2 }
+                ' "$_DISKID_CACHE_FILE" | sed 's/[[:space:]]*$//')
+            else
+                tags=$(_disk_all_baseline_ids_uncached "$d" 2>/dev/null \
+                    | awk 'NF>0 {printf "%s ", $0}' \
+                    | sed 's/[[:space:]]*$//')
+            fi
+            model=$(diskutil info "/dev/$d" 2>/dev/null \
+                | awk -F': +' '/Device \/ Media Name:/ {print $2; exit}' \
+                | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+            size=$(diskutil info "/dev/$d" 2>/dev/null \
+                | awk -F': +' '/Disk Size:/ {print $2; exit}' \
+                | awk '{print $1, $2}' \
+                | sed 's/[[:space:]]*$//')
+            if [ -z "$tags" ]; then
+                die "Cannot baseline disk $d (size: ${size:-unknown}, model: ${model:-unknown}):
+no stable on-disk identifier is readable (tried SN, WWN, PART, MBRSIG).
+
+A baselined disk must expose at least one on-disk identifier; without
+one, the matcher has no way to confirm presence after replug. Likely
+causes:
+  - smartctl can't read SN/WWN for this disk (USB bridge that hides
+    IDENTIFY pass-through) AND the disk has no partition table (raw
+    or wiped).
+  - The disk uses a non-GPT, non-MBR partition scheme my-appleRAID
+    doesn't recognize.
+
+To proceed: either partition the disk (gpt scheme), use an enclosure
+that exposes SAT passthrough, or exclude this disk from REQUIRED_DISKS."
+            fi
+            # Skip if any tag is governed by an optset: presence of those
+            # disks is checked by the rotation rules (a)+(b), not the
+            # plain baseline-disks presence check.
+            if [ -n "$_optspecs" ]; then
+                _is_optset=0
+                for t in $tags; do
+                    if printf '%s\n' "$_optspecs" | grep -qxF "$t"; then
+                        _is_optset=1
+                        break
+                    fi
+                done
+                if [ "$_is_optset" = "1" ]; then
+                    log_debug "Skipping $d ($tags) in baseline: member of OPTIONAL_DISK_SETS"
+                    continue
+                fi
+            fi
+            printf '%-44s # %-7s %-9s %s\n' "$tags" "$d" "${size:-?}" "${model:-?}"
+        done < "$_tmp_dl"
+        rm -f "$_tmp_dl"
+>>>>>>> 2dd898e42b065bbaca74af88849fb53912aad281
     } > "$f"
 }
 
+<<<<<<< HEAD
 # Map a tagged baseline id back to the currently-attached /dev/diskN
 # node, or empty if no current disk matches. Used by the presence
 # check.
@@ -2110,6 +2699,244 @@ strictest)."
     printf '%s\n' "$_parsed"
 }
 
+||||||| 5ac8308
+=======
+# Map a tagged baseline id back to the currently-attached /dev/diskN
+# node, or empty if no current disk matches. Used by the presence
+# check.
+#
+# Multi-tag aware: the target tag matches if ANY attached disk currently
+# presents it (under any of its readable identifier types).
+disk_for_baseline_id() {
+    target="$1"
+    [ -n "$target" ] || return 1
+    # Cache fast-path: with one row per (bsd, tag), this awk naturally
+    # finds the bsd whose tag column equals the target, regardless of
+    # whether the target is SN: / PART: / etc.
+    if [ -n "${_DISKID_CACHE_FILE:-}" ] && [ -f "$_DISKID_CACHE_FILE" ]; then
+        _hit=$(awk -F'|' -v t="$target" '$2==t {print $1; exit}' "$_DISKID_CACHE_FILE")
+        if [ -n "$_hit" ]; then
+            echo "$_hit"
+            return 0
+        fi
+        # Cache primed but target not present = genuinely not attached.
+        return 1
+    fi
+    # Slow path: cache uninitialized. Walk all disks, enumerate ALL
+    # their readable tags, match any of them against the target.
+    _tmp_dl=$(mktemp "${STATE_DIR:-/tmp}/.disk-for-id.XXXXXX" 2>/dev/null) || return 1
+    list_all_physical_disks > "$_tmp_dl"
+    _found=""
+    while IFS= read -r d; do
+        [ -n "$d" ] || continue
+        if _disk_all_baseline_ids_uncached "$d" 2>/dev/null | grep -qxF "$target"; then
+            _found="$d"
+            break
+        fi
+    done < "$_tmp_dl"
+    rm -f "$_tmp_dl"
+    if [ -n "$_found" ]; then
+        echo "$_found"
+        return 0
+    fi
+    return 1
+}
+
+# ----------------------------------------------------------------------
+# DISK_ID_MATCH policy parser and evaluator.
+#
+# DISK_ID_MATCH is a required config variable that controls how the
+# matcher decides whether a baselined disk is present. Grammar:
+#
+#     DISK_ID_MATCH = ALL | spec ( "," spec )*
+#     spec          = LETTER  |  "ONE-OF(" LETTER ( "," LETTER )+ ")"
+#     LETTER        = S | W | P
+#
+# Letters:
+#   S   SN:    (ATA/NVMe IDENTIFY serial)
+#   W   WWN:   (LU WWN / NVMe EUI-64 / NGUID)
+#   P   PART:  for GPT, MBRSIG: for MBR (auto-selected by writer)
+#
+# Top-level commas mean AND. Letters inside ONE-OF(...) mean OR.
+# 'ALL' is shorthand for "every recorded tag must match".
+#
+# disk_match_parse normalizes the raw config string into a
+# space-separated sequence of tokens, one per spec:
+#   all              -> entry matches when ALL recorded tags resolve
+#   req=<L>          -> letter L must match (its recorded tag must
+#                       resolve to an attached disk)
+#   oneof=<L>,<L>... -> at least one of the listed letters must match
+# Errors print to stderr and return non-zero.
+# ----------------------------------------------------------------------
+disk_match_parse() {
+    _raw="$1"
+    _raw=$(printf '%s' "$_raw" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+    [ -n "$_raw" ] || { echo "DISK_ID_MATCH is empty" >&2; return 1; }
+    if [ "$_raw" = "ALL" ]; then
+        echo "all"
+        return 0
+    fi
+    _depth=0
+    _cur=""
+    _out=""
+    _i=1
+    _len=${#_raw}
+    while [ "$_i" -le "$_len" ]; do
+        _c=$(printf '%s' "$_raw" | cut -c"$_i")
+        case "$_c" in
+            "(") _depth=$((_depth+1)); _cur="${_cur}(" ;;
+            ")") _depth=$((_depth-1)); _cur="${_cur})" ;;
+            ",")
+                if [ "$_depth" = "0" ]; then
+                    _norm=$(_disk_match_norm_spec "$_cur") || return 1
+                    _out="$_out $_norm"
+                    _cur=""
+                else
+                    _cur="${_cur},"
+                fi
+                ;;
+            *) _cur="${_cur}${_c}" ;;
+        esac
+        _i=$((_i+1))
+    done
+    if [ "$_depth" != "0" ]; then
+        echo "DISK_ID_MATCH: unbalanced parentheses in '$_raw'" >&2
+        return 1
+    fi
+    if [ -n "$_cur" ]; then
+        _norm=$(_disk_match_norm_spec "$_cur") || return 1
+        _out="$_out $_norm"
+    fi
+    printf '%s\n' "$_out" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//'
+}
+
+_disk_match_norm_spec() {
+    _s=$(printf '%s' "$1" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+    [ -n "$_s" ] || { echo "DISK_ID_MATCH: empty spec" >&2; return 1; }
+    case "$_s" in
+        S|W|P) printf 'req=%s' "$_s" ;;
+        ONE-OF\(*\))
+            _inner=${_s#ONE-OF\(}
+            _inner=${_inner%\)}
+            _inner=$(printf '%s' "$_inner" | tr -d ' ')
+            _count=0
+            for _L in $(printf '%s' "$_inner" | tr ',' ' '); do
+                case "$_L" in
+                    S|W|P) _count=$((_count+1)) ;;
+                    *) echo "DISK_ID_MATCH: invalid letter '$_L' in ONE-OF (expected S, W, or P)" >&2; return 1 ;;
+                esac
+            done
+            if [ "$_count" -lt 2 ]; then
+                echo "DISK_ID_MATCH: ONE-OF must list at least 2 letters" >&2
+                return 1
+            fi
+            printf 'oneof=%s' "$_inner"
+            ;;
+        *)
+            echo "DISK_ID_MATCH: unrecognized spec '$_s' (expected S, W, P, or ONE-OF(...))" >&2
+            return 1
+            ;;
+    esac
+}
+
+# Evaluate a parsed DISK_ID_MATCH policy against one baseline-disks
+# entry (the part before '#', possibly carrying multiple tags).
+# Args:
+#   $1 = parsed policy (output of disk_match_parse, space-separated)
+#   $2 = entry text (one or more whitespace-separated tags)
+# Side effects: none (read-only against the cache).
+# Output: if the entry is present under the policy, prints the bsd of
+# the first disk that proved presence. If missing, prints nothing.
+# Return: 0 = present, 1 = missing.
+disk_match_evaluate() {
+    _policy="$1"
+    _entry="$2"
+    _matched_bsd=""
+    # Map letter -> first recorded tag of that type in the entry.
+    _t_S=""; _t_W=""; _t_P=""
+    for _tok in $_entry; do
+        case "$_tok" in
+            SN:*)            [ -z "$_t_S" ] && _t_S="$_tok" ;;
+            WWN:*)           [ -z "$_t_W" ] && _t_W="$_tok" ;;
+            PART:*|MBRSIG:*) [ -z "$_t_P" ] && _t_P="$_tok" ;;
+        esac
+    done
+
+    for _spec in $_policy; do
+        case "$_spec" in
+            all)
+                _all_ok=1
+                for _tok in $_entry; do
+                    case "$_tok" in
+                        SN:*|WWN:*|PART:*|MBRSIG:*) ;;
+                        *) continue ;;
+                    esac
+                    _b=$(disk_for_baseline_id "$_tok" 2>/dev/null)
+                    if [ -z "$_b" ]; then
+                        _all_ok=0
+                        break
+                    fi
+                    [ -z "$_matched_bsd" ] && _matched_bsd="$_b"
+                done
+                [ "$_all_ok" = "1" ] || return 1
+                ;;
+            req=*)
+                _L=${_spec#req=}
+                eval "_tag=\$_t_$_L"
+                [ -n "$_tag" ] || return 1
+                _b=$(disk_for_baseline_id "$_tag" 2>/dev/null)
+                [ -n "$_b" ] || return 1
+                [ -z "$_matched_bsd" ] && _matched_bsd="$_b"
+                ;;
+            oneof=*)
+                _letters=${_spec#oneof=}
+                _found=0
+                for _L in $(printf '%s' "$_letters" | tr ',' ' '); do
+                    eval "_tag=\$_t_$_L"
+                    [ -n "$_tag" ] || continue
+                    _b=$(disk_for_baseline_id "$_tag" 2>/dev/null)
+                    if [ -n "$_b" ]; then
+                        _found=1
+                        [ -z "$_matched_bsd" ] && _matched_bsd="$_b"
+                        break
+                    fi
+                done
+                [ "$_found" = "1" ] || return 1
+                ;;
+        esac
+    done
+
+    [ -n "$_matched_bsd" ] && echo "$_matched_bsd"
+    return 0
+}
+
+# Return the parsed DISK_ID_MATCH policy (caching on first call).
+# Errors out + aborts if DISK_ID_MATCH is unset OR fails to parse.
+# Callers should treat this as a hard precondition before invoking
+# disk_match_evaluate.
+_DISK_ID_MATCH_PARSED_CACHE=""
+disk_match_require() {
+    if [ -n "$_DISK_ID_MATCH_PARSED_CACHE" ]; then
+        printf '%s\n' "$_DISK_ID_MATCH_PARSED_CACHE"
+        return 0
+    fi
+    if [ -z "${DISK_ID_MATCH:-}" ]; then
+        die "DISK_ID_MATCH is not set in $LOADED_CONFIG.
+Required: declares which on-disk identifiers must match for a baselined
+disk to count as present. Suggested default for most users:
+
+    DISK_ID_MATCH=\"ONE-OF(S,W),P\"
+
+See the DISK_ID_MATCH section in the example config for the full
+grammar (S/W/P letters, ONE-OF(...) for OR, comma for AND, 'ALL' for
+strictest)."
+    fi
+    _parsed=$(disk_match_parse "$DISK_ID_MATCH") || die "DISK_ID_MATCH=\"$DISK_ID_MATCH\" failed to parse (see error above)."
+    _DISK_ID_MATCH_PARSED_CACHE="$_parsed"
+    printf '%s\n' "$_parsed"
+}
+
+>>>>>>> 2dd898e42b065bbaca74af88849fb53912aad281
 # ----------------------------------------------------------------------
 # Alerting: sound + email.
 # alert_sound plays ALARM_SOUND using afplay, respecting ALARM_VOLUME_MODE.
@@ -2179,6 +3006,21 @@ alert_email() {
     subject="$1"; body="$2"
     [ -n "${EMAIL_TO:-}" ] || { log_debug "Email disabled (no EMAIL_TO)"; return 0; }
     [ -n "${EMAIL_SENDER:-}" ] || { log_debug "Email disabled (no EMAIL_SENDER)"; return 0; }
+<<<<<<< HEAD
+||||||| 5ac8308
+    [ -x "$EMAIL_SENDER" ] || { log_warn "Email sender not executable: $EMAIL_SENDER"; return 0; }
+=======
+
+    # Resolve the sender. Accept either an absolute path or a bare name
+    # (e.g. "msmtp"); for the latter we look it up via PATH, which now
+    # includes both Homebrew prefixes (see top-of-script PATH block).
+    case "$EMAIL_SENDER" in
+        /*) sender_exec="$EMAIL_SENDER" ;;
+        *)  sender_exec=$(command -v "$EMAIL_SENDER" 2>/dev/null) ;;
+    esac
+    [ -n "$sender_exec" ] && [ -x "$sender_exec" ] \
+        || { log_warn "Email sender not found or not executable: '$EMAIL_SENDER'"; return 0; }
+>>>>>>> 2dd898e42b065bbaca74af88849fb53912aad281
 
     # Resolve the sender. Accept either an absolute path or a bare name
     # (e.g. "msmtp"); for the latter we look it up via PATH, which now
@@ -2202,6 +3044,7 @@ alert_email() {
         printf 'Content-Type: text/plain; charset=utf-8\n'
         printf '\n'
         printf '%s\n' "$body"
+<<<<<<< HEAD
     } | "$sender_exec" "$EMAIL_TO" 2>"${_stderr_tmp:-/dev/null}"
     _rc=$?
     if [ "$_rc" -ne 0 ]; then
@@ -2394,6 +3237,13 @@ Set EMAIL_HEARTBEAT_INTERVAL=0 in the config to disable.
     else
         log_warn "heartbeat: send FAILED (see EMAIL FAILED block above)"
     fi
+||||||| 5ac8308
+    } | "$EMAIL_SENDER" "$EMAIL_TO" 2>/dev/null \
+        || log_warn "Email send failed (check msmtp config and $EMAIL_SENDER --debug)"
+=======
+    } | "$sender_exec" "$EMAIL_TO" 2>/dev/null \
+        || log_warn "Email send failed (check msmtp config and '$sender_exec --debug')"
+>>>>>>> 2dd898e42b065bbaca74af88849fb53912aad281
 }
 
 # ----------------------------------------------------------------------
@@ -4166,6 +5016,7 @@ cmd_health() {
     fi
     state_init
     seen_init
+<<<<<<< HEAD
 
     # Per-run event log. handle_problem and handle_resolved append to
     # this file (via the HEALTH_RUN_LOG env var) so the end-of-run
@@ -4190,6 +5041,25 @@ cmd_health() {
     # health is the natural place to catch the case where a set was
     # destroyed before cmd_destroy got a chance to sweep.
     _sweep_stale_ar_overrides
+||||||| 5ac8308
+    # Trap so we always clean up the temp seen-file.
+    trap 'seen_cleanup' EXIT INT TERM
+=======
+
+    # Per-run event log. handle_problem and handle_resolved append to
+    # this file (via the HEALTH_RUN_LOG env var) so the end-of-run
+    # SUMMARY block can count what happened this pass without re-
+    # parsing the state DB. Cleaned up by the trap below.
+    HEALTH_RUN_LOG=$(mktemp -t my-appleRAID-runlog.XXXXXX) || HEALTH_RUN_LOG=""
+    export HEALTH_RUN_LOG
+
+    # Trap so we always clean up the temp seen-file + run-log.
+    # Health iterates monitored disks, optsets, and presence checks -
+    # all of which call disk_baseline_id / disk_for_baseline_id. Cache
+    # once up front, clean up via the same trap as the rest.
+    _diskid_cache_init
+    trap 'seen_cleanup; _diskid_cache_clear; [ -n "$HEALTH_RUN_LOG" ] && rm -f "$HEALTH_RUN_LOG"' EXIT INT TERM
+>>>>>>> 2dd898e42b065bbaca74af88849fb53912aad281
 
     dry=0
     force=0
@@ -4372,6 +5242,7 @@ cmd_health() {
         [ "$worst" -lt 1 ] && worst=1
     fi
 
+<<<<<<< HEAD
     # Refresh the sidecar BEFORE seen_cleanup (state DB read is still
     # valid here). status / disks invocations read this file for their
     # top-banner + bottom-detail blocks.
@@ -4383,6 +5254,14 @@ cmd_health() {
     # (alert emails already exercise the channel).
     _send_heartbeat_if_due
 
+||||||| 5ac8308
+=======
+    # Refresh the sidecar BEFORE seen_cleanup (state DB read is still
+    # valid here). status / disks invocations read this file for their
+    # top-banner + bottom-detail blocks.
+    _write_health_problems_file 2>/dev/null || true
+
+>>>>>>> 2dd898e42b065bbaca74af88849fb53912aad281
     seen_cleanup
     trap - EXIT INT TERM
     return $worst
@@ -4539,6 +5418,7 @@ cmd_create_config() {
 # ======================================================================
 
 
+<<<<<<< HEAD
 # ======================================================================
 # !!! REVIEW / SET THESE FIRST !!!
 # ----------------------------------------------------------------------
@@ -4592,6 +5472,47 @@ EMAIL_INTERVAL=4h
 EMAIL_HEARTBEAT_INTERVAL=7d
 
 
+||||||| 5ac8308
+=======
+# ======================================================================
+# !!! REVIEW / SET THESE FIRST !!!
+# ----------------------------------------------------------------------
+# Without the three EMAIL_* keys below, problems are detected and logged
+# but NO email is sent. The audible alarm still fires (if enabled), and
+# the LOG_FILE still records everything, but you will NOT be notified
+# remotely until EMAIL_TO has a real address AND EMAIL_SENDER points at
+# a configured sendmail-compatible binary.
+# ======================================================================
+
+# Recipient. EMPTY (default) DISABLES EMAIL ENTIRELY.
+# Set this to a real address before relying on the daemon for alerts.
+EMAIL_TO=""
+
+# From address. Must match what your SMTP relay allows (most relays
+# reject mail whose envelope sender is not a domain they accept).
+# Default below is a placeholder that will be rejected by every relay.
+EMAIL_FROM="my-appleRAID@localhost"
+
+# Path to (or bare name of) a sendmail-compatible sender. msmtp is
+# recommended:
+#   brew install msmtp
+# Configure ~/.msmtprc with a working SMTP account before email will
+# leave the host.
+#
+# A bare name (default below) is resolved via PATH; my-appleRAID's
+# top-of-script block extends PATH to include /opt/homebrew/bin and
+# /usr/local/bin so this works in the launchd daemon context too. Set
+# to an absolute path here if you have multiple sender binaries and
+# want to pin one explicitly.
+EMAIL_SENDER="msmtp"
+
+# Minimum time between emails for the SAME ongoing problem.
+# Accepts duration suffixes (see top of file): 60, 60s, 5m, 2h, 1d, 1w.
+# Default 4h gives 6 emails/day max per problem.
+EMAIL_INTERVAL=4h
+
+
+>>>>>>> 2dd898e42b065bbaca74af88849fb53912aad281
 # --- RAID monitoring -------------------------------------------------
 
 # Which RAID sets to SMART-monitor and status-check.
@@ -5525,6 +6446,7 @@ Use 'baseline --update --sets' (etc.) to refresh, or 'baseline' alone to show."
         info "Forensic snapshot refreshed: $(_baseline_raw_file)"
     fi
 
+<<<<<<< HEAD
     # End of --update --sets/--disks path. If --update was given without
     # any scope flags (do_optsets=1 alongside), launch the interactive
     # OPTIONAL_DISK_SETS manager too, with an "(s)kip" prompt so non-tty
@@ -6490,6 +7412,976 @@ _optsets_action_remove() {
             printf '%s|%s|__placeholder__\n' "$_setn" "$_grpn" >> "$_wf"
         fi
     done
+||||||| 5ac8308
+    ok "Baseline updated."
+    info "REQUIRED_SETS=all / REQUIRED_DISKS=all will compare against these files."
+=======
+    # End of --update --sets/--disks path. If --update was given without
+    # any scope flags (do_optsets=1 alongside), launch the interactive
+    # OPTIONAL_DISK_SETS manager too, with an "(s)kip" prompt so non-tty
+    # contexts (daemon, scripted) don't hang.
+    if [ "${do_update:-0}" = "1" ] && [ "${do_optsets:-0}" = "1" ]; then
+        if [ "$do_sets" = "1" ] || [ "$do_disks" = "1" ]; then
+            # Came via the "no scope = all three" path. Offer to skip.
+            echo
+            if [ -t 0 ] && [ -t 1 ]; then
+                printf '%s' "Now run the interactive OPTIONAL_DISK_SETS manager? [Y/n/s(kip)]: "
+                read -r _ans
+                case "$_ans" in
+                    n|N|s|S|skip|SKIP)
+                        info "Skipped --optsets step."
+                        ;;
+                    *)
+                        cmd_baseline_optsets
+                        ;;
+                esac
+            else
+                info "Skipping --optsets step (non-interactive; stdin is not a terminal)."
+            fi
+        fi
+    fi
+
+    ok "Baseline update complete."
+    info "REQUIRED_SETS=all and REQUIRED_DISKS=all use the files above; OPTIONAL_DISK_SETS rules (a)+(b) use the config."
+}
+
+# ----------------------------------------------------------------------
+# Forensic baseline.raw: per-disk dump of diskutil + smartctl +
+# system_profiler output, plus a header with timestamp/host/version.
+# Written atomically every time --update --disks (or full --update)
+# runs. Never read by runtime code paths - purely diagnostic.
+# ----------------------------------------------------------------------
+_baseline_raw_file() { echo "${STATE_DIR}/baseline.raw"; }
+
+# Render one section: print the command line, then a separator, then
+# the command's stdout. Used by _baseline_write_raw.
+_baseline_raw_cmd() {
+    _label="$1"; shift
+    printf '\n----- $ %s -----\n' "$_label"
+    "$@" 2>&1 || printf '(command exited %d)\n' "$?"
+}
+
+# Atomically rewrite $STATE_DIR/baseline.raw from current system state.
+# Caller is responsible for require_smartctl_usable / cache priming.
+_baseline_write_raw() {
+    _raw=$(_baseline_raw_file)
+    _tmp="${_raw}.tmp.$$"
+    {
+        printf '================================================================================\n'
+        printf 'my-appleRAID baseline.raw\n'
+        printf 'Generated:       %s\n' "$(now_iso)"
+        printf 'Host:            %s  (%s %s)\n' \
+            "$(hostname -s 2>/dev/null)" "$(uname -s)" "$(uname -r)"
+        printf 'my-appleRAID:    %s (%s)\n' "${SCRIPT_VERSION:-?}" "${SCRIPT_COMMIT:-?}"
+        if command -v smartctl >/dev/null 2>&1; then
+            printf 'smartctl:        %s\n' "$(smartctl --version 2>/dev/null | awk 'NR==1')"
+        else
+            printf 'smartctl:        NOT INSTALLED\n'
+        fi
+        printf 'macOS:           %s (build %s)\n' \
+            "$(sw_vers -productVersion 2>/dev/null)" \
+            "$(sw_vers -buildVersion 2>/dev/null)"
+        printf '================================================================================\n'
+        # Per-disk section, in the order baseline-disks lists them.
+        _bf=$(baseline_disks_file)
+        if [ ! -f "$_bf" ]; then
+            printf '\n(no baseline-disks file yet; nothing to dump)\n'
+        else
+            _idx=0
+            _total=$(awk 'NF>0 && !/^#/' "$_bf" | wc -l | tr -d ' ')
+            awk 'NF>0 && !/^#/' "$_bf" | while IFS= read -r _line; do
+                _idx=$((_idx + 1))
+                # Tags (pre-#) and bsd-hint (post-#).
+                _tags=$(printf '%s' "$_line" | awk '{sub(/[[:space:]]*#.*$/,""); print}')
+                _comment=$(printf '%s' "$_line" | awk -F'#' 'NF>1 {print $2}' \
+                    | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+                _bsd=$(printf '%s' "$_comment" | awk '{print $1}')
+                printf '\n##############################################################################\n'
+                printf '# Disk %d/%d  -- baseline entry: %s\n' \
+                    "$_idx" "$_total" "$_tags"
+                printf '# Hint: %s\n' "$_comment"
+                printf '##############################################################################\n'
+                if [ -z "$_bsd" ] || ! diskutil info "/dev/$_bsd" >/dev/null 2>&1; then
+                    # The recorded bsd no longer exists; try to resolve
+                    # via the cache (a tag from the entry).
+                    _try=$(echo "$_tags" | awk '{print $1}')
+                    _bsd=$(disk_for_baseline_id "$_try" 2>/dev/null)
+                    if [ -n "$_bsd" ]; then
+                        printf '(bsd hint stale; resolved via tag to /dev/%s)\n' "$_bsd"
+                    else
+                        printf '(disk not currently attached; tag lookup failed)\n'
+                        continue
+                    fi
+                fi
+                _baseline_raw_cmd "diskutil info /dev/$_bsd" \
+                    diskutil info "/dev/$_bsd"
+                _baseline_raw_cmd "diskutil list /dev/$_bsd" \
+                    diskutil list "/dev/$_bsd"
+                if command -v smartctl >/dev/null 2>&1; then
+                    _baseline_raw_cmd "smartctl -i /dev/$_bsd" \
+                        smartctl -i "/dev/$_bsd"
+                    _baseline_raw_cmd "smartctl -a /dev/$_bsd" \
+                        smartctl -a "/dev/$_bsd"
+                fi
+            done
+        fi
+    } > "$_tmp" 2>/dev/null
+    mv "$_tmp" "$_raw" || { rm -f "$_tmp"; die "Failed to write $_raw"; }
+    chmod 0644 "$_raw" 2>/dev/null || true
+}
+
+# baseline --raw: cat the recorded forensic snapshot.
+_baseline_show_raw() {
+    _raw=$(_baseline_raw_file)
+    if [ ! -f "$_raw" ]; then
+        die "No forensic snapshot recorded yet.
+Run '$SCRIPT_NAME baseline --update --disks' to create $_raw."
+    fi
+    cat "$_raw"
+}
+
+# baseline --diff: show what --update would change relative to the
+# recorded baseline files. Read-only.
+_baseline_diff() {
+    step "Baseline diff (recorded vs. live)"
+    # Sets.
+    _sets_f=$(baseline_sets_file)
+    _prev_sets=""
+    [ -f "$_sets_f" ] && _prev_sets=$(awk 'NF>0 && !/^#/' "$_sets_f")
+    _live_sets=$(diskutil appleRAID list 2>/dev/null | awk -F': +' '
+        /^Name:/ { n=$2; sub(/ +$/,"",n); if (n!="") print n }')
+    _added_s=$(printf '%s\n' "$_live_sets" "$_prev_sets" "$_prev_sets" \
+        | awk 'NF>0' | sort | uniq -u)
+    _removed_s=$(printf '%s\n' "$_prev_sets" "$_live_sets" "$_live_sets" \
+        | awk 'NF>0' | sort | uniq -u)
+    info "RAID sets:"
+    if [ -z "$_added_s" ] && [ -z "$_removed_s" ]; then
+        echo "    (no changes)"
+    else
+        [ -n "$_added_s" ]   && echo "$_added_s"   | sed 's/^/    + /'
+        [ -n "$_removed_s" ] && echo "$_removed_s" | sed 's/^/    - /'
+    fi
+    echo
+
+    # Disks: compare recorded entries vs. live entries the writer
+    # would produce. Both are entry-text (tags + bsd-hint).
+    require_smartctl_usable "baseline --diff (live disk snapshot)"
+    info "Disks:"
+    _disks_f=$(baseline_disks_file)
+    _prev_disks_full=""
+    [ -f "$_disks_f" ] && _prev_disks_full=$(awk 'NF>0 && !/^#/' "$_disks_f")
+    # Generate the live disk-entry list into a tmpfile (same path
+    # baseline_write_disks would take, minus the actual write).
+    _live_tmp=$(mktemp "${STATE_DIR}/.baseline-diff-disks.XXXXXX")
+    _orig_f=$(baseline_disks_file)
+    baseline_disks_file() { echo "$_live_tmp"; }
+    baseline_write_disks
+    baseline_disks_file() { echo "$_orig_f"; }
+    _live_disks_full=$(awk 'NF>0 && !/^#/' "$_live_tmp")
+    rm -f "$_live_tmp"
+    # Compare ENTRY TEXT (full line minus comment). A line is "changed"
+    # if its first-tag key is present in both but the entries differ;
+    # added if only in live; removed if only in prev.
+    _diff_disks_added=$(printf '%s\n%s\n%s\n' "$_live_disks_full" "$_prev_disks_full" "$_prev_disks_full" \
+        | awk 'NF>0' | sort | uniq -u)
+    _diff_disks_removed=$(printf '%s\n%s\n%s\n' "$_prev_disks_full" "$_live_disks_full" "$_live_disks_full" \
+        | awk 'NF>0' | sort | uniq -u)
+    if [ -z "$_diff_disks_added" ] && [ -z "$_diff_disks_removed" ]; then
+        echo "    (no changes)"
+    else
+        [ -n "$_diff_disks_removed" ] && echo "$_diff_disks_removed" | sed 's/^/    - /'
+        [ -n "$_diff_disks_added" ]   && echo "$_diff_disks_added"   | sed 's/^/    + /'
+    fi
+    echo
+    info "Read-only. Run 'baseline --update --disks' to apply changes."
+}
+
+# baseline --diff --raw: unified diff of the forensic snapshot.
+_baseline_diff_raw() {
+    _raw=$(_baseline_raw_file)
+    if [ ! -f "$_raw" ]; then
+        die "No forensic snapshot recorded yet.
+Run '$SCRIPT_NAME baseline --update --disks' to create $_raw, then re-diff."
+    fi
+    require_smartctl_usable "baseline --diff --raw (live forensic snapshot)"
+    step "Baseline raw diff (recorded vs. live)"
+    info "Recorded: $(awk '/^Generated:/ {sub(/^Generated:[[:space:]]*/, ""); print; exit}' "$_raw")"
+    info "Live:     $(now_iso)"
+    # Generate the live raw snapshot into a tmpfile by temporarily
+    # redirecting _baseline_raw_file.
+    _live_tmp=$(mktemp "${STATE_DIR}/.baseline-diff-raw.XXXXXX")
+    _orig_f="$_raw"
+    _baseline_raw_file() { echo "$_live_tmp"; }
+    _baseline_write_raw
+    _baseline_raw_file() { echo "$_orig_f"; }
+    echo
+    diff -u "$_raw" "$_live_tmp" | sed 's/^/    /'
+    rm -f "$_live_tmp"
+}
+
+# ----------------------------------------------------------------------
+# `baseline --update --optsets` - interactive OPTIONAL_DISK_SETS manager.
+#
+# Lets the user define named rotation groups and assign disks to them
+# without hand-editing the config file. Operates on a session-local
+# work file that mirrors the parsed OPTIONAL_DISK_SETS value as one
+# "<group>|<spec>" line per (group, member) pair. On save, the work
+# file is rendered back into a multi-line OPTIONAL_DISK_SETS="..."
+# block and spliced into $LOADED_CONFIG (replacing any existing
+# OPTIONAL_DISK_SETS assignment, single-line or multi-line).
+# ----------------------------------------------------------------------
+
+# Render the work file back into a shell value for OPTIONAL_DISK_SETS.
+# Output: a multi-line "..." string. Each non-empty (set, group) emits
+# "<set>/<group> = spec, spec, ..." line. Empty placeholder-only groups
+# are excluded (they exist only as in-memory scaffolding mid-edit).
+_optsets_render_value() {
+    _wf="$1"
+    [ -f "$_wf" ] || { printf '""\n'; return 0; }
+    # Real (non-placeholder) tuples?
+    if ! awk -F'|' 'NF>=3 && $3 != "__placeholder__" {f=1; exit} END{exit !f}' "$_wf"; then
+        printf '""\n'; return 0
+    fi
+    printf '"\n'
+    awk -F'|' 'NF>=3 && $3 != "__placeholder__" {
+        key = $1 "|" $2
+        if (!(seen[key]++)) order[++n] = key
+        members[key] = (members[key] ? members[key] ", " $3 : $3)
+    }
+    END {
+        for (i = 1; i <= n; i++) {
+            split(order[i], a, "|")
+            print a[1] "/" a[2] " = " members[order[i]]
+        }
+    }' "$_wf"
+    printf '"\n'
+}
+
+# Sweep baseline-disks: remove any tagged-id whose disk is now a
+# member of an optset (any group in any set). Those disks are
+# governed by the optset rules; keeping them in the standard
+# baseline-disks list would be confusing in `baseline --show` and
+# noisy in baseline diffs (resolve_required_disks already filters
+# them out at runtime, so behaviour doesn't change - this is a
+# cleanup pass for clarity).
+_optsets_clean_baseline() {
+    _wf="$1"
+    _bf=$(baseline_disks_file)
+    [ -f "$_bf" ] || return 0
+    _specs=$(mktemp "$STATE_DIR/.optsets-clean.XXXXXX") || return 0
+    awk -F'|' 'NF>=3 && $3 != "__placeholder__" {print $3}' "$_wf" | sort -u > "$_specs"
+    if [ ! -s "$_specs" ]; then rm -f "$_specs"; return 0; fi
+    _new=$(mktemp "$STATE_DIR/.optsets-cleanout.XXXXXX") || { rm -f "$_specs"; return 0; }
+    awk '
+        NR==FNR { specs[$0]=1; next }
+        /^[[:space:]]*#/ || NF==0 { print; next }
+        !($1 in specs) { print }
+    ' "$_specs" "$_bf" > "$_new"
+    _old_n=$(awk 'NF>0 && !/^[[:space:]]*#/' "$_bf" | wc -l | tr -d ' ')
+    _new_n=$(awk 'NF>0 && !/^[[:space:]]*#/' "$_new" | wc -l | tr -d ' ')
+    _removed=$((_old_n - _new_n))
+    if [ "$_removed" -gt 0 ]; then
+        chmod --reference="$_bf" "$_new" 2>/dev/null \
+            || chmod 0644 "$_new" 2>/dev/null || true
+        if mv "$_new" "$_bf"; then
+            ok "Removed $_removed disk(s) from baseline-disks (now governed by optset): $_bf"
+        else
+            rm -f "$_new"
+            warn "Could not update $_bf"
+        fi
+    else
+        rm -f "$_new"
+    fi
+    rm -f "$_specs"
+}
+
+# Splice a new OPTIONAL_DISK_SETS=<value> block into $LOADED_CONFIG,
+# replacing any existing assignment (single-line OR multi-line quoted).
+# Appends if not present. Writes atomically via a tmpfile next to the
+# real config. Honors symlinks: edits the link target.
+_optsets_save_to_config() {
+    _new_value_file="$1"
+    case "$LOADED_CONFIG" in
+        ""|*'(none'*)
+            errmsg "No config file is loaded; nothing to write to."
+            errmsg "Create one first: $SCRIPT_NAME create-config <path>"
+            return 1
+            ;;
+    esac
+    _conf=$(readlink -f "$LOADED_CONFIG" 2>/dev/null || echo "$LOADED_CONFIG")
+    if [ ! -w "$_conf" ]; then
+        errmsg "Config file is not writable by uid=$(id -u): $_conf"
+        errmsg "Re-run as root, or fix permissions, then try again."
+        return 1
+    fi
+    _tmp=$(mktemp "$_conf.optset.XXXXXX") || { errmsg "mktemp failed"; return 1; }
+    # Strip any existing OPTIONAL_DISK_SETS=... block (handles both
+    # single-line and multi-line quoted forms).
+    awk '
+        BEGIN { skip = 0 }
+        {
+            if (skip) {
+                if ($0 ~ /"/) skip = 0
+                next
+            }
+            if ($0 ~ /^OPTIONAL_DISK_SETS=/) {
+                # Single-line: closes on same line.
+                if ($0 ~ /^OPTIONAL_DISK_SETS="[^"]*"[[:space:]]*$/) next
+                # Single-line bare (unquoted, e.g. OPTIONAL_DISK_SETS=).
+                if ($0 !~ /^OPTIONAL_DISK_SETS="/) next
+                # Multi-line opening: skip until next line containing ".
+                skip = 1
+                next
+            }
+            print
+        }
+    ' "$_conf" > "$_tmp" || { rm -f "$_tmp"; errmsg "awk rewrite failed"; return 1; }
+    # Append the new block (with a leading blank line for readability).
+    {
+        printf '\n# Updated by %s baseline --update --optsets on %s\n' "$SCRIPT_NAME" "$(now_iso 2>/dev/null || date)"
+        printf 'OPTIONAL_DISK_SETS=%s' "$(cat "$_new_value_file")"
+    } >> "$_tmp"
+    # Preserve perms/ownership.
+    chmod --reference="$_conf" "$_tmp" 2>/dev/null \
+        || chmod 0644 "$_tmp" 2>/dev/null || true
+    if mv "$_tmp" "$_conf"; then
+        ok "Wrote OPTIONAL_DISK_SETS into: $_conf"
+        return 0
+    else
+        rm -f "$_tmp"
+        errmsg "atomic rename to $_conf failed"
+        return 1
+    fi
+}
+
+# Print the current state of the work file as a SET/GROUP tree, with
+# presence tally per group; plus unassigned attached disks and
+# missing-from-baseline disks the user can assign.
+# Build the candidate cache. Format per line:
+#     KIND|ID|NODE|SIZE|MODEL
+# KIND is ATTACHED (currently plugged in, has a stable id) or MISSING
+# (in baseline-disks but not currently attached). Order: attached
+# first (declaration order from list_all_physical_disks), then
+# missing (declaration order from the baseline file). Numbers used
+# in the UI are 1-based row indices into this file and are stable
+# for the whole session.
+_optsets_build_cache() {
+    _cache="$1"
+    : > "$_cache"
+    # Attached.
+    list_all_physical_disks | while IFS= read -r _d; do
+        [ -n "$_d" ] || continue
+        _id=$(disk_baseline_id "$_d" 2>/dev/null)
+        [ -n "$_id" ] || continue
+        _info=$(diskutil info "/dev/$_d" 2>/dev/null)
+        _model=$(printf '%s\n' "$_info" \
+            | awk -F': +' '/Device \/ Media Name:/ {print $2; exit}' \
+            | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+        # "Disk Size: 16.0 TB (15999999999 Bytes) (...)". We want the
+        # human form (first two whitespace-separated tokens after the
+        # colon), e.g. "16.0 TB".
+        _size=$(printf '%s\n' "$_info" \
+            | awk -F': +' '/Disk Size:/ {print $2; exit}' \
+            | awk '{print $1, $2}' \
+            | sed 's/[[:space:]]*$//')
+        printf 'ATTACHED|%s|/dev/%s|%s|%s\n' "$_id" "$_d" "${_size:-?}" "${_model:-?}" >> "$_cache"
+    done
+    # Missing-from-baseline. baseline_write_disks formats each line as
+    #     <id>  # <bsd>  <size>  <model>
+    # where <size> is "<num> <unit>" (two whitespace-separated tokens)
+    # and <model> is the rest. Parse with awk.
+    _bf=$(baseline_disks_file)
+    if [ -f "$_bf" ]; then
+        awk '
+            NF>0 && !/^#/ {
+                id = $1
+                hidx = 0
+                for (i = 2; i <= NF; i++) if ($i == "#") { hidx = i; break }
+                if (hidx == 0 || hidx + 3 > NF) {
+                    # Fallback: no parsable hint. Emit whole tail as model.
+                    rest = ""
+                    for (j = 2; j <= NF; j++) rest = rest (rest=="" ? "" : " ") $j
+                    print id "|-|?|" rest
+                    next
+                }
+                bsd = $(hidx + 1)
+                size = $(hidx + 2) " " $(hidx + 3)
+                model = ""
+                for (j = hidx + 4; j <= NF; j++) model = (model == "" ? $j : model " " $j)
+                if (model == "") model = "?"
+                print id "|" bsd "|" size "|" model
+            }
+        ' "$_bf" | while IFS='|' read -r _id _bsd _size _model; do
+            [ -n "$_id" ] || continue
+            # Skip if we already listed it as ATTACHED (under any bsd).
+            if grep -q "^ATTACHED|${_id}|" "$_cache" 2>/dev/null; then continue; fi
+            # Confirm it's actually missing from current attachment.
+            [ -z "$(disk_for_baseline_id "$_id" 2>/dev/null)" ] || continue
+            printf 'MISSING|%s|-|%s|%s\n' "$_id" "${_size:-?}" "${_model:-?}" >> "$_cache"
+        done
+    fi
+}
+
+# Look up the (set/group) currently holding a given spec in the work
+# file, or empty if unassigned. Excludes placeholders.
+_optsets_assignment_of() {
+    _wf="$1"; _spec="$2"
+    awk -F'|' -v sp="$_spec" '$3==sp && $3!="__placeholder__" {print $1 "/" $2; exit}' "$_wf"
+}
+
+# Resolve a number from the cache to its tagged id (column 2). Empty
+# if the number is out of range.
+_optsets_id_for_num() {
+    _cache="$1"; _n="$2"
+    awk -F'|' -v n="$_n" 'NR==n {print $2; exit}' "$_cache"
+}
+
+# Render the SET/GROUP/STATE/MEMBERS table (4 columns, SET in column 1)
+# plus the cached numbered disk list with per-row assignment status.
+_optsets_show_state() {
+    _wf="$1"; _cache="$2"
+    echo
+    step "Optional disk sets (working draft)"
+    if ! awk 'NF>0' "$_wf" | head -n1 | grep -q .; then
+        info "(no sets/groups defined yet)"
+    else
+        printf '  %-18s %-18s %-12s %s\n' "SET" "GROUP" "STATE" "MEMBERS"
+        printf '  %-18s %-18s %-12s %s\n' "---" "-----" "-----" "-------"
+        # Walk SET, then GROUPs within, in declaration order.
+        _setlist=$(awk -F'|' 'NF>=3 && !seen[$1]++ {print $1}' "$_wf")
+        echo "$_setlist" | while IFS= read -r _setn; do
+            [ -n "$_setn" ] || continue
+            _groups=$(awk -F'|' -v s="$_setn" '$1==s && !seen[$2]++ {print $2}' "$_wf")
+            echo "$_groups" | while IFS= read -r _grpn; do
+                [ -n "$_grpn" ] || continue
+                _ms=$(awk -F'|' -v s="$_setn" -v g="$_grpn" '$1==s && $2==g && $3 != "__placeholder__" {print $3}' "$_wf" | tr '\n' ' ')
+                if [ -z "$(printf '%s' "$_ms" | tr -d '[:space:]')" ]; then
+                    printf '  %-18s %-18s %-12s %s\n' "$_setn" "$_grpn" "EMPTY(0/0)" "(no disks assigned yet)"
+                    continue
+                fi
+                _total=0; _present=0; _line=""
+                for _s in $_ms; do
+                    _total=$((_total + 1))
+                    _bsd=$(optional_spec_to_bsd "$_s" 2>/dev/null)
+                    if [ -n "$_bsd" ]; then
+                        _present=$((_present + 1))
+                        _line="$_line ${_s}->${_bsd}"
+                    else
+                        _line="$_line ${_s}=MISSING"
+                    fi
+                done
+                if [ "$_total" -gt 0 ] && [ "$_present" = "$_total" ]; then
+                    _state="FULL"
+                elif [ "$_present" -gt 0 ]; then
+                    _state="PARTIAL"
+                else
+                    _state="ABSENT"
+                fi
+                printf '  %-18s %-18s %-12s %s\n' "$_setn" "$_grpn" "${_state}(${_present}/${_total})" "${_line# }"
+            done
+        done
+    fi
+
+    # Numbered disk list: ATTACHED first, then MISSING. Numbers are
+    # stable for the whole session (the cache is built once at start).
+    echo
+    info "Disks (numbers stable; use them in 'a' / 'x' / disk-pick after 'c'):"
+    if [ ! -s "$_cache" ]; then
+        echo "  (no disks discovered)"
+        return 0
+    fi
+    _i=0
+    while IFS='|' read -r _kind _id _node _size _model; do
+        [ -n "$_kind" ] || continue
+        _i=$((_i + 1))
+        _own=$(_optsets_assignment_of "$_wf" "$_id")
+        if [ -n "$_own" ]; then
+            _tag="in: $_own"
+        else
+            _tag="unassigned"
+        fi
+        # Columns: NUM) KIND ID NODE SIZE MODEL [tag]
+        # ID width sized for the widest tagged form: "PART:" + 36-char
+        # GPT GUID = 41 chars. SIZE is "<num> <unit>" e.g. "16.0 TB"
+        # (8 chars max for sane disks). MODEL squashed to single
+        # spaces and capped at 28 chars.
+        _model_norm=$(printf '%s' "${_model:-?}" | tr -s '[:space:]' ' ')
+        printf '  %3d) [%-8s] %-41s %-12s %-9s %-28.28s [%s]\n' \
+            "$_i" "$_kind" "$_id" "$_node" "${_size:-?}" "$_model_norm" "$_tag"
+    done < "$_cache"
+}
+
+# Interactive entry point.
+cmd_baseline_optsets() {
+    if [ ! -t 0 ] || [ ! -t 1 ]; then
+        die "baseline --update --optsets is interactive; needs a TTY on stdin/stdout."
+    fi
+    _ensure_state_dir_writable
+    _wf=$(mktemp "$STATE_DIR/.optsets-work.XXXXXX") \
+        || die "mktemp failed in $STATE_DIR"
+    _cache=$(mktemp "$STATE_DIR/.optsets-cache.XXXXXX") \
+        || { rm -f "$_wf"; die "mktemp failed in $STATE_DIR"; }
+    # On normal EXIT just clean up. On INT/TERM clean up AND exit:
+    # otherwise the trap deletes the work files but control returns to
+    # the menu loop, which then tries to awk a vanished file. Common
+    # path: user Ctrl+C-s out of an interactive child (bash readline,
+    # confirm, etc.) - the SIGINT hits both the child and us.
+    trap 'rm -f "$_wf" "$_cache"' EXIT
+    trap 'rm -f "$_wf" "$_cache"; trap - EXIT; exit 130' INT TERM
+
+    # Seed the work file from the current OPTIONAL_DISK_SETS value.
+    optional_sets_iter > "$_wf" 2>/dev/null || true
+    # Build the candidate cache ONCE (expensive: smartctl, system_profiler).
+    _optsets_build_cache "$_cache"
+
+    step "Interactive OPTIONAL_DISK_SETS manager (SETs of GROUPs of DISKs)"
+    explain "Loaded config: ${LOADED_CONFIG:-<none>}"
+    explain "Changes are kept in memory until you 's'ave."
+    explain "Per-group rule (a): if any member is present, ALL members must be."
+    explain "Per-set rule (b): at least one group in the set must be fully present."
+    explain "Paths are 'Set/Group' (e.g. OffsiteRotation/Pair1)."
+    explain "Disk numbers shown below are STABLE across actions in this session."
+
+    while :; do
+        _optsets_show_state "$_wf" "$_cache"
+        echo
+        printf '%sActions:%s\n' "${C_BOLD}" "${C_RESET}"
+        printf '  c) create a new group (Set/Group), then assign disks by number\n'
+        printf '  r) rename a group or a whole set\n'
+        printf '  d) delete a group or a whole set\n'
+        printf '  a) add disks to an existing group (by number from list above)\n'
+        printf '  x) remove disks from a group\n'
+        printf '  R) rebuild disk cache (re-scan after a hardware change)\n'
+        printf '  s) save and exit (writes to %s)\n' "${LOADED_CONFIG:-<none>}"
+        printf '  q) quit without saving\n'
+        printf '%sChoose [c/r/d/a/x/R/s/q]:%s ' "${C_YELLOW}" "${C_RESET}"
+        if ! read -r _act; then
+            echo; warn "EOF on input; quitting without saving."
+            return 1
+        fi
+        case "$_act" in
+            c|C) _optsets_action_create "$_wf" "$_cache" ;;
+            r)   _optsets_action_rename "$_wf" ;;
+            d|D) _optsets_action_delete "$_wf" ;;
+            a|A) _optsets_action_add    "$_wf" "$_cache" ;;
+            x|X) _optsets_action_remove "$_wf" ;;
+            R)   info "Rebuilding disk cache..."
+                 # Drop the bsd->id cache too so hardware changes are
+                 # picked up on the next disk_baseline_id / for_id call.
+                 _diskid_cache_clear
+                 _diskid_cache_init
+                 _optsets_build_cache "$_cache"
+                 ok "Cache rebuilt." ;;
+            s|S)
+                _val=$(mktemp "$STATE_DIR/.optsets-val.XXXXXX") \
+                    || { errmsg "mktemp failed"; continue; }
+                _optsets_render_value "$_wf" > "$_val"
+                if _optsets_save_to_config "$_val"; then
+                    rm -f "$_val"
+                    # Sweep baseline-disks: any disk that is now in an
+                    # optset is no longer a "plain required disk", so
+                    # remove it from the baseline file for clarity.
+                    _optsets_clean_baseline "$_wf"
+                    info "Re-run 'my-appleRAID disks' to confirm membership annotations."
+                    return 0
+                fi
+                rm -f "$_val"
+                ;;
+            q|Q)
+                if confirm "Discard all changes and quit?"; then
+                    info "No changes written."
+                    return 0
+                fi
+                ;;
+            *) warn "Unknown action: '$_act'" ;;
+        esac
+    done
+}
+
+_optsets_prompt() {
+    # $1=prompt label, sets _ANS to trimmed input (may be empty).
+    printf '%s%s%s ' "${C_YELLOW}" "$1" "${C_RESET}"
+    if ! read -r _ANS; then _ANS=""; return 1; fi
+    _ANS=$(printf '%s' "$_ANS" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+}
+
+# Prompt with a numbered candidate list (helps avoid typos and
+# duplicate names by letting the user pick an existing entry by
+# number rather than retyping it).
+# $1 = prompt; $2... = candidate strings.
+# Sets _ANS to the resolved value (or blank if nothing entered):
+# - a numeric input picks the corresponding candidate
+# - any other input is returned verbatim (intended for "new" names)
+#
+# Why a numbered list rather than readline TAB completion: dash's
+# built-in `read` has no readline. We previously delegated to a
+# `bash -i -c` subshell with TAB bound to dynamic-complete-history,
+# but `bash -i` inside $(...) cannot reliably take over the user's
+# controlling terminal for input on macOS - the subshell would hang
+# silently with no echo. A numbered list works in pure dash and is
+# arguably clearer anyway: the user sees every existing name AND
+# can pick by single digit.
+_optsets_prompt_completing() {
+    _prompt="$1"; shift
+    if [ "$#" -gt 0 ]; then
+        info "Existing names (pick by number, or type a new name):"
+        _i=0
+        for _c in "$@"; do
+            [ -n "$_c" ] || continue
+            _i=$((_i + 1))
+            printf '  %2d) %s\n' "$_i" "$_c"
+        done
+    fi
+    _optsets_prompt "$_prompt"
+    case "$_ANS" in
+        '') return 0 ;;
+        [0-9]*)
+            # Numeric input - resolve to the Nth candidate.
+            _idx="$_ANS"
+            _i=0
+            _resolved=""
+            for _c in "$@"; do
+                [ -n "$_c" ] || continue
+                _i=$((_i + 1))
+                if [ "$_i" = "$_idx" ]; then
+                    _resolved="$_c"
+                    break
+                fi
+            done
+            if [ -n "$_resolved" ]; then
+                _ANS="$_resolved"
+                info "  -> $_ANS"
+            else
+                warn "No candidate at number $_idx; using literal '$_ANS' as a new name."
+            fi
+            ;;
+    esac
+    return 0
+}
+
+# List all (set, group) pairs in declaration order, numbered.
+# Sets _PATHS to a newline-separated "set/group" list and prints
+# them with numbers. Returns 1 if the work file is empty.
+_optsets_list_paths() {
+    _wf="$1"
+    _PATHS=$(awk -F'|' 'NF>=3 && !seen[$1"|"$2]++ {print $1 "/" $2}' "$_wf")
+    if [ -z "$_PATHS" ]; then return 1; fi
+    _i=0
+    echo "$_PATHS" | while IFS= read -r _p; do
+        _i=$((_i+1)); printf '  %2d) %s\n' "$_i" "$_p"
+    done
+    return 0
+}
+
+# Resolve a user input to a "set/group" path. Accepts:
+#   - a number from the list shown by _optsets_list_paths
+#   - a literal "set/group" string
+#   - a bare group name if exactly one group with that name exists
+# Sets _PICK to the resolved "set/group" or empty.
+_optsets_resolve_path() {
+    _wf="$1"; _ans="$2"
+    _PICK=""
+    [ -n "$_ans" ] || return 1
+    _all=$(awk -F'|' 'NF>=3 && !seen[$1"|"$2]++ {print $1 "/" $2}' "$_wf")
+    case "$_ans" in
+        [0-9]*)
+            _PICK=$(echo "$_all" | awk -v n="$_ans" 'NR==n {print; exit}')
+            ;;
+        */*)
+            if echo "$_all" | grep -qxF "$_ans"; then
+                _PICK="$_ans"
+            fi
+            ;;
+        *)
+            # Bare group name: unique-match across all sets.
+            _hits=$(echo "$_all" | awk -F'/' -v g="$_ans" '$2==g {print}')
+            _hc=$(echo "$_hits" | awk 'NF>0' | wc -l | tr -d ' ')
+            if [ "$_hc" = "1" ]; then
+                _PICK=$(echo "$_hits" | head -n1)
+            elif [ "$_hc" -gt 1 ]; then
+                warn "Group name '$_ans' is ambiguous (matches: $(echo "$_hits" | tr '\n' ' '))."
+                return 1
+            fi
+            ;;
+    esac
+    if [ -z "$_PICK" ]; then
+        warn "No such set/group: '$_ans'"
+        return 1
+    fi
+    return 0
+}
+
+_optsets_validate_name() {
+    # $1 = candidate name; rejects empty / space / | / , / = / /.
+    case "$1" in
+        '') return 1 ;;
+        *'|'*|*','*|*'='*|*'/'*|*' '*) return 1 ;;
+    esac
+    return 0
+}
+
+_optsets_action_create() {
+    _wf="$1"; _cache="$2"
+
+    # Show existing sets+groups so the user has a clear visual reference
+    # for what already exists (helps avoid typos and duplicate set
+    # names). Two-step prompt: SET first (with TAB-completion of
+    # existing set names), then GROUP (with TAB-completion of existing
+    # group names within that set, shown for awareness — duplicates
+    # are rejected by validation below).
+    _existing_sets=$(awk -F'|' 'NF>=3 && !seen[$1]++ {print $1}' "$_wf")
+    if [ -n "$_existing_sets" ]; then
+        info "Existing sets:"
+        echo "$_existing_sets" | while IFS= read -r _s; do
+            [ -n "$_s" ] || continue
+            _gs=$(awk -F'|' -v s="$_s" '$1==s && !seen[$2]++ {print $2}' "$_wf" | paste -sd, -)
+            printf '  - %s (groups: %s)\n' "$_s" "${_gs:-none}"
+        done
+    else
+        info "No sets defined yet — pick any name (e.g. OffsiteRotation, WeeklyArchive)."
+    fi
+
+    # 1. Set name. With a numbered list of existing sets so the user
+    # can reuse one by number (avoids typos / accidental duplicates).
+    if [ -n "$_existing_sets" ]; then
+        # shellcheck disable=SC2046  # word-splitting intended
+        _optsets_prompt_completing \
+            "Set name (number to reuse existing, or type a new name):" \
+            $(echo "$_existing_sets")
+    else
+        _optsets_prompt "Set name (e.g. OffsiteRotation):"
+    fi
+    [ -n "$_ANS" ] || { warn "Empty set name; aborted."; return; }
+    _setn="$_ANS"
+    _optsets_validate_name "$_setn" \
+        || { warn "Invalid set name (no space, '|', ',', '=', '/')."; return; }
+
+    # 2. Group name. List this set's existing groups so the user
+    # avoids name collisions. Loop until we get a fresh, valid name
+    # (or empty input to abort) - rejecting a duplicate inline is
+    # friendlier than bouncing back to the main menu and forcing a
+    # re-entry of every step.
+    _existing_groups=$(awk -F'|' -v s="$_setn" '$1==s && !seen[$2]++ {print $2}' "$_wf")
+    if [ -n "$_existing_groups" ]; then
+        info "Groups already in set '$_setn' (pick a name NOT in this list):"
+        echo "$_existing_groups" | sed 's/^/  - /'
+    else
+        info "Set '$_setn' has no groups yet."
+    fi
+    _grpn=""
+    while [ -z "$_grpn" ]; do
+        _optsets_prompt "New group name in '$_setn' (must be fresh, e.g. Pair1; blank to cancel):"
+        if [ -z "$_ANS" ]; then
+            warn "Empty group name; aborted."
+            return
+        fi
+        if ! _optsets_validate_name "$_ANS"; then
+            warn "Invalid group name (no space, '|', ',', '=', '/'). Try again."
+            continue
+        fi
+        if awk -F'|' -v s="$_setn" -v g="$_ANS" '$1==s && $2==g {f=1; exit} END{exit !f}' "$_wf"; then
+            warn "Group '$_setn/$_ANS' already exists. Pick a different name."
+            continue
+        fi
+        _grpn="$_ANS"
+    done
+    printf '%s|%s|__placeholder__\n' "$_setn" "$_grpn" >> "$_wf"
+    ok "Created group '$_setn/$_grpn'."
+
+    # Streamlined: chain immediately into disk assignment, using the
+    # cached numbered list. Blank input keeps the empty group.
+    _optsets_assign_disks "$_wf" "$_cache" "$_setn" "$_grpn" \
+        "Assign disks to '$_setn/$_grpn' now (numbers from list, blank to skip):"
+}
+
+# Shared assignment routine. Reads space-separated numbers from the
+# cache (or pasted free-form specs) and adds each to (set, group).
+# Skips already-assigned ids (warns, with the existing path), and
+# enforces "one home per disk" across all sets/groups.
+_optsets_assign_disks() {
+    _wf="$1"; _cache="$2"; _setn="$3"; _grpn="$4"; _prompt="$5"
+    if [ ! -s "$_cache" ]; then
+        warn "Disk cache is empty (no candidates). Use 'R' to rebuild."
+        return
+    fi
+    _optsets_prompt "$_prompt"
+    if [ -z "$_ANS" ]; then
+        info "No disks assigned to '$_setn/$_grpn' yet."
+        return
+    fi
+    # Accept commas, semicolons, and whitespace as separators so "10,11",
+    # "10 11", "10; 11" all do the same thing.
+    _ANS=$(printf '%s' "$_ANS" | tr ',;' '  ')
+    _added=0
+    for _tok in $_ANS; do
+        case "$_tok" in
+            [0-9]*) _id=$(_optsets_id_for_num "$_cache" "$_tok") ;;
+            *)      _id="$_tok" ;;
+        esac
+        if [ -z "$_id" ]; then
+            warn "Could not resolve '$_tok'"; continue
+        fi
+        # Drop placeholder for this (set, group) before appending real members.
+        _tmp=$(mktemp "$STATE_DIR/.optsets-addg.XXXXXX") || continue
+        awk -F'|' -v s="$_setn" -v g="$_grpn" '!($1==s && $2==g && $3=="__placeholder__")' "$_wf" > "$_tmp" \
+            && mv "$_tmp" "$_wf"
+        # Already in this exact group?
+        if awk -F'|' -v s="$_setn" -v g="$_grpn" -v sp="$_id" '$1==s && $2==g && $3==sp {f=1; exit} END{exit !f}' "$_wf"; then
+            warn "$_id already in '$_setn/$_grpn'; skipped."
+            continue
+        fi
+        # In a DIFFERENT group? "Exactly one home per disk" — warn, skip.
+        if awk -F'|' -v sp="$_id" '$3==sp && $3!="__placeholder__" {f=1; exit} END{exit !f}' "$_wf"; then
+            _other=$(awk -F'|' -v sp="$_id" '$3==sp && $3!="__placeholder__" {print $1 "/" $2; exit}' "$_wf")
+            warn "$_id is already in '$_other'; skipped (a disk lives in one group). Use 'x' to move it."
+            continue
+        fi
+        printf '%s|%s|%s\n' "$_setn" "$_grpn" "$_id" >> "$_wf"
+        ok "Added $_id to '$_setn/$_grpn'."
+        _added=$((_added + 1))
+    done
+    [ "$_added" -gt 0 ] || warn "No disks added."
+}
+
+_optsets_action_rename() {
+    _wf="$1"
+    _optsets_prompt "Path to rename (Set or Set/Group; number from list or string):" || return
+    [ -n "$_ANS" ] || { warn "Empty; aborted."; return; }
+
+    # Determine if it refers to a SET (no slash) or a GROUP (has slash
+    # or matches a numbered list entry).
+    case "$_ANS" in
+        */*|[0-9]*)
+            _optsets_resolve_path "$_wf" "$_ANS" || return
+            _oldset=$(printf '%s' "$_PICK" | sed 's|/.*||')
+            _oldgrp=$(printf '%s' "$_PICK" | sed 's|^[^/]*/||')
+            _optsets_prompt "New Set/Group name:" || return
+            case "$_ANS" in
+                */*) ;;
+                *) warn "Need a Set/Group path."; return ;;
+            esac
+            _newset=$(printf '%s' "$_ANS" | sed 's|/.*||')
+            _newgrp=$(printf '%s' "$_ANS" | sed 's|^[^/]*/||')
+            _optsets_validate_name "$_newset" && _optsets_validate_name "$_newgrp" \
+                || { warn "Invalid name."; return; }
+            if awk -F'|' -v s="$_newset" -v g="$_newgrp" '$1==s && $2==g {f=1; exit} END{exit !f}' "$_wf"; then
+                warn "Target '$_newset/$_newgrp' already exists."; return
+            fi
+            _tmp=$(mktemp "$STATE_DIR/.optsets-rn.XXXXXX") || { errmsg "mktemp failed"; return; }
+            awk -F'|' -v os="$_oldset" -v og="$_oldgrp" -v ns="$_newset" -v ng="$_newgrp" \
+                'BEGIN{OFS="|"} $1==os && $2==og {$1=ns; $2=ng} {print}' "$_wf" > "$_tmp" \
+                && mv "$_tmp" "$_wf" \
+                && ok "Renamed '$_oldset/$_oldgrp' -> '$_newset/$_newgrp'." \
+                || { rm -f "$_tmp"; errmsg "rename failed"; }
+            ;;
+        *)
+            # Rename a SET (affects all its groups).
+            _oldset="$_ANS"
+            if ! awk -F'|' -v s="$_oldset" '$1==s {f=1; exit} END{exit !f}' "$_wf"; then
+                warn "No such set: '$_oldset'"; return
+            fi
+            _optsets_prompt "New set name:" || return
+            _optsets_validate_name "$_ANS" || { warn "Invalid set name."; return; }
+            if awk -F'|' -v s="$_ANS" '$1==s {f=1; exit} END{exit !f}' "$_wf"; then
+                warn "Set '$_ANS' already exists; renames must not collide."; return
+            fi
+            _tmp=$(mktemp "$STATE_DIR/.optsets-rn.XXXXXX") || { errmsg "mktemp failed"; return; }
+            awk -F'|' -v os="$_oldset" -v ns="$_ANS" \
+                'BEGIN{OFS="|"} $1==os {$1=ns} {print}' "$_wf" > "$_tmp" \
+                && mv "$_tmp" "$_wf" \
+                && ok "Renamed set '$_oldset' -> '$_ANS' (all its groups moved)." \
+                || { rm -f "$_tmp"; errmsg "rename failed"; }
+            ;;
+    esac
+}
+
+_optsets_action_delete() {
+    _wf="$1"
+    _optsets_prompt "Path to delete (Set or Set/Group; number from list or string):" || return
+    [ -n "$_ANS" ] || { warn "Empty; aborted."; return; }
+    case "$_ANS" in
+        */*|[0-9]*)
+            _optsets_resolve_path "$_wf" "$_ANS" || return
+            _setn=$(printf '%s' "$_PICK" | sed 's|/.*||')
+            _grpn=$(printf '%s' "$_PICK" | sed 's|^[^/]*/||')
+            confirm "Delete group '$_setn/$_grpn' and unassign all its members?" || return
+            _tmp=$(mktemp "$STATE_DIR/.optsets-del.XXXXXX") || { errmsg "mktemp failed"; return; }
+            awk -F'|' -v s="$_setn" -v g="$_grpn" '!($1==s && $2==g)' "$_wf" > "$_tmp" \
+                && mv "$_tmp" "$_wf" \
+                && ok "Deleted group '$_setn/$_grpn'." \
+                || { rm -f "$_tmp"; errmsg "delete failed"; }
+            ;;
+        *)
+            _setn="$_ANS"
+            if ! awk -F'|' -v s="$_setn" '$1==s {f=1; exit} END{exit !f}' "$_wf"; then
+                warn "No such set: '$_setn'"; return
+            fi
+            confirm "Delete entire set '$_setn' (all its groups and members)?" || return
+            _tmp=$(mktemp "$STATE_DIR/.optsets-del.XXXXXX") || { errmsg "mktemp failed"; return; }
+            awk -F'|' -v s="$_setn" '$1!=s' "$_wf" > "$_tmp" \
+                && mv "$_tmp" "$_wf" \
+                && ok "Deleted set '$_setn'." \
+                || { rm -f "$_tmp"; errmsg "delete failed"; }
+            ;;
+    esac
+}
+
+_optsets_action_add() {
+    _wf="$1"; _cache="$2"
+    info "Existing groups:"
+    if ! _optsets_list_paths "$_wf"; then
+        warn "No groups defined yet. Use 'c' to create one (Set/Group)."
+        return
+    fi
+    _optsets_prompt "Add to which group (Set/Group, or number above):" || return
+    _optsets_resolve_path "$_wf" "$_ANS" || return
+    _setn=$(printf '%s' "$_PICK" | sed 's|/.*||')
+    _grpn=$(printf '%s' "$_PICK" | sed 's|^[^/]*/||')
+    _optsets_assign_disks "$_wf" "$_cache" "$_setn" "$_grpn" \
+        "Pick disk numbers (space-separated; or paste a free-form spec):"
+}
+
+_optsets_action_remove() {
+    _wf="$1"
+    info "Existing groups:"
+    if ! _optsets_list_paths "$_wf"; then
+        warn "No groups defined yet."
+        return
+    fi
+    _optsets_prompt "Remove from which group (Set/Group, or number above):" || return
+    _optsets_resolve_path "$_wf" "$_ANS" || return
+    _setn=$(printf '%s' "$_PICK" | sed 's|/.*||')
+    _grpn=$(printf '%s' "$_PICK" | sed 's|^[^/]*/||')
+
+    _ms=$(awk -F'|' -v s="$_setn" -v g="$_grpn" '$1==s && $2==g && $3!="__placeholder__" {print $3}' "$_wf")
+    if [ -z "$_ms" ]; then
+        warn "Group '$_setn/$_grpn' has no members."
+        return
+    fi
+    info "Members of '$_setn/$_grpn':"
+    _i=0
+    echo "$_ms" | while IFS= read -r _s; do
+        _i=$((_i+1)); printf '  %d) %s\n' "$_i" "$_s"
+    done
+    _optsets_prompt "Pick (numbers; comma, semicolon, or whitespace separated):"
+    [ -n "$_ANS" ] || { warn "Nothing entered."; return; }
+    _ANS=$(printf '%s' "$_ANS" | tr ',;' '  ')
+    for _tok in $_ANS; do
+        case "$_tok" in
+            [0-9]*) _id=$(echo "$_ms" | awk -v n="$_tok" 'NR==n {print; exit}') ;;
+            *)      _id="$_tok" ;;
+        esac
+        [ -n "$_id" ] || { warn "Could not resolve '$_tok'"; continue; }
+        _tmp=$(mktemp "$STATE_DIR/.optsets-rm.XXXXXX") || continue
+        awk -F'|' -v s="$_setn" -v g="$_grpn" -v sp="$_id" '!($1==s && $2==g && $3==sp)' "$_wf" > "$_tmp" \
+            && mv "$_tmp" "$_wf" \
+            && ok "Removed $_id from '$_setn/$_grpn'."
+        # If the group is now empty, restore a placeholder so it stays visible.
+        if ! awk -F'|' -v s="$_setn" -v g="$_grpn" '$1==s && $2==g && $3!="__placeholder__" {f=1; exit} END{exit !f}' "$_wf"; then
+            printf '%s|%s|__placeholder__\n' "$_setn" "$_grpn" >> "$_wf"
+        fi
+    done
+>>>>>>> 2dd898e42b065bbaca74af88849fb53912aad281
 }
 
 # ----------------------------------------------------------------------
@@ -8256,7 +10148,12 @@ disk_serial_hash() {
 # OR if the cache file is unreadable (silent miss; not an error).
 smart_dtype_lookup() {
     disk="$1"; serial_hash="$2"
+<<<<<<< HEAD
     _ensure_state_dir_readable
+||||||| 5ac8308
+=======
+    _ensure_state_dir_writable
+>>>>>>> 2dd898e42b065bbaca74af88849fb53912aad281
     f=$(smart_cache_file)
     [ -f "$f" ] && [ -r "$f" ] || return 0
     awk -F'|' -v d="$disk" -v s="$serial_hash" '
@@ -8271,11 +10168,16 @@ smart_dtype_lookup() {
 # cache only costs a few smartctl probes, not correctness.
 smart_dtype_store() {
     disk="$1"; serial_hash="$2"; dtype="$3"
+<<<<<<< HEAD
     # Soft-fail in full: the cache is opportunistic. A non-root caller
     # of `smart` shouldn't die because STATE_DIR (0755 root) won't
     # accept their write — they'll just re-probe next time.
     [ -n "${STATE_DIR:-}" ] || STATE_DIR="/var/db/my-appleRAID"
     [ -d "$STATE_DIR" ] && [ -w "$STATE_DIR" ] || return 0
+||||||| 5ac8308
+=======
+    _ensure_state_dir_writable
+>>>>>>> 2dd898e42b065bbaca74af88849fb53912aad281
     f=$(smart_cache_file)
     if [ ! -f "$f" ]; then
         if ! {
@@ -8286,13 +10188,23 @@ smart_dtype_store() {
             return 0
         fi
     fi
+<<<<<<< HEAD
     tmp=$(mktemp "${f}.XXXXXX" 2>/dev/null) || {
         log_warn "smart-dtype-cache: mktemp at ${f}.XXXXXX failed - skipping cache write"
         return 0
     }
     if ! awk -F'|' -v d="$disk" -v s="$serial_hash" '
+||||||| 5ac8308
+    tmp=$(mktemp "${f}.XXXXXX") || return 1
+    awk -F'|' -v d="$disk" -v s="$serial_hash" '
+=======
+    tmp=$(mktemp "${f}.XXXXXX" 2>/dev/null) \
+        || err 012 "mktemp for smart-dtype-cache failed at ${f}.XXXXXX"
+    if ! awk -F'|' -v d="$disk" -v s="$serial_hash" '
+>>>>>>> 2dd898e42b065bbaca74af88849fb53912aad281
         /^#/ { print; next }
         !($1 == d && $2 == s) { print }
+<<<<<<< HEAD
     ' "$f" > "$tmp" 2>/dev/null; then
         rm -f "$tmp"
         log_warn "smart-dtype-cache: awk rewrite of $f failed - skipping cache write"
@@ -8308,6 +10220,20 @@ smart_dtype_store() {
         log_warn "smart-dtype-cache: atomic rename $tmp -> $f failed - skipping cache write"
         return 0
     }
+||||||| 5ac8308
+    ' "$f" > "$tmp"
+    printf '%s|%s|%s\n' "$disk" "$serial_hash" "$dtype" >> "$tmp"
+    mv "$tmp" "$f"
+=======
+    ' "$f" > "$tmp" 2>/dev/null; then
+        rm -f "$tmp"
+        err 013 "smart-dtype-cache rewrite (awk) failed for $f"
+    fi
+    printf '%s|%s|%s\n' "$disk" "$serial_hash" "$dtype" >> "$tmp" \
+        || err 013 "smart-dtype-cache: append of new row failed"
+    mv "$tmp" "$f" \
+        || err 013 "smart-dtype-cache: atomic rename ${tmp} -> ${f} failed"
+>>>>>>> 2dd898e42b065bbaca74af88849fb53912aad281
 }
 
 # Probe smartctl with the given -d type. Returns 0 if smartctl was
@@ -8363,6 +10289,7 @@ smart_cmd() {
     esac
 }
 
+<<<<<<< HEAD
 # Compact one-line SMART summary for a single whole-disk identifier
 # (e.g. "disk7"). Designed to be called inline from cmd_status's per-
 # member loop so the user doesn't have to run `smart <disk>` separately
@@ -9327,6 +11254,981 @@ _smart_compare_two() {
     fi
 }
 
+||||||| 5ac8308
+=======
+# Compact one-line SMART summary for a single whole-disk identifier
+# (e.g. "disk7"). Designed to be called inline from cmd_status's per-
+# member loop so the user doesn't have to run `smart <disk>` separately
+# for each mirror member.
+#
+# Output examples:
+#   SMART: OK  temp=36C  POH=63685h  realloc=0  pending=0  uncorr=0  crc=0
+#   SMART: unavailable (smartctl not installed)
+#   SMART: unsupported on this enclosure
+#
+# Non-zero killer attributes (5/197/198/199) are highlighted in red so
+# they jump out in a status table. The dtype probe is cached via
+# smart_dtype_for, so subsequent calls on the same enclosure are fast.
+smart_summary_line() {
+    d="$1"
+    [ -n "$d" ] || { echo "SMART: (no device)"; return; }
+    if ! command -v smartctl >/dev/null 2>&1; then
+        echo "SMART: unavailable (smartctl not installed)"; return
+    fi
+    if ! diskutil info "/dev/$d" >/dev/null 2>&1; then
+        echo "SMART: unavailable (/dev/$d not present)"; return
+    fi
+    dtype=$(smart_dtype_for "$d")
+    if [ -z "$dtype" ] || [ "$dtype" = "none" ]; then
+        echo "SMART: unsupported on this enclosure"; return
+    fi
+    sc=$(smart_cmd "$d")
+
+    health=$($sc -H "/dev/$d" 2>/dev/null | awk -F': *' '
+        /SMART overall-health/ { print $2; exit }
+        /SMART Health Status/  { print $2; exit }')
+    health=$(echo "$health" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+    case "$health" in
+        PASSED|OK)  hd="${C_GREEN}OK${C_RESET}" ;;
+        '')         hd="?" ;;
+        *)          hd="${C_RED}${health}${C_RESET}" ;;
+    esac
+
+    attrs=$($sc -A "/dev/$d" 2>/dev/null)
+    poh=$(echo "$attrs" | awk '
+        /^[[:space:]]*9[[:space:]]+Power_On_Hours/ {print $10; exit}
+        /^Power On Hours:/                          {v=$NF; gsub(/,/,"",v); print v; exit}')
+    temp=$(echo "$attrs" | awk '/^[[:space:]]*(194|190)[[:space:]]+Temperature/ {print $10; exit}')
+    realloc=$(echo "$attrs" | awk '/^[[:space:]]*5[[:space:]]+Reallocated_Sector/ {print $10; exit}')
+    pending=$(echo "$attrs" | awk '/^[[:space:]]*197[[:space:]]+Current_Pending/ {print $10; exit}')
+    uncorr=$(echo  "$attrs" | awk '/^[[:space:]]*198[[:space:]]+Offline_Uncorr/  {print $10; exit}')
+    crc=$(echo     "$attrs" | awk '/^[[:space:]]*199[[:space:]]+UDMA_CRC/        {print $10; exit}')
+
+    fmt_kill() {
+        # $1=label, $2=value (string). Empty => "?"; "0" => plain; non-zero => red.
+        case "${2:-}" in
+            "")    printf '%s=?' "$1" ;;
+            0)     printf '%s=0' "$1" ;;
+            *)     printf '%s%s=%s%s' "${C_RED}" "$1" "$2" "${C_RESET}" ;;
+        esac
+    }
+
+    out="SMART: $hd"
+    [ -n "$temp" ] && out="$out  temp=${temp}C"
+    if [ -n "$poh" ]; then
+        # POH (Power_On_Hours) is the canonical raw attribute; we
+        # show it as both the raw value and a years-rounded AGE so
+        # the user can read 'how old is this drive' at a glance
+        # without doing the /8760 division in their head.
+        age_y=$(awk -v h="$poh" 'BEGIN { printf "%.1f", h / 8760 }')
+        out="$out  POH=${poh}h  age=${age_y}y"
+    fi
+    out="$out  $(fmt_kill realloc "$realloc")"
+    out="$out  $(fmt_kill pending "$pending")"
+    out="$out  $(fmt_kill uncorr  "$uncorr")"
+    out="$out  $(fmt_kill crc     "$crc")"
+    echo "$out"
+}
+
+# ----------------------------------------------------------------------
+# SMART drill-down: print a comprehensive per-disk health readout.
+# Used by `cmd_smart` (interactive standalone) and `cmd_health --disk`
+# (drill-down mode of the daemon command). Read-only.
+#
+# Sections:
+#   1. Overall health        (smartctl -H)
+#   2. Pre-failure attrs     (smartctl -A) + non-zero "killer" highlight
+#   3. Self-test log         (smartctl -l selftest)
+#   4. Error log             (smartctl -l error)
+#
+# Argument: short disk name (e.g. "disk3"), no /dev/ prefix.
+# Returns 0 on clean run, 1 if smartctl/diskutil cannot inspect the disk.
+# ----------------------------------------------------------------------
+_smart_drilldown_one() {
+    d="$1"
+    dev="/dev/$d"
+
+    if ! command -v smartctl >/dev/null 2>&1; then
+        die "smartctl not installed.  Fix:  brew install smartmontools"
+    fi
+    if ! diskutil info "$dev" >/dev/null 2>&1; then
+        die "Device not found: $dev"
+    fi
+
+    # smart_dtype_for writes a cache file under $STATE_DIR. STATE_DIR is
+    # only populated by cfg_load (or state_init's fallback), which the
+    # daemon path always runs but our standalone callers (cmd_smart,
+    # cmd_health --disk) do not. Load the config first, then ensure the
+    # dir exists - falling back to /tmp if the configured location isn't
+    # writable (avoids the empty-path 'cannot create' from mktemp).
+    cfg_load
+    if [ -z "${STATE_DIR:-}" ]; then
+        STATE_DIR="/var/db/my-appleRAID"
+    fi
+    if ! mkdir -p "$STATE_DIR" 2>/dev/null; then
+        STATE_DIR="/tmp/my-appleRAID"
+        mkdir -p "$STATE_DIR" 2>/dev/null || true
+    fi
+
+    virt=$(diskutil info "$dev" 2>/dev/null | awk -F': *' '/Virtual:/ {print $2; exit}')
+    if [ "$virt" = "Yes" ]; then
+        die "$dev is a VIRTUAL device (RAID/APFS container) - has no SMART data of its own."
+    fi
+
+    # Resolve / cache the right -d type for this enclosure.
+    dtype=$(smart_dtype_for "$d")
+    if [ -z "$dtype" ] || [ "$dtype" = "none" ]; then
+        die "$dev does not respond to SMART (no working -d type for this enclosure)."
+    fi
+    sc=$(smart_cmd "$d")
+
+    # Header
+    model=$(diskutil info "$dev" 2>/dev/null | awk -F': +' '/Device \/ Media Name:/ {print $2; exit}')
+    [ -z "$model" ] && model=$(diskutil info "$dev" 2>/dev/null | awk -F': +' '/Media Name:/ {print $2; exit}')
+    serial=$(disk_serial "$d")
+    size=$(diskutil info "$dev" 2>/dev/null | awk -F': +' '
+        /Disk Size:/  {print $2; exit}
+        /Total Size:/ {print $2; exit}' | sed 's/ *(.*)//; s/[[:space:]]*$//')
+    proto=$(diskutil info "$dev" 2>/dev/null | awk -F': +' '/Protocol:/ {print $2; exit}')
+
+    step "SMART drill-down: $dev"
+    printf '  %-10s %s\n' "Model:"    "${model:-?}"
+    printf '  %-10s %s\n' "Serial:"   "${serial:-?}"
+    printf '  %-10s %s\n' "Size:"     "${size:-?}"
+    printf '  %-10s %s\n' "Protocol:" "${proto:-?}"
+    printf '  %-10s %s\n' "Probe:"    "$sc"
+    echo
+
+    # 1. Overall health
+    step "1/4: Overall health  (smartctl -H)"
+    health_raw=$($sc -H "$dev" 2>/dev/null | awk -F': *' '
+        /SMART overall-health/ {print $2; exit}
+        /SMART Health Status/   {print $2; exit}')
+    health_raw=$(echo "$health_raw" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+    case "$health_raw" in
+        PASSED|OK)  ok "Overall health: $health_raw" ;;
+        '')         warn "Overall health: not reported by drive" ;;
+        *)          err "Overall health: $health_raw" ;;
+    esac
+    echo
+
+    # 2. Pre-failure attributes (full table + non-zero killer summary)
+    step "2/4: Pre-failure attributes  (smartctl -A)"
+    explain "Watch the RAW_VALUE column. Non-zero on these IDs is a red flag:"
+    explain "  5 Reallocated  187 Reported_Uncorrect  197 Pending  198 Offline_Uncorrectable  199 UDMA_CRC"
+    echo
+    attrs=$($sc -A "$dev" 2>/dev/null)
+
+    # Current Power_On_Hours - sections 3/4 use this to translate each
+    # log entry's LifeTime(hours) into "X ago" + an approximate date.
+    # Empty if the drive doesn't expose POH (rare).
+    poh=$(echo "$attrs" | awk '
+        /^[[:space:]]*9[[:space:]]+Power_On_Hours/ { print $10; exit }
+        /^Power On Hours:/ { v=$NF; gsub(/,/, "", v); print v; exit }')
+
+    if [ -z "$attrs" ]; then
+        warn "Could not read SMART attributes."
+    else
+        echo "$attrs" | sed 's/^/  /'
+        echo
+
+        # ATA killers: numeric IDs 5/187/197/198/199 with non-zero RAW.
+        ata_nonzero=$(echo "$attrs" | awk '
+            /^[[:space:]]*(5|187|197|198|199)[[:space:]]+[A-Za-z]/ {
+                if ($10+0 > 0) printf "    %3d %-26s RAW=%s\n", $1, $2, $10
+            }')
+
+        # NVMe critical fields.
+        nvme_warn=$(echo "$attrs" | awk -F': *' '
+            /Critical Warning/         { v=$2; gsub(/^ +| +$/,"",v); if (v != "" && v != "0x00") printf "    %s = %s\n", $1, v }
+            /Media and Data Integrity/ { v=$2; gsub(/^ +| +$/,"",v); if (v+0 > 0) printf "    %s = %s\n", $1, v }
+            /Unsafe Shutdowns/         { v=$2; gsub(/^ +| +$/,"",v); if (v+0 > 0) printf "    %s = %s\n", $1, v }
+            /Available Spare:/         { v=$2; gsub(/^ +| +$/,"",v); n=v; gsub(/%/,"",n); if (n+0 < 100 && n != "") printf "    %s = %s\n", $1, v }')
+
+        if [ -n "$ata_nonzero" ] || [ -n "$nvme_warn" ]; then
+            errmsg "Pre-failure indicator(s) found:"
+            [ -n "$ata_nonzero" ] && printf '%s\n' "$ata_nonzero"
+            [ -n "$nvme_warn"   ] && printf '%s\n' "$nvme_warn"
+        else
+            ok "No pre-failure indicators (ATA killers / NVMe critical fields all clean)."
+        fi
+    fi
+    echo
+
+    # 3. Self-test log
+    step "3/4: Self-test log  (smartctl -l selftest)"
+    selftest=$($sc -l selftest "$dev" 2>/dev/null)
+    if [ -z "$selftest" ]; then
+        warn "Self-test log unreadable (some USB bridges hide it)."
+    elif echo "$selftest" | grep -qE 'No self-tests have been logged|No Self-tests Logged'; then
+        info "No self-tests have been logged on this drive yet."
+        explain "Run one with:  sudo $sc -t short $dev    (~2 min)"
+        explain "             or sudo $sc -t long  $dev    (hours, full surface)"
+    else
+        if [ -n "$poh" ]; then
+            explain "Current Power_On_Hours: $poh - the AGE_AGO / APPROX_DATE columns are"
+            explain "computed as (POH - LifeTime). Calendar-accurate when the drive is"
+            explain "roughly always-on; underestimates the more the drive sleeps."
+            echo
+        else
+            warn "Could not read Power_On_Hours - showing raw LifeTime only."
+            echo
+        fi
+        echo "$selftest" \
+          | sed -n '/Num.*Test_Description/,/^$/p' \
+          | awk -v poh="$poh" '
+            function age_label(d) {
+                if (poh == "" || d == "" || d+0 < 0)  return "?"
+                if (d < 72)         return d "h"
+                if (d < 14*24)      return int(d/24) "d"
+                if (d < 8*7*24)     return int(d/(7*24)) "w"
+                if (d < 365*24)     return int(d/(30*24)) "mo"
+                return sprintf("%.1fy", d/(365*24))
+            }
+            function age_date(d,    cmd, out) {
+                if (poh == "" || d == "" || d+0 < 0)  return "?"
+                cmd = "date -v -" d "H +%Y-%m-%d 2>/dev/null"
+                out = "?"
+                cmd | getline out
+                close(cmd)
+                if (out == "") out = "?"
+                return out
+            }
+            /Num.*Test_Description.*LifeTime/ {
+                gsub(/[[:space:]]+$/, "", $0)
+                printf "  %s  %-7s  %s\n", $0, "AGE_AGO", "APPROX_DATE"
+                next
+            }
+            /^# *[0-9]+/ {
+                gsub(/[[:space:]]+$/, "", $0)
+                lt = $(NF-1)
+                if (lt ~ /^[0-9]+$/ && poh != "" && (poh+0) >= (lt+0)) {
+                    d = poh - lt
+                    printf "  %s  %-7s  %s\n", $0, age_label(d), age_date(d)
+                } else {
+                    printf "  %s  %-7s  %s\n", $0, "?", "?"
+                }
+                next
+            }
+            { print "  " $0 }
+        '
+        if echo "$selftest" | grep -qE 'Failed|Aborted_by_host|Interrupted|Completed: read failure'; then
+            warn "Past self-test failure(s) above. LBA_of_first_error points to the bad sector."
+        else
+            ok "All logged self-tests completed without error."
+        fi
+    fi
+    echo
+
+    # 4. Error log (firmware-recorded uncorrectable errors)
+    step "4/4: SMART error log  (smartctl -l error)"
+    elog=$($sc -l error "$dev" 2>/dev/null)
+    if [ -z "$elog" ]; then
+        warn "Error log unreadable (some USB bridges hide it)."
+    elif echo "$elog" | grep -qE 'No Errors Logged|No errors logged'; then
+        ok "Error count: 0  (firmware has logged no errors)"
+    else
+        ec=$(echo "$elog" | awk -F': *' '
+            /Error [Cc]ount:/         { print $2; exit }
+            /Device Error Count:/     { print $2; exit }')
+        ec=$(echo "$ec" | awk '{print $1}')
+        if [ -n "$ec" ] && [ "$ec" = "0" ]; then
+            ok "Error count: 0"
+        elif [ -n "$ec" ]; then
+            errmsg "Error count: $ec  (firmware-recorded errors - inspect below)"
+            echo
+            if [ -n "$poh" ]; then
+                explain "Each 'power-on lifetime: N hours' line is annotated with how long ago"
+                explain "that error happened (current Power_On_Hours: $poh)."
+                echo
+            fi
+            echo "$elog" \
+              | awk '/^Error [0-9]+/,/^$/' \
+              | awk -v poh="$poh" '
+                function age_label(d) {
+                    if (poh == "" || d == "" || d+0 < 0)  return "?"
+                    if (d < 72)         return d "h"
+                    if (d < 14*24)      return int(d/24) "d"
+                    if (d < 8*7*24)     return int(d/(7*24)) "w"
+                    if (d < 365*24)     return int(d/(30*24)) "mo"
+                    return sprintf("%.1fy", d/(365*24))
+                }
+                function age_date(d,    cmd, out) {
+                    if (poh == "" || d == "" || d+0 < 0)  return "?"
+                    cmd = "date -v -" d "H +%Y-%m-%d 2>/dev/null"
+                    out = "?"
+                    cmd | getline out
+                    close(cmd)
+                    if (out == "") out = "?"
+                    return out
+                }
+                /lifetime: [0-9]+ hours/ {
+                    if (match($0, /lifetime: [0-9]+ hours/)) {
+                        seg = substr($0, RSTART, RLENGTH)
+                        gsub(/[^0-9]/, "", seg)
+                        lt = seg+0
+                        if (poh != "" && lt > 0 && (poh+0) >= lt) {
+                            d = (poh+0) - lt
+                            print $0 "    -> ~" age_label(d) " ago / " age_date(d)
+                            next
+                        }
+                    }
+                    print
+                    next
+                }
+                { print }
+              ' | sed 's/^/  /' | head -120
+        else
+            warn "Could not parse error count - raw output:"
+            echo "$elog" | sed 's/^/  /' | head -40
+        fi
+    fi
+    echo
+
+    # ------------------------------------------------------------------
+    # Summary highlights. Mirrors the priority logic used by the 2-drive
+    # comparison (_smart_compare_two), but reduced to a single-drive
+    # verdict: HEALTHY / WATCH / RETIRE-CANDIDATE. Reuses $health_raw,
+    # $attrs, $selftest, $elog, $poh already collected above.
+    # ------------------------------------------------------------------
+    step "Summary"
+
+    # Helper: extract raw value of a numeric ATA attribute id from $attrs.
+    _attr_raw_one() {
+        echo "$attrs" | awk -v id="$1" '
+            $1+0 == id+0 && $2 ~ /^[A-Za-z]/ { print $10; exit }'
+    }
+
+    # Age in years from POH (8766 h/y).
+    age_y=""
+    if [ -n "$poh" ] && [ "$poh" -gt 0 ] 2>/dev/null; then
+        age_y=$(awk -v h="$poh" 'BEGIN { printf "%.1f", h/8766 }')
+    fi
+
+    # Killer attrs.
+    s5=$(_attr_raw_one 5)
+    s187=$(_attr_raw_one 187)
+    s197=$(_attr_raw_one 197)
+    s198=$(_attr_raw_one 198)
+    s199=$(_attr_raw_one 199)
+    s22=$(_attr_raw_one 22)
+
+    # Self-test status: count + last result.
+    st_count=0
+    st_last=""
+    st_failed=0
+    if [ -n "$selftest" ] && ! echo "$selftest" | grep -qE 'No self-tests have been logged|No Self-tests Logged'; then
+        st_count=$(echo "$selftest" | awk '/^# *[0-9]+/' | wc -l | awk '{print $1}')
+        st_last=$(echo "$selftest" | awk '
+            /^# *[0-9]+/ {
+                line=$0
+                # Status field is everything between Test_Description and Remaining
+                # but smartctl prints fixed columns; field 5 ("Status") is reliable.
+                gsub(/[[:space:]]+$/, "", line)
+                print line
+                exit
+            }')
+        if echo "$selftest" | grep -qE 'Failed|Completed: read failure|Completed: unknown failure|Completed: servo'; then
+            st_failed=1
+        fi
+    fi
+
+    # Error log count.
+    err_n=""
+    if [ -n "$elog" ] && ! echo "$elog" | grep -qE 'No Errors Logged|No errors logged'; then
+        err_n=$(echo "$elog" | awk -F': *' '
+            /Error [Cc]ount:/         { print $2; exit }
+            /Device Error Count:/     { print $2; exit }' | awk '{print $1}')
+    fi
+
+    # Render highlights.
+    printf '  %-22s %s\n' "Overall health:"  "${health_raw:-?}"
+    if [ -n "$age_y" ]; then
+        printf '  %-22s %s years  (POH=%sh)\n' "Age:" "$age_y" "$poh"
+    fi
+    if [ -n "$s5$s187$s197$s198" ]; then
+        printf '  %-22s (any non-zero raw value = drive-level damage)\n' \
+            "Killer attrs:"
+        printf '    %-30s = %s\n'  "5   Reallocated_Sector_Ct"   "${s5:-?}"
+        printf '    %-30s = %s\n'  "187 Reported_Uncorrect"      "${s187:-?}"
+        printf '    %-30s = %s\n'  "197 Current_Pending_Sector"  "${s197:-?}"
+        printf '    %-30s = %s\n'  "198 Offline_Uncorrectable"   "${s198:-?}"
+    fi
+    if [ -n "$s199" ]; then
+        printf '  %-22s %s  (199 UDMA_CRC_Error_Count - cable/port noise, not a drive defect on its own)\n' \
+            "UDMA_CRC:" "$s199"
+    fi
+    if [ -n "$s22" ] && [ "$s22" -gt 0 ] 2>/dev/null; then
+        printf '  %-22s %s  (22 Helium_Level - 100=full, drops as gas escapes; <95 = retire)\n' \
+            "Helium:" "$s22"
+    fi
+    if [ "$st_count" -gt 0 ] 2>/dev/null; then
+        printf '  %-22s %s recorded; last: %s\n' \
+            "Self-tests:" "$st_count" "${st_last:-?}"
+    else
+        printf '  %-22s none recorded yet\n' "Self-tests:"
+    fi
+    if [ -n "$err_n" ]; then
+        printf '  %-22s %s\n' "Error log:" "$err_n"
+    else
+        printf '  %-22s 0\n' "Error log:"
+    fi
+    echo
+
+    # Verdict logic (single drive). Priority matches _smart_compare_two.
+    verdict_level=""   # "" / WATCH / RETIRE
+    verdict_reason=""
+
+    case "$health_raw" in
+        PASSED|OK|"") :;;
+        *) verdict_level="RETIRE"; verdict_reason="overall health '$health_raw' is not PASSED" ;;
+    esac
+
+    if [ -z "$verdict_level" ] && [ "$st_failed" = "1" ]; then
+        verdict_level="RETIRE"
+        verdict_reason="self-test failure recorded - real surface fault"
+    fi
+
+    if [ -z "$verdict_level" ]; then
+        for v in "$s5" "$s197" "$s198"; do
+            if [ -n "$v" ] && [ "$v" -gt 0 ] 2>/dev/null; then
+                verdict_level="RETIRE"
+                verdict_reason="killer attribute non-zero (5=${s5:-0} 197=${s197:-0} 198=${s198:-0}) - sector damage"
+                break
+            fi
+        done
+    fi
+
+    if [ -z "$verdict_level" ] && [ -n "$err_n" ] && [ "$err_n" -gt 0 ] 2>/dev/null; then
+        verdict_level="WATCH"
+        verdict_reason="firmware-recorded error count = $err_n - inspect section 4 above"
+    fi
+
+    if [ -z "$verdict_level" ] && [ -n "$s187" ] && [ "$s187" -gt 0 ] 2>/dev/null; then
+        verdict_level="WATCH"
+        verdict_reason="Reported_Uncorrect (187) = $s187 - drive saw uncorrectable reads"
+    fi
+
+    if [ -z "$verdict_level" ] && [ -n "$s199" ] && [ "$s199" -gt 0 ] 2>/dev/null; then
+        verdict_level="WATCH"
+        verdict_reason="UDMA_CRC (199) = $s199 - check SATA cable / port (not a drive defect on its own)"
+    fi
+
+    if [ -z "$verdict_level" ] && [ -n "$age_y" ]; then
+        # >7 years: WATCH; >10 years: still WATCH but stronger phrasing.
+        age_int=${age_y%.*}
+        if [ "$age_int" -ge 10 ] 2>/dev/null; then
+            verdict_level="WATCH"
+            verdict_reason="drive is ${age_y} years old - well past typical lifetime, plan replacement"
+        elif [ "$age_int" -ge 7 ] 2>/dev/null; then
+            verdict_level="WATCH"
+            verdict_reason="drive is ${age_y} years old - approaching end of typical lifetime"
+        fi
+    fi
+
+    if [ "$st_count" = "0" ]; then
+        if [ -z "$verdict_level" ]; then
+            verdict_level="WATCH"
+            verdict_reason="no self-tests recorded - run 'sudo $sc -t short $dev' to populate the log"
+        else
+            verdict_reason="$verdict_reason; also: no self-tests recorded yet"
+        fi
+    fi
+
+    case "$verdict_level" in
+        RETIRE) errmsg "VERDICT: RETIRE-CANDIDATE - $verdict_reason" ;;
+        WATCH)  warn   "VERDICT: WATCH - $verdict_reason" ;;
+        *)      ok     "VERDICT: HEALTHY - no concerning indicators across health, killers, self-tests, error log, age." ;;
+    esac
+    echo
+
+    step "Run a fresh self-test"
+    explain "Short test:  sudo $sc -t short $dev   (~2 min, online; quick electronics + media sample)"
+    explain "Long  test:  sudo $sc -t long  $dev   (hours, full surface scan)"
+    explain "Results land in 'smart $d' section 3/4 once the test completes."
+}
+
+# ----------------------------------------------------------------------
+# Side-by-side SMART comparison of two physical disks. Designed to
+# answer 'which one would you discard'. Renders a per-attribute table,
+# computes deltas, highlights the discriminating signals (the four
+# 'killer' attributes 5/197/198/199; load-cycle wear; helium level;
+# SMART overall-health), and ends with a one-line verdict.
+#
+# Methodology - a drive is the loser if ANY of these is true, in
+# order of priority:
+#   1) Overall health != PASSED
+#   2) Any killer attribute (5/197/198/199) raw value > 0
+#   3) Helium level (22) significantly lower
+#   4) Load-cycle count (193) significantly higher (>= 20% delta)
+#   5) Power-on-hours (9) significantly higher (>= 20% delta)
+# Otherwise: 'no clear loser'.
+# ----------------------------------------------------------------------
+_smart_compare_two() {
+    bsd_a="$1"; bsd_b="$2"
+    devA="/dev/$bsd_a"
+    devB="/dev/$bsd_b"
+
+    if ! command -v smartctl >/dev/null 2>&1; then
+        die "smartctl not installed.  Fix:  brew install smartmontools"
+    fi
+    diskutil info "$devA" >/dev/null 2>&1 || die "Device not found: $devA"
+    diskutil info "$devB" >/dev/null 2>&1 || die "Device not found: $devB"
+
+    cfg_load
+    _ensure_state_dir_writable
+
+    # Resolve smartctl command + dtype per disk.
+    scA=$(smart_cmd "$bsd_a")
+    scB=$(smart_cmd "$bsd_b")
+    [ "$scA" = "smartctl" ] && [ -z "$(smart_dtype_for "$bsd_a")" ] \
+        && die "/dev/$bsd_a does not respond to SMART (no working -d type)."
+    [ "$scB" = "smartctl" ] && [ -z "$(smart_dtype_for "$bsd_b")" ] \
+        && die "/dev/$bsd_b does not respond to SMART (no working -d type)."
+
+    # Capture raw smartctl outputs.
+    infoA=$($scA -i "$devA" 2>/dev/null)
+    infoB=$($scB -i "$devB" 2>/dev/null)
+    healthA_raw=$($scA -H "$devA" 2>/dev/null)
+    healthB_raw=$($scB -H "$devB" 2>/dev/null)
+    attrA=$($scA -A "$devA" 2>/dev/null)
+    attrB=$($scB -A "$devB" 2>/dev/null)
+    # SMART self-test log + error log are firmware-resident on the
+    # drive itself - no external storage required. We pull them once
+    # here and parse below; counts/last-result feed comparison rows.
+    selftestA=$($scA -l selftest "$devA" 2>/dev/null)
+    selftestB=$($scB -l selftest "$devB" 2>/dev/null)
+    errlogA=$($scA -l error "$devA" 2>/dev/null)
+    errlogB=$($scB -l error "$devB" 2>/dev/null)
+
+    # Helpers for parsing.
+    _info_field() {
+        # $1 = info dump, $2 = label substring (e.g. "Device Model")
+        echo "$1" | awk -F': *' -v lbl="$2" 'index($1, lbl) {
+            sub(/^[[:space:]]+/, "", $2); sub(/[[:space:]]+$/, "", $2); print $2; exit
+        }'
+    }
+    _attr_raw() {
+        # $1 = attr dump, $2 = numeric attribute id
+        # Returns the RAW_VALUE column (first numeric token in the
+        # smartctl raw column). Empty if id is not present.
+        echo "$1" | awk -v id="$2" '$1 == id {
+            # raw is column 10 in the standard layout, but the value
+            # may include a parenthesized note (e.g. "35 (Min/Max ...)").
+            # Take the first numeric token.
+            for (i = 10; i <= NF; i++) {
+                if (match($i, /^[0-9]+$/)) { print $i; exit }
+            }
+            exit
+        }'
+    }
+    _health_word() {
+        # $1 = health dump
+        echo "$1" | awk -F': *' '
+            /SMART overall-health/ { print $NF; exit }
+            /SMART Health Status/  { print $NF; exit }
+        '
+    }
+
+    # Identity.
+    modelA=$(_info_field "$infoA" "Device Model")
+    [ -z "$modelA" ] && modelA=$(_info_field "$infoA" "Model Family")
+    modelB=$(_info_field "$infoB" "Device Model")
+    [ -z "$modelB" ] && modelB=$(_info_field "$infoB" "Model Family")
+    serialA=$(_info_field "$infoA" "Serial Number")
+    serialB=$(_info_field "$infoB" "Serial Number")
+    healthA=$(_health_word "$healthA_raw"); healthA=${healthA:-?}
+    healthB=$(_health_word "$healthB_raw"); healthB=${healthB:-?}
+
+    step "SMART comparison: $devA  vs  $devB"
+    info "Drive A: ${modelA:-?}  serial=${serialA:-?}  $devA"
+    info "Drive B: ${modelB:-?}  serial=${serialB:-?}  $devB"
+
+    # Age - read from attr 9. Used both for the in-table age row
+    # AND by the verdict logic later, so compute here.
+    pohA=$(_attr_raw "$attrA" 9)
+    pohB=$(_attr_raw "$attrB" 9)
+    ageA_y=""; ageB_y=""
+    if [ -n "$pohA" ]; then
+        ageA_y=$(awk -v h="$pohA" 'BEGIN { printf "%.2f", h / 8760 }')
+    fi
+    if [ -n "$pohB" ]; then
+        ageB_y=$(awk -v h="$pohB" 'BEGIN { printf "%.2f", h / 8760 }')
+    fi
+
+    echo
+    # Pre-header line: print the actual bsd names (e.g. 'disk7' /
+    # 'disk8') directly above the 'Drive A' / 'Drive B' label columns,
+    # so the user can see at a glance which physical disk each column
+    # refers to without scrolling back up to the header block.
+    printf '%-4s %-25s %12s %12s\n' \
+        "" "" "$bsd_a" "$bsd_b"
+    printf '%s%-4s %-25s %12s %12s   %s%s\n' \
+        "${C_BOLD}" "ID" "Attribute" "Drive A" "Drive B" "Delta / note" "${C_RESET}"
+
+    # Per-attribute rows. Format:
+    #   ID  Name                       Drive A   Drive B    delta / note
+    _row() {
+        # $1 id, $2 label, $3 a, $4 b, $5 note
+        printf '%-4s %-25s %12s %12s   %s\n' "$1" "$2" "${3:-?}" "${4:-?}" "$5"
+    }
+
+    # Top two rows: not actual SMART attributes, but values the user
+    # always wants to see at the top of the comparison. ID column
+    # uses '-' to flag them as derived/synthetic.
+    health_note="ok (both)"
+    case "$healthA" in PASSED|OK|"") :;; *)
+        case "$healthB" in PASSED|OK|"") health_note="A '$healthA' - DISCARD A" ;;
+                            *)            health_note="BOTH not PASSED" ;; esac ;;
+    esac
+    case "$healthB" in PASSED|OK|"") :;; *)
+        case "$healthA" in PASSED|OK|"") health_note="B '$healthB' - DISCARD B" ;;
+                            *)            health_note="BOTH not PASSED" ;; esac ;;
+    esac
+    _row "-" "Overall health" "$healthA" "$healthB" "$health_note"
+
+    # Age (years) row. Delta computed from POH (more precision than
+    # rounded years), but displayed as years for human readability.
+    age_note=""
+    if [ -n "$pohA" ] && [ -n "$pohB" ] \
+       && [ "$pohA" -gt 0 ] 2>/dev/null && [ "$pohB" -gt 0 ] 2>/dev/null; then
+        if [ "$pohA" -ge "$pohB" ]; then
+            d=$(awk -v hi="$pohA" -v lo="$pohB" 'BEGIN { printf "%.0f", (hi - lo) * 100 / lo }')
+            age_higher="A"
+        else
+            d=$(awk -v hi="$pohB" -v lo="$pohA" 'BEGIN { printf "%.0f", (hi - lo) * 100 / lo }')
+            age_higher="B"
+        fi
+        if [ "$d" -ge 5 ] 2>/dev/null; then
+            age_note="$age_higher older by ${d}%"
+        else
+            age_note="similar age"
+        fi
+    fi
+    _row "-" "Age (years)" "${ageA_y:+${ageA_y}y}" "${ageB_y:+${ageB_y}y}" "$age_note"
+
+    # ---- Error log + self-test log (firmware-resident) ----
+    #
+    # The drive's own firmware keeps two persistent logs that survive
+    # reboots and travel with the disk:
+    #   - error log    (smartctl -l error)    - actual command failures
+    #   - self-test log (smartctl -l selftest) - results of every short
+    #                                            and long self-test
+    #
+    # 'health' fires a long self-test weekly per SELFTEST_LONG_SCHEDULE,
+    # so on a normally-monitored host these logs are populated and very
+    # useful for the comparison: a drive with a 'Completed: read failure'
+    # in its self-test log is a stronger discard signal than any
+    # threshold delta on an attribute.
+    #
+    # Parse:
+    #   _errlog_count(text) -> total errors recorded ('No Errors Logged'
+    #                          maps to 0)
+    #   _selftest_count(text) -> number of completed (any kind) entries
+    #   _selftest_last(text) -> status of the most recent entry, e.g.
+    #                          'Completed without error' or 'Completed:
+    #                          read failure'
+    _errlog_count() {
+        # Look for either 'No Errors Logged' (-> 0) or
+        # 'ATA Error Count: N' (-> N).
+        echo "$1" | awk '
+            /No Errors Logged/        { print 0; exit }
+            /ATA Error Count:/        { for (i = 1; i <= NF; i++) if (match($i, /^[0-9]+$/)) { print $i; exit } exit }
+            /Error logging capability:.*disabled/ { print "n/a"; exit }
+        '
+    }
+    _selftest_count() {
+        # Number of '# N  Description ...' rows.
+        echo "$1" | awk '/^# +[0-9]+ +/ { c++ } END { print c+0 }'
+    }
+    _selftest_last() {
+        # First entry under the header is the MOST RECENT (smartctl
+        # prints them newest-first). Status is a multi-word column
+        # between the description and the percentage-remaining.
+        # Capture the whole line, then extract the status piece.
+        echo "$1" | awk '
+            /^# +1 +/ {
+                # Drop "# N" and the description (1 or 2 words like
+                # "Short offline" / "Extended offline" / "Conveyance
+                # offline"). Easier to take the whole line and strip
+                # the prefix + percentage onward.
+                line = $0
+                sub(/^# +[0-9]+ +(Short|Extended|Conveyance|Selective)( offline| captive)? +/, "", line)
+                # Now line starts with the status (multi-word) and ends
+                # with "  XX% LIFETIME LBA". Strip from the percentage
+                # onward.
+                sub(/[[:space:]]+[0-9]+% .*/, "", line)
+                # Trim trailing whitespace.
+                sub(/[[:space:]]+$/, "", line)
+                print line
+                exit
+            }'
+    }
+    errA_n=$(_errlog_count "$errlogA")
+    errB_n=$(_errlog_count "$errlogB")
+    stcA_n=$(_selftest_count "$selftestA")
+    stcB_n=$(_selftest_count "$selftestB")
+    stlA=$(_selftest_last "$selftestA")
+    stlB=$(_selftest_last "$selftestB")
+
+    # Error-log row.
+    err_note=""
+    case "${errA_n:-?}" in
+        0|n/a|"") a_err_bad=0 ;;
+        *)
+            if [ "$errA_n" -gt 0 ] 2>/dev/null; then a_err_bad=1; else a_err_bad=0; fi ;;
+    esac
+    case "${errB_n:-?}" in
+        0|n/a|"") b_err_bad=0 ;;
+        *)
+            if [ "$errB_n" -gt 0 ] 2>/dev/null; then b_err_bad=1; else b_err_bad=0; fi ;;
+    esac
+    if [ "$a_err_bad" = "1" ] && [ "$b_err_bad" = "0" ]; then err_note="A has logged errors - DISCARD A"
+    elif [ "$b_err_bad" = "1" ] && [ "$a_err_bad" = "0" ]; then err_note="B has logged errors - DISCARD B"
+    elif [ "$a_err_bad" = "1" ] && [ "$b_err_bad" = "1" ]; then err_note="BOTH have logged errors"
+    else err_note="ok (both)"
+    fi
+    _row "-" "Error log entries" "${errA_n:-?}" "${errB_n:-?}" "$err_note"
+
+    # Self-test log rows: count + last result.
+    _row "-" "Self-tests recorded" "${stcA_n:-0}" "${stcB_n:-0}" ""
+    st_note=""
+    case "$stlA" in
+        ""|"-"|"Completed without error") a_st_bad=0 ;;
+        *Aborted*|*"in progress"*)        a_st_bad=0 ;;
+        *)                                a_st_bad=1 ;;
+    esac
+    case "$stlB" in
+        ""|"-"|"Completed without error") b_st_bad=0 ;;
+        *Aborted*|*"in progress"*)        b_st_bad=0 ;;
+        *)                                b_st_bad=1 ;;
+    esac
+    if [ "$a_st_bad" = "1" ] && [ "$b_st_bad" = "0" ]; then st_note="A failure - DISCARD A"
+    elif [ "$b_st_bad" = "1" ] && [ "$a_st_bad" = "0" ]; then st_note="B failure - DISCARD B"
+    elif [ "$a_st_bad" = "1" ] && [ "$b_st_bad" = "1" ]; then st_note="BOTH failures"
+    fi
+    _row "-" "Last self-test" "${stlA:--}" "${stlB:--}" "$st_note"
+
+    # Killer attributes - the three that genuinely point at drive
+    # failure when non-zero: reallocated sectors, current pending,
+    # offline uncorrectable. ANY non-zero == discard that drive.
+    for spec in '5:Reallocated_Sector_Ct' \
+                '197:Current_Pending_Sector' \
+                '198:Offline_Uncorrectable'; do
+        id=${spec%%:*}; name=${spec#*:}
+        a=$(_attr_raw "$attrA" "$id")
+        b=$(_attr_raw "$attrB" "$id")
+        a_bad=0; b_bad=0
+        [ -n "$a" ] && [ "$a" -gt 0 ] 2>/dev/null && a_bad=1
+        [ -n "$b" ] && [ "$b" -gt 0 ] 2>/dev/null && b_bad=1
+        note="ok (both)"
+        if [ "$a_bad" = "1" ] && [ "$b_bad" = "0" ]; then note="A non-zero - DISCARD A"; fi
+        if [ "$b_bad" = "1" ] && [ "$a_bad" = "0" ]; then note="B non-zero - DISCARD B"; fi
+        if [ "$a_bad" = "1" ] && [ "$b_bad" = "1" ]; then note="BOTH non-zero - both suspect"; fi
+        _row "$id" "$name" "$a" "$b" "$note"
+    done
+
+    # UDMA_CRC_Error_Count (199) is in the kill-zone of many SMART
+    # tools, but on real hardware it's usually a SATA cable / port
+    # / connector issue rather than a drive defect: the protocol
+    # caught a bad transfer and retransmitted, so data integrity
+    # is preserved. Show non-zero values with a 'cable check'
+    # annotation rather than 'DISCARD', and treat it as a low-
+    # priority verdict signal (after age + load cycles).
+    a199=$(_attr_raw "$attrA" 199)
+    b199=$(_attr_raw "$attrB" 199)
+    a_bus_bad=0; b_bus_bad=0
+    [ -n "$a199" ] && [ "$a199" -gt 0 ] 2>/dev/null && a_bus_bad=1
+    [ -n "$b199" ] && [ "$b199" -gt 0 ] 2>/dev/null && b_bus_bad=1
+    crc_note="ok (both)"
+    if [ "$a_bus_bad" = "1" ] && [ "$b_bus_bad" = "0" ]; then crc_note="A non-zero - check A's SATA cable / port"; fi
+    if [ "$b_bus_bad" = "1" ] && [ "$a_bus_bad" = "0" ]; then crc_note="B non-zero - check B's SATA cable / port"; fi
+    if [ "$a_bus_bad" = "1" ] && [ "$b_bus_bad" = "1" ]; then crc_note="BOTH non-zero - check cabling on both"; fi
+    _row 199 "UDMA_CRC_Error_Count" "$a199" "$b199" "$crc_note"
+
+    # Wear / age signals with delta % computed.
+    for spec in '4:Start_Stop_Count' \
+                '12:Power_Cycle_Count' \
+                '192:Power-Off_Retract_Count' \
+                '193:Load_Cycle_Count' \
+                '9:Power_On_Hours'; do
+        id=${spec%%:*}; name=${spec#*:}
+        a=$(_attr_raw "$attrA" "$id")
+        b=$(_attr_raw "$attrB" "$id")
+        delta_note=""
+        if [ -n "$a" ] && [ -n "$b" ] && [ "$a" -gt 0 ] 2>/dev/null && [ "$b" -gt 0 ] 2>/dev/null; then
+            # delta = (max - min) / min * 100
+            if [ "$a" -ge "$b" ]; then
+                delta=$(awk -v hi="$a" -v lo="$b" 'BEGIN { printf "%.0f", (hi - lo) * 100 / lo }')
+                higher="A"
+            else
+                delta=$(awk -v hi="$b" -v lo="$a" 'BEGIN { printf "%.0f", (hi - lo) * 100 / lo }')
+                higher="B"
+            fi
+            if [ "$delta" -ge 5 ] 2>/dev/null; then
+                delta_note="$higher higher by ${delta}%"
+            else
+                delta_note="similar"
+            fi
+        fi
+        _row "$id" "$name" "$a" "$b" "$delta_note"
+    done
+
+    # Helium level (HE-series). Lower is worse.
+    heA=$(_attr_raw "$attrA" 22)
+    heB=$(_attr_raw "$attrB" 22)
+    he_note=""
+    if [ -n "$heA" ] && [ -n "$heB" ]; then
+        if [ "$heA" -lt "$heB" ] 2>/dev/null; then he_note="A lower - leak suspect"
+        elif [ "$heB" -lt "$heA" ] 2>/dev/null; then he_note="B lower - leak suspect"
+        else he_note="equal"
+        fi
+    fi
+    _row 22 "Helium_Level" "$heA" "$heB" "$he_note"
+
+    # Temperature.
+    tA=$(_attr_raw "$attrA" 194)
+    tB=$(_attr_raw "$attrB" 194)
+    _row 194 "Temperature_Celsius" "$tA" "$tB" ""
+
+    echo
+
+    # Verdict logic.
+    verdict=""
+    reason=""
+
+    # 1) Overall health.
+    case "$healthA" in PASSED|OK|"") :;; *) verdict="A"; reason="overall health '$healthA' is not PASSED"; esac
+    case "$healthB" in PASSED|OK|"") :;; *) [ -z "$verdict" ] && verdict="B" && reason="overall health '$healthB' is not PASSED";; esac
+
+    # 2) Self-test failure on one only - VERY strong signal (the drive
+    #    actually exercised its surface and reported a real fault).
+    if [ -z "$verdict" ]; then
+        if [ "$a_st_bad" = "1" ] && [ "$b_st_bad" = "0" ]; then
+            verdict="A"; reason="self-test failure on A (last result: '$stlA') - real surface fault"
+        elif [ "$b_st_bad" = "1" ] && [ "$a_st_bad" = "0" ]; then
+            verdict="B"; reason="self-test failure on B (last result: '$stlB') - real surface fault"
+        fi
+    fi
+
+    # 3) Error log entries on one only.
+    if [ -z "$verdict" ]; then
+        if [ "$a_err_bad" = "1" ] && [ "$b_err_bad" = "0" ]; then
+            verdict="A"; reason="error log entries on A (count=$errA_n) - firmware-recorded command failures"
+        elif [ "$b_err_bad" = "1" ] && [ "$a_err_bad" = "0" ]; then
+            verdict="B"; reason="error log entries on B (count=$errB_n) - firmware-recorded command failures"
+        fi
+    fi
+
+    # 4) Killer attrs 5/197/198 (sector-level drive damage). 199 is
+    #    handled later as a low-priority hint because it's usually
+    #    cable/port/connector noise rather than a drive defect.
+    if [ -z "$verdict" ]; then
+        for id in 5 197 198; do
+            a=$(_attr_raw "$attrA" "$id")
+            b=$(_attr_raw "$attrB" "$id")
+            a_bad=0; b_bad=0
+            [ -n "$a" ] && [ "$a" -gt 0 ] 2>/dev/null && a_bad=1
+            [ -n "$b" ] && [ "$b" -gt 0 ] 2>/dev/null && b_bad=1
+            if [ "$a_bad" = "1" ] && [ "$b_bad" = "0" ]; then
+                verdict="A"; reason="attribute $id is non-zero on A only (raw=$a) - drive sector damage"; break
+            fi
+            if [ "$b_bad" = "1" ] && [ "$a_bad" = "0" ]; then
+                verdict="B"; reason="attribute $id is non-zero on B only (raw=$b) - drive sector damage"; break
+            fi
+        done
+    fi
+
+    # 3) Helium level.
+    if [ -z "$verdict" ] && [ -n "$heA" ] && [ -n "$heB" ]; then
+        if [ "$heA" -lt "$heB" ] 2>/dev/null; then
+            verdict="A"; reason="lower helium level (A=$heA vs B=$heB)"
+        elif [ "$heB" -lt "$heA" ] 2>/dev/null; then
+            verdict="B"; reason="lower helium level (B=$heB vs A=$heA)"
+        fi
+    fi
+
+    # 4) Load cycle count delta >= 20%.
+    if [ -z "$verdict" ]; then
+        lA=$(_attr_raw "$attrA" 193)
+        lB=$(_attr_raw "$attrB" 193)
+        if [ -n "$lA" ] && [ -n "$lB" ] && [ "$lA" -gt 0 ] 2>/dev/null && [ "$lB" -gt 0 ] 2>/dev/null; then
+            if [ "$lA" -ge "$lB" ]; then
+                d=$(awk -v hi="$lA" -v lo="$lB" 'BEGIN { printf "%.0f", (hi - lo) * 100 / lo }')
+                if [ "$d" -ge 20 ] 2>/dev/null; then
+                    verdict="A"; reason="head-park wear: A has ${d}% more load cycles than B ($lA vs $lB)"
+                fi
+            else
+                d=$(awk -v hi="$lB" -v lo="$lA" 'BEGIN { printf "%.0f", (hi - lo) * 100 / lo }')
+                if [ "$d" -ge 20 ] 2>/dev/null; then
+                    verdict="B"; reason="head-park wear: B has ${d}% more load cycles than A ($lB vs $lA)"
+                fi
+            fi
+        fi
+    fi
+
+    # 5) Power-on hours delta >= 20%.
+    if [ -z "$verdict" ] && [ -n "$pohA" ] && [ -n "$pohB" ] \
+       && [ "$pohA" -gt 0 ] 2>/dev/null && [ "$pohB" -gt 0 ] 2>/dev/null; then
+        if [ "$pohA" -ge "$pohB" ]; then
+            d=$(awk -v hi="$pohA" -v lo="$pohB" 'BEGIN { printf "%.0f", (hi - lo) * 100 / lo }')
+            if [ "$d" -ge 20 ] 2>/dev/null; then
+                verdict="A"; reason="A is ${d}% older than B (POH $pohA vs $pohB)"
+            fi
+        else
+            d=$(awk -v hi="$pohB" -v lo="$pohA" 'BEGIN { printf "%.0f", (hi - lo) * 100 / lo }')
+            if [ "$d" -ge 20 ] 2>/dev/null; then
+                verdict="B"; reason="B is ${d}% older than A (POH $pohB vs $pohA)"
+            fi
+        fi
+    fi
+
+    # 6) UDMA_CRC delta - lowest-priority tiebreaker. This is rarely a
+    #    drive defect; it's typically a cable/port/connector issue.
+    #    Only fire if NOTHING else differentiated the drives.
+    if [ -z "$verdict" ] && [ "$a_bus_bad" = "1" ] && [ "$b_bus_bad" = "0" ]; then
+        verdict="A"; reason="UDMA CRC errors on A ($a199) suggest cable/port issue on A's bus (verify cabling before retiring)"
+    fi
+    if [ -z "$verdict" ] && [ "$b_bus_bad" = "1" ] && [ "$a_bus_bad" = "0" ]; then
+        verdict="B"; reason="UDMA CRC errors on B ($b199) suggest cable/port issue on B's bus (verify cabling before retiring)"
+    fi
+
+    if [ -n "$verdict" ]; then
+        if [ "$verdict" = "A" ]; then
+            warn "VERDICT: if you must retire one, prefer DRIVE A ($devA, ${modelA:-?})"
+        else
+            warn "VERDICT: if you must retire one, prefer DRIVE B ($devB, ${modelB:-?})"
+        fi
+        warn "  Reason: $reason"
+    else
+        info "VERDICT: no clear loser - both drives look healthy on the metrics compared."
+        info "  Both passed killer attributes, helium, load cycles, and age delta thresholds."
+    fi
+    echo
+    # Closing note. If both drives have at least one recorded self-test,
+    # mention that we used those results in the comparison; otherwise
+    # say what was used and what was skipped.
+    if [ "${stcA_n:-0}" -gt 0 ] 2>/dev/null && [ "${stcB_n:-0}" -gt 0 ] 2>/dev/null; then
+        explain "Note: comparison includes attributes + error log + self-test history"
+        explain "(both drives have firmware-recorded self-tests; latest run on each is"
+        explain "shown in the 'Last self-test' row). For the full dump on either drive,"
+        explain "use '$SCRIPT_NAME smart <disk>'."
+    else
+        explain "Note: comparison includes attributes + error log; self-test history is"
+        if [ "${stcA_n:-0}" = 0 ] && [ "${stcB_n:-0}" = 0 ]; then
+            explain "  empty on BOTH drives (configure SELFTEST_LONG_SCHEDULE in the config"
+            explain "  to have the daemon run periodic long self-tests; results survive"
+            explain "  reboot in firmware-resident logs)."
+        elif [ "${stcA_n:-0}" = 0 ]; then
+            explain "  empty on Drive A (no self-tests have been run on this disk yet)."
+        else
+            explain "  empty on Drive B (no self-tests have been run on this disk yet)."
+        fi
+        explain "For the full dump on either drive, use '$SCRIPT_NAME smart <disk>'."
+    fi
+}
+
+>>>>>>> 2dd898e42b065bbaca74af88849fb53912aad281
 # ----------------------------------------------------------------------
 # `test-alerts` - exercise every alerting channel.
 # ----------------------------------------------------------------------
@@ -10983,6 +13885,7 @@ cmd_watch() {
 }
 
 # ----------------------------------------------------------------------
+<<<<<<< HEAD
 # Subcommand: blink
 # ----------------------------------------------------------------------
 # Pulse a disk's activity LED by repeatedly reading from it. macOS
@@ -11518,6 +14421,543 @@ EOF
 }
 
 # ----------------------------------------------------------------------
+||||||| 5ac8308
+=======
+# Subcommand: blink
+# ----------------------------------------------------------------------
+# Pulse a disk's activity LED by repeatedly reading from it. macOS
+# exposes no API to toggle an enclosure LED, so we generate read I/O
+# instead and let the bus-activity LED do the blinking. This is the
+# same trick SoftRAID's "Identify" button uses.
+pick_physical_disk_interactively() {
+    # $1 = verb shown in the prompt header ("blink", "eject", ...).
+    _verb="${1:-pick}"
+
+    # Enumerate whole disks (skip Virtual: AppleRAID/APFS containers).
+    _disks=$(diskutil list 2>/dev/null | awk '/^\/dev\/disk[0-9]+/ {
+        sub(/:$/, "", $1); sub(/^\/dev\//, "", $1); print $1
+    }')
+
+    _i=0
+    _map=""
+    {
+        printf '%sPick a disk to %s:%s\n\n' "${C_BOLD}" "$_verb" "${C_RESET}"
+        printf '  %3s  %-8s %-9s %-4s %9s  %s\n' "#" "DEV" "LOC" "KIND" "SIZE" "MODEL"
+        printf '  %3s  %-8s %-9s %-4s %9s  %s\n' "-" "---" "---" "----" "----" "-----"
+    } >&2
+
+    for d in $_disks; do
+        info_out=$(diskutil info "/dev/$d" 2>/dev/null) || continue
+        virtual=$(echo "$info_out" | awk -F': +' '/Virtual:/ {print $2; exit}')
+        [ "$virtual" = "Yes" ] && continue
+
+        size=$(echo "$info_out" | awk -F': +' '
+            /Disk Size:/ { print $2; exit }
+            /Total Size:/ { print $2; exit }
+        ' | sed 's/ *(.*)//; s/[[:space:]]*$//')
+
+        solid=$(echo "$info_out"    | awk -F': +' '/Solid State:/  {print $2; exit}')
+        protocol=$(echo "$info_out" | awk -F': +' '/Protocol:/     {print $2; exit}')
+        if   [ "$protocol" = "Disk Image" ]; then kind="img"
+        elif [ "$solid"    = "Yes" ];        then kind="SSD"
+        else                                       kind="HDD"
+        fi
+
+        loc=$(echo "$info_out" | awk -F': +' '/Device Location:/ {print $2; exit}')
+        [ -z "$loc" ] && loc=$(echo "$info_out" | awk -F': +' '/Internal:/ {print ($2=="Yes"?"Internal":"External"); exit}')
+        loc=$(echo "$loc" | awk '{print $1}')
+
+        model=$(echo "$info_out" | awk -F': +' '/Device \/ Media Name:/ {print $2; exit}')
+        [ -z "$model" ] && model=$(echo "$info_out" | awk -F': +' '/Media Name:/ {print $2; exit}')
+        [ -z "$model" ] && model="-"
+
+        _i=$((_i + 1))
+        _map="$_map$_i=$d
+"
+        printf '  %3d  %-8s %-9s %-4s %9s  %s\n' "$_i" "$d" "${loc:-?}" "$kind" "$size" "$model" >&2
+    done
+
+    if [ "$_i" -eq 0 ]; then
+        errmsg "No physical disks found."
+        return 1
+    fi
+
+    {
+        echo
+        printf '%sChoice [1-%d, q to abort]:%s ' "${C_YELLOW}" "$_i" "${C_RESET}"
+    } >&2
+    read -r _choice || return 1
+    case "$_choice" in
+        q|Q|'')      err "Aborted."; return 1 ;;
+        *[!0-9]*)    err "Invalid choice: $_choice"; return 1 ;;
+    esac
+    if [ "$_choice" -lt 1 ] || [ "$_choice" -gt "$_i" ]; then
+        errmsg "Invalid choice: $_choice (must be 1..$_i)"
+        return 1
+    fi
+
+    _picked=$(printf '%s' "$_map" | awk -F= -v c="$_choice" '$1==c {print $2; exit}')
+    [ -n "$_picked" ] || { err "Internal error resolving choice $_choice."; return 1; }
+    echo "$_picked"
+}
+
+cmd_blink() {
+    eval "$(parse_global_flags "$@")"
+
+    arg=""
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -h|--help)
+                cat <<EOF
+Usage: $SCRIPT_NAME blink [<disk>]
+
+Pulse a disk's activity LED so you can identify which physical drive
+(or which enclosure slot) maps to a given /dev/diskN before yanking
+it for a swap or repair.
+
+macOS has no API to toggle an enclosure LED directly, so this
+generates read I/O on the disk and lets the bus-activity LED do the
+blinking. Same trick SoftRAID's "Identify" button uses.
+
+ARGUMENTS
+  <disk>    Optional. Disk number (e.g. 3), short name (disk3) or
+            full path (/dev/disk3). If omitted, you get an
+            interactive picker listing all attached physical disks.
+
+NOTES
+  - Read-only. Will not touch data.
+  - Reads from the raw device (/dev/rdiskN) for maximum throughput;
+    requires sudo on modern macOS.
+  - Pulses ~64 MiB read, then ~0.5 s idle, looping until you press
+    Ctrl-C. The on/off pattern makes the blink obvious.
+EOF
+                return 0
+                ;;
+            -V|--verbose|-D|--debug) ;;
+            -*) warn "Unknown option: $1" ;;
+            *)  arg="$1" ;;
+        esac
+        shift
+    done
+
+    if [ -z "$arg" ]; then
+        arg=$(pick_physical_disk_interactively "blink") || return 1
+    fi
+
+    dev=$(resolve_disk "$arg") || die "Invalid disk spec: $arg"
+    assert_whole_disk "$dev"
+
+    virt=$(diskutil info "$dev" 2>/dev/null | awk -F': *' '/Virtual:/ {print $2; exit}')
+    if [ "$virt" = "Yes" ]; then
+        die "$dev is a VIRTUAL device (RAID/APFS container) and has no LED of its own. Pick a physical disk."
+    fi
+
+    rdev="/dev/r${dev#/dev/}"
+
+    step "Blinking $dev"
+    describe_disk "$dev"
+    explain "Read-only loop: reads ~64 MiB, idles ~0.5 s, repeats. Watch the"
+    explain "drive's activity LED to identify which physical slot $dev is."
+    explain "Press Ctrl-C to stop."
+    echo
+
+    # Trap so Ctrl-C exits cleanly instead of dumping a half-printed dd line.
+    trap 'echo; ok "Blink stopped."; exit 0' INT TERM
+
+    # Prime sudo once so the loop body doesn't trigger a re-prompt mid-pulse.
+    if ! sudo -n true 2>/dev/null; then
+        info "Reading $rdev requires sudo (cached for the rest of the loop)."
+        sudo true || die "sudo authentication failed."
+    fi
+
+    pulse=0
+    while :; do
+        pulse=$((pulse + 1))
+        printf '  pulse %d ...\r' "$pulse"
+        if ! sudo dd if="$rdev" of=/dev/null bs=1m count=64 2>/dev/null; then
+            echo
+            die "Read failed on $rdev (disk disconnected?)"
+        fi
+        sleep 0.5
+    done
+}
+
+# ----------------------------------------------------------------------
+# Subcommand: eject
+# ----------------------------------------------------------------------
+# Spin down and power off a physical disk so it can be safely yanked.
+# Designed as the natural follow-up to `blink`: blink to identify which
+# slot a /dev/diskN is in, then eject it before pulling it.
+cmd_eject() {
+    eval "$(parse_global_flags "$@")"
+
+    arg=""
+    do_release=0
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -h|--help)
+                cat <<EOF
+Usage: $SCRIPT_NAME eject [<disk>] [--release]
+
+Unmount every volume on the disk, issue an explicit STANDBY IMMEDIATE
+via smartctl to spin the platter down, and run 'diskutil eject' so
+the disk can be safely disconnected. Natural follow-up to
+'$SCRIPT_NAME blink': blink to identify which physical slot a
+/dev/diskN is in, then eject it before pulling it.
+
+The explicit smartctl spin-down is needed because 'diskutil eject'
+is unreliable on direct-SATA / JBOD enclosures - it returns success
+while the disk keeps spinning. smartctl -s standby,now actually
+parks the heads and stops the platter via ATA STANDBY IMMEDIATE.
+USB bridges that intercept ATA pass-through may still ignore it;
+in that case the warning is non-fatal and the eject still runs.
+
+ARGUMENTS
+  <disk>      Optional. One of:
+                3                  disk number
+                disk3              short name
+                /dev/disk3         full device path
+                /dev/disk3s2       partition path (resolved to whole disk)
+                /Volumes/foo       mount point (walked back to whole disk)
+              If omitted, you get an interactive picker listing all
+              attached physical disks.
+
+OPTIONS
+  --release   Only meaningful when the disk is an active AppleRAID
+              member. Releases the kernel claim via
+                  diskutil appleRAID remove <member-uuid> <set-uuid>
+              before ejecting. THIS IS DESTRUCTIVE: the set goes
+              DEGRADED and rejoining the disk later requires a full
+              rebuild via '$SCRIPT_NAME repair'. Without --release,
+              eject REFUSES for an active RAID member and tells you
+              what to do instead.
+
+NOTES
+  - For a temporary unplug (cable test, slot swap), do NOT use eject
+    on a RAID member. Just yank the cable. The set will go Degraded;
+    the volume stays mounted and writes go to the survivor; on
+    reconnect AutoRebuild=1 rebuilds, AutoRebuild=0 leaves the disk
+    Failed (and you can recover via '$SCRIPT_NAME repair').
+  - Internal disks are refused (would take down macOS).
+  - Virtual devices (RAID/APFS containers) are refused; eject the
+    backing physical disk instead.
+EOF
+                return 0
+                ;;
+            -V|--verbose|-D|--debug) ;;
+            --release) do_release=1 ;;
+            -*) warn "Unknown option: $1" ;;
+            *)  arg="$1" ;;
+        esac
+        shift
+    done
+
+    if [ -z "$arg" ]; then
+        arg=$(pick_physical_disk_interactively "eject") || return 1
+    fi
+
+    dev=$(resolve_disk "$arg") || die "Invalid disk spec: $arg"
+    assert_whole_disk "$dev"
+    short="${dev#/dev/}"
+
+    virt=$(diskutil info "$dev" 2>/dev/null | awk -F': *' '/Virtual:/ {print $2; exit}')
+    if [ "$virt" = "Yes" ]; then
+        die "$dev is a VIRTUAL device (RAID/APFS container). Eject the backing physical disk instead."
+    fi
+
+    internal=$(diskutil info "$dev" 2>/dev/null | awk -F': *' '/Internal:/ {print $2; exit}')
+    if [ "$internal" = "Yes" ]; then
+        die "$dev is an INTERNAL disk - refusing to eject (would take down macOS)."
+    fi
+
+    # Quick membership check: is $dev a member of any AppleRAID set?
+    is_raid_member=0
+    if diskutil appleRAID list 2>/dev/null \
+         | awk '/^[0-9-]+[ \t]+disk/ {print $2}' \
+         | sed 's/s[0-9]*$//' \
+         | grep -qx "$short"; then
+        is_raid_member=1
+    fi
+
+    step "Eject plan for $dev"
+    describe_disk "$dev"
+    release_from_raid=0
+    if [ "$is_raid_member" = "1" ]; then
+        if [ "$do_release" = "0" ]; then
+            errmsg "$dev is an active member of an AppleRAID set."
+            echo
+            explain "Plain eject won't work: AppleRAID claims member disks at the"
+            explain "kernel level, so 'diskutil eject' fails while the membership"
+            explain "is live. Two ways forward:"
+            explain ""
+            explain "  - For a TEMPORARY unplug (cable test, slot swap, brief move):"
+            explain "    just yank the cable. The set goes Degraded; the volume stays"
+            explain "    mounted; on reconnect AutoRebuild=1 rebuilds, AutoRebuild=0"
+            explain "    leaves the disk Failed (recoverable via '$SCRIPT_NAME repair')."
+            explain ""
+            explain "  - To DESTROY the membership and physically remove the disk,"
+            explain "    re-run with --release :"
+            explain "      $SCRIPT_NAME eject $short --release"
+            explain "    THIS IS DESTRUCTIVE: the set goes DEGRADED and rejoining"
+            explain "    this disk later requires a full rebuild via 'repair'."
+            die "Aborted - 'eject' alone won't release a RAID member."
+        fi
+        # Delegate the release step to the shared helper used by
+        # 'cmd_release' and 'cmd_create --force'. Same plan + confirm
+        # logic across all three entry points.
+        release_disks_from_existing_raids "$dev"
+        release_from_raid=1
+    fi
+
+    step "Unmounting $dev"
+    run sudo diskutil unmountDisk force "$dev" \
+        || warn "unmountDisk returned non-zero (may be already unmounted)"
+
+    # The release helper above (when --release was passed) has already
+    # done the diskutil-appleRAID-remove step; we don't need a separate
+    # release block before the spin-down.
+
+    # Issue STANDBY IMMEDIATE via smartctl. macOS 'diskutil eject' is
+    # unreliable about spinning the platter down: it returns success
+    # while the disk often keeps spinning. smartctl -s standby,now
+    # asks the drive firmware to park the heads and stop the platter.
+    #
+    # macOS limitation worth knowing: the kernel's IOATAFamily driver
+    # (used for direct-SATA / internal disks) BLOCKS non-SMART ATA
+    # commands, so STANDBY IMMEDIATE fails with "Non-SMART commands
+    # not implemented" for those devices. It still works for USB and
+    # other-bus enclosures whose bridge presents the disk via the
+    # IOSCSIArchitectureModelFamily path. We attempt it best-effort
+    # and explain the failure mode if the kernel blocks us.
+    step "Spinning down $dev (STANDBY IMMEDIATE)"
+    smartctl_bin=$(command -v smartctl 2>/dev/null)
+    if [ -z "$smartctl_bin" ]; then
+        warn "smartctl not found in PATH - skipping explicit spin-down."
+        warn "  Install with: brew install smartmontools"
+    elif run sudo "$smartctl_bin" -s standby,now "$dev"; then
+        ok "Drive accepted STANDBY IMMEDIATE - platter is spinning down."
+    else
+        warn "STANDBY IMMEDIATE failed (exit non-zero)."
+        explain "On macOS, this is expected for direct-SATA / internal disks:"
+        explain "  the IOATAFamily kernel driver blocks non-SMART ATA"
+        explain "  pass-through, so userspace cannot send STANDBY IMMEDIATE."
+        explain "  USB / Thunderbolt-bridged enclosures that route the disk"
+        explain "  through IOSCSIArchitectureModelFamily are not affected."
+        explain "'diskutil eject' below will detach the device. The platter"
+        explain "may keep spinning until you power down the enclosure or"
+        explain "unplug the cable - modern drives park heads automatically"
+        explain "on power-loss (emergency-park via stored capacitor charge),"
+        explain "so unplugging while spinning is safe in practice."
+    fi
+
+    step "Ejecting $dev"
+    if run diskutil eject "$dev"; then
+        ok "$dev ejected. Safe to disconnect."
+        if [ "$release_from_raid" = "1" ]; then
+            echo
+            info "The disk has been released from its AppleRAID set."
+            info "After connecting a replacement (or the same disk back),"
+            info "rebuild with:  $SCRIPT_NAME repair <set>"
+        fi
+    else
+        errmsg "diskutil eject failed for $dev."
+        explain "Possible reasons:"
+        explain "  - A process is still holding files open on a volume on $dev."
+        explain "    Try: lsof +D /Volumes/<name>  (or 'sudo lsof' for system processes)"
+        if [ "$is_raid_member" = "1" ] && [ "$release_from_raid" != "1" ]; then
+            explain "  - $dev is still a member of an AppleRAID set."
+            explain "    To release + eject, run:  $SCRIPT_NAME eject $short --release"
+            explain "    (DESTRUCTIVE: the set will go Degraded.)"
+        fi
+        explain "  - The enclosure does not honor SCSI eject (some USB bridges)."
+        explain "    The disk is unmounted but the device node will persist."
+        explain "  - macOS refused due to a pending I/O operation. Wait a few seconds and retry."
+        exit 1
+    fi
+}
+
+# ----------------------------------------------------------------------
+# Subcommand: release
+# ----------------------------------------------------------------------
+# Release one or more disks from any AppleRAID set that currently
+# claims them, WITHOUT ejecting / unmounting the disk. Thin wrapper
+# around the same release_disks_from_existing_raids helper used by
+# 'cmd_create --force' and 'cmd_eject --release', so all three entry
+# points share semantics:
+#
+#   - If the set has OTHER members (not all are targets): just remove
+#     the target member; set stays alive (Degraded with the survivors).
+#   - If all members of the set are targets: delete the set.
+#
+# Confirms before any destructive action.
+cmd_release() {
+    eval "$(parse_global_flags "$@")"
+
+    args=""
+    for a in "$@"; do
+        case "$a" in
+            -h|--help)
+                cat <<EOF
+Usage: $SCRIPT_NAME release <disk> [<disk>...]
+
+Release one or more disks from the AppleRAID set(s) that currently
+claim them. The disks become free for any other use; the set stays
+alive (Degraded) for any members that were NOT released, and is
+deleted only if every one of its members was released.
+
+This is the underlying step used by:
+  - 'eject <disk> --release'   (release + unmount + spin-down + eject)
+  - 'create <name> <N1> <N2> --force'  (release + create new mirror)
+
+DESTRUCTIVE: the data on the released disk's side of the mirror is
+lost. Data on the surviving members is preserved.
+
+EXAMPLES
+  $SCRIPT_NAME release 7
+  $SCRIPT_NAME release disk7
+  $SCRIPT_NAME release /dev/disk7
+  $SCRIPT_NAME release 7 8           # release both
+EOF
+                return 0
+                ;;
+            -V|--verbose|-D|--debug) ;;
+            -*) warn "Unknown option: $a" ;;
+            *)  args="$args $a" ;;
+        esac
+    done
+    # shellcheck disable=SC2086
+    set -- $args
+
+    [ $# -ge 1 ] || die "Usage: $SCRIPT_NAME release <disk> [<disk>...]"
+
+    devs=""
+    for arg in "$@"; do
+        d=$(resolve_disk "$arg") || die "Invalid disk spec: $arg"
+        assert_whole_disk "$d"
+        devs="$devs $d"
+    done
+
+    # Pre-check: do any of these actually need releasing? If not,
+    # exit early with an explanatory message instead of a confusing
+    # silent no-op.
+    any_member=0
+    for d in $devs; do
+        short="${d#/dev/}"
+        if diskutil appleRAID list 2>/dev/null \
+            | awk '/^[0-9-]+[ \t]+disk/ {print $2}' \
+            | sed 's/s[0-9]*$//' \
+            | grep -qx "$short"; then
+            any_member=1
+            break
+        fi
+    done
+    if [ "$any_member" = "0" ]; then
+        info "None of the specified disks are members of an AppleRAID set."
+        info "Nothing to release."
+        return 0
+    fi
+
+    # shellcheck disable=SC2086
+    release_disks_from_existing_raids $devs
+}
+
+# ----------------------------------------------------------------------
+# Subcommand: smart
+# ----------------------------------------------------------------------
+# Comprehensive on-demand SMART drill-down for one disk: overall health,
+# pre-failure attributes (with non-zero killer highlight), self-test
+# history, and the firmware error log. Complements `health`, which is a
+# recurring monitor that only alerts on threshold crossings - it never
+# shows the firmware error/self-test logs and isn't designed for
+# interactive per-disk inspection.
+cmd_smart() {
+    eval "$(parse_global_flags "$@")"
+
+    args=""
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -h|--help)
+                cat <<EOF
+Usage: $SCRIPT_NAME smart [<disk>]
+       $SCRIPT_NAME smart <disk1> <disk2>
+
+Detailed SMART health drill-down for one disk, OR side-by-side
+comparison of two disks.
+
+ONE-DISK MODE (drill-down)
+  1/4  Overall health           (smartctl -H)
+  2/4  Pre-failure attributes   (smartctl -A) + non-zero killer summary
+  3/4  Self-test log            (smartctl -l selftest)
+  4/4  SMART error log          (smartctl -l error)
+
+  The error log and self-test log are exactly the data that answers
+  'was this drive ever in trouble in the past' - the firmware itself
+  remembers errors and test outcomes across reboots. Neither is shown
+  by '$SCRIPT_NAME health', which only alerts on the current value of
+  overall health, temperature, and the killer attributes.
+
+TWO-DISK MODE (comparison)
+  Render a per-attribute side-by-side table of two drives, compute
+  deltas (load-cycle wear, power-on-hours, helium level), and emit a
+  one-line VERDICT recommending which drive to retire FIRST if forced
+  to choose. Useful when retiring HE-series drives near end-of-life
+  and trying to decide which one is the weaker bet.
+
+ARGUMENTS
+  <disk>      Disk number (e.g. 3), short name (disk3) or full path
+              (/dev/disk3). Without args you get an interactive
+              picker listing all attached physical disks.
+  <disk1> <disk2>
+              Two disks to compare side-by-side.
+
+NOTES
+  - Read-only.
+  - Auto-detects the right 'smartctl -d <type>' for USB/TB enclosures.
+  - Refuses virtual devices (RAID/APFS containers).
+  - Requires smartctl: brew install smartmontools
+EOF
+                return 0
+                ;;
+            -V|--verbose|-D|--debug) ;;
+            -*) warn "Unknown option: $1" ;;
+            *)  args="$args $1" ;;
+        esac
+        shift
+    done
+
+    # shellcheck disable=SC2086
+    set -- $args
+
+    # Run writability checks ONCE in the main shell BEFORE any
+    # subshell-invoked smart_dtype_lookup / smart_dtype_store. The
+    # corrected STATE_DIR / LOG_FILE then propagate via process
+    # inheritance to every downstream subshell.
+    cfg_load
+    _ensure_state_dir_writable
+
+    if [ $# -ge 2 ]; then
+        # Comparison mode.
+        devA=$(resolve_disk "$1") || die "Invalid disk spec: $1"
+        devB=$(resolve_disk "$2") || die "Invalid disk spec: $2"
+        assert_whole_disk "$devA"
+        assert_whole_disk "$devB"
+        [ "$devA" = "$devB" ] && die "Cannot compare a disk to itself."
+        _smart_compare_two "${devA#/dev/}" "${devB#/dev/}"
+        return 0
+    fi
+
+    arg=""
+    [ $# -ge 1 ] && arg="$1"
+    if [ -z "$arg" ]; then
+        arg=$(pick_physical_disk_interactively "inspect (SMART)") || return 1
+    fi
+    dev=$(resolve_disk "$arg") || die "Invalid disk spec: $arg"
+    assert_whole_disk "$dev"
+    _smart_drilldown_one "${dev#/dev/}"
+}
+
+# ----------------------------------------------------------------------
+>>>>>>> 2dd898e42b065bbaca74af88849fb53912aad281
 # Subcommand: wipe
 # ----------------------------------------------------------------------
 # Zero first and last 100 MB of a whole disk.
@@ -12401,6 +15841,7 @@ _cmd_test_one_uuid() {
         ok "All tests passed."
         return 0
     else
+<<<<<<< HEAD
         errmsg "$fails test(s) failed."
         return 1
     fi
@@ -12933,6 +16374,540 @@ EOF
         info "tip: if you're using the health daemon with REQUIRED_SETS=all, run:"
         info "       $SCRIPT_NAME baseline --update --sets"
         info "     so the daemon picks up the new name."
+||||||| 5ac8308
+        err "$fails test(s) failed."
+        exit 1
+=======
+        errmsg "$fails test(s) failed."
+        return 1
+    fi
+}
+
+cmd_test() {
+    eval "$(parse_global_flags "$@")"
+
+    test_all=0
+    arg=""
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -h|--help)
+                cat <<EOF
+Usage: $SCRIPT_NAME test [--all | <name|uuid>]
+
+Run non-destructive tests on a RAID set:
+  T1: overall RAID status is 'Online'
+  T2: every member is 'Online'
+  T3: virtual device exists
+  T4: APFS volume on the RAID is mounted
+  T5: write/read probe to the mounted volume
+
+ARGUMENTS
+  <name|uuid>   Test the named RAID set.
+  --all         Test every AppleRAID set on the system. Continues
+                through failures and exits non-zero if ANY set fails.
+                Mutually exclusive with <name|uuid>.
+  (omitted)     Interactive picker.
+EOF
+                return 0
+                ;;
+            --all) test_all=1 ;;
+            -V|--verbose|-D|--debug) ;;
+            -*) warn "Unknown option: $1" ;;
+            *)  arg="$1" ;;
+        esac
+        shift
+    done
+
+    if [ "$test_all" = "1" ] && [ -n "$arg" ]; then
+        die "--all and a RAID set argument are mutually exclusive."
+    fi
+
+    if [ "$test_all" = "1" ]; then
+        _uuids=$(raid_list_uuids)
+        [ -n "$_uuids" ] || die "No AppleRAID sets found."
+
+        _total=0
+        _failed=""
+        for _u in $_uuids; do
+            _total=$((_total + 1))
+            if ! _cmd_test_one_uuid "$_u"; then
+                _name=$(diskutil appleRAID list "$_u" 2>/dev/null \
+                        | awk -F': +' '/^Name:/ {print $2; exit}')
+                _failed="$_failed${_failed:+
+}$_u${_name:+ ($_name)}"
+            fi
+        done
+
+        echo
+        step "Aggregate test summary"
+        if [ -z "$_failed" ]; then
+            ok "All $_total RAID set(s) passed."
+            return 0
+        else
+            _nfail=$(printf '%s\n' "$_failed" | grep -c .)
+            errmsg "$_nfail of $_total RAID set(s) failed:"
+            printf '%s\n' "$_failed" | sed 's/^/    - /'
+            exit 1
+        fi
+    fi
+
+    if [ -n "$arg" ]; then
+        uuid=""
+        for u in $(raid_list_uuids); do
+            [ "$u" = "$arg" ] && uuid="$u" && break
+        done
+        [ -z "$uuid" ] && uuid=$(raid_name_to_uuid "$arg")
+        [ -z "$uuid" ] && die "No RAID set matches '$arg'."
+        SELECTED_UUID="$uuid"
+    else
+        pick_raid_set
+    fi
+
+    _cmd_test_one_uuid "$SELECTED_UUID" || exit 1
+}
+
+# ----------------------------------------------------------------------
+# Subcommand: autorebuild
+# ----------------------------------------------------------------------
+# Manage AppleRAID's `AutoRebuild` (a.k.a. `Rebuild:` in `diskutil
+# appleRAID list`) per set. With AutoRebuild=automatic, a returning
+# member after a transient disconnect auto-rebuilds without operator
+# intervention. With manual, a returning member sits in `Failed` until
+# you run `repair`.
+#
+# Usage:
+#   autorebuild                    explainer + table of all sets with their AutoRebuild policy
+#   autorebuild <set>              show current state for one set;
+#                                  prompt yes/no to flip
+#   autorebuild <set> on|off       non-interactive flip
+#
+# (`SetTimeout` is intentionally NOT manageable via this command -
+# empirical testing on real disks shows it has no observable effect on
+# physical-disconnect behavior. See README "Empirically-verified
+# AppleRAID behavior" section. SetTimeout is displayed read-only in
+# `status`.)
+_autorebuild_help() {
+    cat <<EOF
+Usage: $SCRIPT_NAME autorebuild [<set>] [<mode>]
+       $SCRIPT_NAME autorebuild [<mode>] [<set>]
+
+  (no args)         Print this help text + show every set's current
+                    AutoRebuild value (table at the bottom). Read-only.
+  <set>             Show the named set's current AutoRebuild; prompt
+                    yes/no to flip it. Requires sudo for the update.
+  <set> <mode>      Set AutoRebuild non-interactively.
+  <mode> <set>      Same; the two positional args are order-independent.
+
+ARGUMENTS
+  <set>             A RAID set's name (e.g. 'weg', 'backup') or its UUID.
+                    Tip: tab-completion + 'list' to find names quickly.
+  <mode>            One of (case-insensitive):
+                      on  | automatic | auto | 1   ->  AutoRebuild=1
+                      off | manual    | man  | 0   ->  AutoRebuild=0
+                      reset | default                 clear per-set override
+                                                      (re-enable DEFAULT_AUTO_REBUILD
+                                                      enforcement for this set)
+
+PER-SET OVERRIDE
+  Setting <mode> on or off records a per-set override file in the state
+  directory. This is what stops the health daemon's DEFAULT_AUTO_REBUILD
+  enforcement from silently reverting your explicit choice on the next
+  pass. The override stays in effect until you run
+
+      $SCRIPT_NAME autorebuild <set> reset
+
+  ('autorebuild' with no args shows an OVERRIDE column in its table so
+  you can see at a glance which sets are user-pinned vs daemon-managed.)
+
+EXAMPLES
+  $SCRIPT_NAME autorebuild                  # this help + table of all sets
+  $SCRIPT_NAME autorebuild weg              # show + interactive prompt
+  $SCRIPT_NAME autorebuild weg on           # set weg's AR to automatic (1)
+  $SCRIPT_NAME autorebuild on weg           # same, args swapped
+  $SCRIPT_NAME autorebuild weg 1            # numeric form
+  $SCRIPT_NAME autorebuild 0 weg            # numeric, args swapped
+  $SCRIPT_NAME autorebuild backup off
+  $SCRIPT_NAME autorebuild weg reset        # clear weg's override
+
+TRADE-OFF
+  Empirical real-disk testing shows AutoRebuild is the ONLY knob that
+  controls what happens when a temporarily-missing member returns.
+    on  (automatic) - kernel auto-rebuilds (Failed -> Rebuilding ->
+                      Online). Full block-by-block rebuild; hours per
+                      TB. The set self-heals; the health daemon still
+                      emails on every transition + every 6h during
+                      the rebuild, so you don't lose visibility.
+    off (manual)    - returning member stays Failed; you must manually
+                      run '$SCRIPT_NAME repair' (which does the same
+                      full rebuild, just at your discretion). Persistent
+                      visible Degraded+Failed state until you act.
+
+  The script's default is OFF (DEFAULT_AUTO_REBUILD=0) - hard-alert
+  behavior. Flip to ON if you'd rather have silent self-healing while
+  trusting the daemon's emails to surface incidents.
+
+NOTE
+  SetTimeout (the other per-set parameter) has NO observable runtime
+  effect for clean physical disconnects on the enclosures we tested. It
+  is intentionally not managed by this command. Apple's default is 30s;
+  see '$SCRIPT_NAME status <set>' for the current value.
+EOF
+}
+
+cmd_autorebuild() {
+    eval "$(parse_global_flags "$@")"
+
+    arg_set=""
+    arg_mode=""
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -h|--help)
+                _autorebuild_help
+                return 0
+                ;;
+            -V|--verbose|-D|--debug) ;;
+            # Mode synonyms (case-insensitive). 0/1 forms are aliases
+            # for off/on so the user can use whichever feels natural.
+            on|ON|automatic|AUTOMATIC|auto|AUTO|1)         arg_mode="on"  ;;
+            off|OFF|manual|MANUAL|man|MAN|0)               arg_mode="off" ;;
+            # 'reset' clears any per-set user override so the daemon's
+            # DEFAULT_AUTO_REBUILD enforcement applies again.
+            reset|RESET|default|DEFAULT)                   arg_mode="reset" ;;
+            -*) warn "Unknown option: $1" ;;
+            *)
+                if [ -z "$arg_set" ]; then arg_set="$1"
+                else warn "Unexpected extra arg: $1"; fi
+                ;;
+        esac
+        shift
+    done
+
+    cfg_load 2>/dev/null
+
+    # No-args mode: print the same help text the user gets from
+    # 'my-appleRAID autorebuild --help', then append the per-set
+    # table at the bottom. Single source of truth for the wording.
+    if [ -z "$arg_set" ]; then
+        _autorebuild_help
+        echo
+        # Table of every set with current AutoRebuild + override flag.
+        printf '%s%-22s %-8s %-36s %-12s %-10s%s\n' \
+            "${C_BOLD}" "NAME" "STATUS" "UUID" "AutoRebuild" "OVERRIDE" "${C_RESET}"
+        for u in $(raid_list_uuids 2>/dev/null); do
+            n=$(diskutil appleRAID list "$u" 2>/dev/null \
+                | awk -F': +' '/^Name:/ {v=$2; sub(/[[:space:]]+$/,"",v); print v; exit}')
+            st=$(raid_status "$u")
+            ar_raw=$(raid_ar_get "$u")
+            case "$ar_raw" in
+                1) ar="auto"   ;;
+                0) ar="manual" ;;
+                *) ar="?"      ;;
+            esac
+            ovr_marker="-"
+            [ -f "$(ar_override_file "$u")" ] && ovr_marker="user-set"
+            printf '  %-22s %-8s %-36s %-12s %-10s\n' \
+                "$n" "$st" "$u" "$ar" "$ovr_marker"
+        done
+        echo
+        if [ -n "${DEFAULT_AUTO_REBUILD:-}" ]; then
+            info "Effective DEFAULT_AUTO_REBUILD config: $DEFAULT_AUTO_REBUILD"
+            info "  Sets without an OVERRIDE will be re-applied on the next list/health run."
+            info "  Sets with OVERRIDE='user-set' keep their explicit value (the daemon will"
+            info "  not revert it). Run 'autorebuild <set> reset' to clear an override."
+        else
+            info "DEFAULT_AUTO_REBUILD is empty - no automatic enforcement; sets keep their AutoRebuild as-is."
+        fi
+        return 0
+    fi
+
+    # Resolve set arg to UUID.
+    uuid=""
+    for u in $(raid_list_uuids); do
+        [ "$u" = "$arg_set" ] && uuid="$u" && break
+    done
+    [ -z "$uuid" ] && uuid=$(raid_name_to_uuid "$arg_set")
+    [ -z "$uuid" ] && die "No RAID set matches '$arg_set'."
+    name=$(diskutil appleRAID list "$uuid" 2>/dev/null \
+        | awk -F': +' '/^Name:/ {v=$2; sub(/[[:space:]]+$/,"",v); print v; exit}')
+
+    cur=$(raid_ar_get "$uuid")
+    cur_word="manual"
+    [ "$cur" = "1" ] && cur_word="auto"
+
+    # 'reset' clears the per-set override so the daemon's
+    # DEFAULT_AUTO_REBUILD enforcement applies again to this set.
+    if [ "$arg_mode" = "reset" ]; then
+        ovr=$(ar_override_file "$uuid")
+        if [ -f "$ovr" ]; then
+            run rm -f "$ovr" \
+                || die "Failed to remove override file: $ovr"
+            ok "Per-set AutoRebuild override cleared on '$name'."
+            info "DEFAULT_AUTO_REBUILD enforcement will re-apply on the next list/health pass."
+        else
+            info "No per-set override is set on '$name' (nothing to clear)."
+        fi
+        return 0
+    fi
+
+    # Per-set mode without explicit on/off: show + prompt.
+    if [ -z "$arg_mode" ]; then
+        step "AutoRebuild for set '$name' ($uuid)"
+        info "Current value: $cur_word ($cur)"
+        if [ -f "$(ar_override_file "$uuid")" ]; then
+            info "Per-set override is currently in effect (daemon will not revert)."
+        fi
+        echo
+        if [ "$cur_word" = "manual" ]; then
+            confirm "Switch to AUTOMATIC (recommended)?" || { info "No change."; return 0; }
+            arg_mode="on"
+        else
+            confirm "Switch to MANUAL?" || { info "No change."; return 0; }
+            arg_mode="off"
+        fi
+    fi
+
+    # Apply the requested change.
+    case "$(printf '%s' "$arg_mode" | tr '[:upper:]' '[:lower:]')" in
+        on)  target=1; word="automatic" ;;
+        off) target=0; word="manual"    ;;
+        *)   die "Unknown mode '$arg_mode' (expected on, off, or reset)" ;;
+    esac
+
+    # Persist the user's explicit choice as a per-set override BEFORE
+    # the diskutil call. This way, even if the daemon's next pass
+    # sneaks in between this update and the user's next inspection,
+    # it sees the override and skips the revert. Make sure STATE_DIR
+    # exists first so the touch won't silently fail when the daemon
+    # has never run.
+    mkdir -p "${STATE_DIR:-/tmp}" 2>/dev/null || true
+    printf '%s\n' "$target" > "$(ar_override_file "$uuid")" 2>/dev/null \
+        || warn "Could not write override file at $(ar_override_file "$uuid") - daemon may revert this change on the next pass."
+
+    if [ "$cur" = "$target" ]; then
+        ok "AutoRebuild already $word on '$name'. (Override file refreshed.)"
+        return 0
+    fi
+
+    step "Setting AutoRebuild=$word on '$name'"
+    if run sudo diskutil appleRAID update AutoRebuild "$target" "$uuid"; then
+        new=$(raid_ar_get "$uuid")
+        new_word="manual"
+        [ "$new" = "1" ] && new_word="auto"
+        if [ "$new" = "$target" ]; then
+            ok "AutoRebuild is now $word on '$name'."
+            info "Per-set override recorded ($(ar_override_file "$uuid"))."
+            info "  Daemon will respect this until you run:"
+            info "    $SCRIPT_NAME autorebuild $name reset"
+        else
+            warn "diskutil reported success but ioreg shows AutoRebuild=$new_word."
+        fi
+    else
+        die "Failed to set AutoRebuild=$word on '$name'."
+    fi
+}
+
+# ----------------------------------------------------------------------
+# Subcommand: rename
+# ----------------------------------------------------------------------
+# Renames a RAID set's "Name:" field (as shown in `diskutil appleRAID list`).
+#
+# Uses the undocumented `diskutil appleRAID update SetName <new> <uuid>` key.
+# The documented update keys are only AutoRebuild and SetTimeout, but SetName
+# is accepted by macOS (verified on Darwin 25.x). No sudo required; ownership
+# of the RAID set is sufficient.
+#
+# Does NOT rename the file system volume inside the RAID (e.g. the APFS
+# volume at /Volumes/<name>). Those are independent names; rename the
+# mounted volume separately with `diskutil rename <mountpoint> <new>`
+# if you want them to match.
+cmd_rename() {
+    # Strip global flags that may appear after the subcommand.
+    eval "$(parse_global_flags "$@")"
+
+    # Handle per-command help explicitly, BEFORE positional parsing -
+    # otherwise `rename --help` would be interpreted as a new name
+    # and rename the auto-selected set to the literal string "--help".
+    for a in "$@"; do
+        case "$a" in
+            -h|--help)
+                cat <<EOF
+Usage: $SCRIPT_NAME rename [name|uuid] <new-name> [--raid-only]
+       $SCRIPT_NAME rename <new-name>              # picks the set interactively
+
+Renames a RAID set's "Name:" field (as shown in 'diskutil appleRAID list').
+Non-destructive; no sudo required.
+
+By default also renames mounted volume(s) backed by this RAID:
+   - if volume name == old RAID name (in sync) -> renamed automatically
+   - if volume name == new RAID name           -> already done; skipped
+   - if volume name diverges from both         -> asks interactively
+                                                  (yes/no per volume)
+
+Options:
+   --raid-only     Rename only the RAID set; never touch volume names.
+
+Rationale: 'diskutil appleRAID create mirror <name> APFS ...' sets BOTH
+the RAID set name and the created volume name to <name>, so the symmetric
+operation for rename is to update both when they still agree.
+EOF
+                return 0
+                ;;
+        esac
+    done
+
+    # Parse --raid-only flag out of positional args (preserve spaces in others).
+    raid_only=no
+    new_args=""
+    for a in "$@"; do
+        case "$a" in
+            --raid-only) raid_only=yes ;;
+            *) new_args="$new_args${new_args:+ }$(printf '%s' "$a" | sed "s/'/'\\\\''/g; s/^/'/; s/$/'/")" ;;
+        esac
+    done
+    eval "set -- $new_args"
+
+    if [ $# -lt 1 ]; then
+        die "Usage: $SCRIPT_NAME rename [name|uuid] <new-name> [--raid-only]"
+    fi
+
+    if [ $# -ge 2 ]; then
+        arg="$1"
+        new_name="$2"
+        uuid=""
+        for u in $(raid_list_uuids); do
+            [ "$u" = "$arg" ] && uuid="$u" && break
+        done
+        [ -z "$uuid" ] && uuid=$(raid_name_to_uuid "$arg")
+        [ -z "$uuid" ] && die "No RAID set matches '$arg'."
+        SELECTED_UUID="$uuid"
+    else
+        new_name="$1"
+        pick_raid_set
+    fi
+
+    # Validate new name: non-empty, not a flag, no leading/trailing space.
+    if [ -z "$new_name" ]; then
+        die "New name must not be empty."
+    fi
+    case "$new_name" in
+        -*) die "New name must not start with '-' (looks like a flag): '$new_name'. Use -- to separate if intentional, or quote the name." ;;
+        ' '*|*' ') die "New name must not start or end with whitespace: '$new_name'" ;;
+    esac
+
+    # Get current name for the log.
+    old_name=$(diskutil appleRAID list 2>/dev/null | awk -F': +' -v u="$SELECTED_UUID" '
+        /^Name:/      { cur = $2; sub(/ +$/, "", cur) }
+        /^Unique ID:/ { uuid = $2; sub(/ +$/, "", uuid); if (uuid == u) { print cur; exit } }
+    ')
+
+    if [ "$old_name" = "$new_name" ]; then
+        info "RAID set $SELECTED_UUID is already named '$new_name'; nothing to do."
+        return 0
+    fi
+
+    # Reject collision with an existing set.
+    collision=$(raid_name_to_uuid "$new_name")
+    if [ -n "$collision" ] && [ "$collision" != "$SELECTED_UUID" ]; then
+        die "Another RAID set is already named '$new_name' (uuid=$collision)."
+    fi
+
+    step "RENAME RAID set $SELECTED_UUID: '$old_name' -> '$new_name'"
+    if [ "$raid_only" = "yes" ]; then
+        info "Mode: --raid-only (volume names will not be touched)."
+    else
+        info "Mode: dual rename (RAID set + matching mounted volume(s))."
+    fi
+
+    run diskutil appleRAID update SetName "$new_name" "$SELECTED_UUID" \
+        || die "RAID rename failed"
+
+    ok "RAID set $SELECTED_UUID renamed: '$old_name' -> '$new_name'."
+
+    # ------------------------------------------------------------------
+    # Volume rename pass.
+    # The RAID's Name field and the file-system volume name(s) are
+    # independent: 'diskutil appleRAID create mirror <n> APFS ...' sets
+    # both, but later 'diskutil rename' may touch only one. So:
+    #   - volume name == old_name  -> they were in sync; rename automatically
+    #   - volume name == new_name  -> already in sync with the new name; skip
+    #   - anything else (diverged) -> ask interactively
+    # ------------------------------------------------------------------
+    if [ "$raid_only" != "yes" ]; then
+        raid_dev=$(raid_uuid_to_device "$SELECTED_UUID")
+        if [ -z "$raid_dev" ]; then
+            warn "Could not resolve device node for RAID $SELECTED_UUID; skipping volume scan."
+        else
+            step "Scanning volumes backed by /dev/$raid_dev"
+            vols=$(list_volumes_on_raid "$raid_dev")
+            if [ -z "$vols" ]; then
+                info "No mounted volumes found on /dev/$raid_dev — nothing to rename."
+            else
+                printf '%s\n' "$vols" | while IFS='|' read -r vdev vname vmp; do
+                    [ -n "$vdev" ] || continue
+                    info "Volume: /dev/$vdev  name='$vname'  mount='$vmp'"
+                    if [ "$vname" = "$new_name" ]; then
+                        info "  -> already named '$new_name'; nothing to do."
+                        continue
+                    fi
+                    if [ "$vname" = "$old_name" ]; then
+                        info "  -> in sync with old RAID name; renaming volume to '$new_name'."
+                        run diskutil rename "/dev/$vdev" "$new_name" \
+                            || warn "  Volume rename failed for /dev/$vdev (continuing)."
+                        continue
+                    fi
+                    warn "  -> name diverges from RAID (volume='$vname', old RAID='$old_name')."
+                    # while-loop is fed by a pipe, so use /dev/tty for the
+                    # interactive prompt (otherwise confirm's read would
+                    # consume the next volume line from the pipe).
+                    # If no tty is available (e.g. ssh without -t), default
+                    # to safe-skip and tell the user how to control behavior.
+                    # Note: '[ -r /dev/tty ]' lies under ssh-without-tty
+                    # (file exists but open() fails), so actually attempt
+                    # the open in a subshell.
+                    if ! ( : < /dev/tty ) 2>/dev/null; then
+                        info "  -> non-interactive (no /dev/tty); leaving volume unchanged."
+                        info "     Use 'ssh -t' to enable the prompt, --raid-only to suppress it,"
+                        info "     or rename manually: diskutil rename /dev/$vdev <new-name>"
+                    elif confirm "  Rename this volume to '$new_name' as well?" < /dev/tty; then
+                        run diskutil rename "/dev/$vdev" "$new_name" \
+                            || warn "  Volume rename failed for /dev/$vdev (continuing)."
+                    else
+                        info "  -> leaving volume name '$vname' unchanged."
+                        info "     (Manual: diskutil rename /dev/$vdev <new-name>)"
+                    fi
+                done
+            fi
+        fi
+    fi
+
+    # Post-rename: friendly compact view of just the renamed set.
+    # Raw diskutil dump gated behind -V.
+    step "Post-rename state"
+    _new_name=$(diskutil appleRAID list "$SELECTED_UUID" 2>/dev/null \
+        | awk -F': +' '/^Name:/ {v=$2; sub(/[[:space:]]+$/,"",v); print v; exit}')
+    if [ -n "$_new_name" ]; then
+        cmd_list "$_new_name"
+    fi
+    if [ "$VERBOSE" = "1" ]; then
+        echo
+        step "Verbose: diskutil appleRAID list $SELECTED_UUID"
+        run diskutil appleRAID list "$SELECTED_UUID"
+    fi
+
+    # Keep baseline in sync if REQUIRED_SETS=all / auto-baseline is on.
+    # Without this, the health daemon would alert for a missing set
+    # (the old name disappeared) and an unexpected set (the new name appeared).
+    cfg_load 2>/dev/null || true
+    if [ "${AUTO_BASELINE_FOR_SETS_ON_CREATE:-no}" = "yes" ] \
+       || [ "${AUTO_BASELINE_FOR_SETS_ON_DESTROY:-no}" = "yes" ]; then
+        state_init 2>/dev/null || true
+        baseline_write_sets
+        info "auto-baseline: $(baseline_sets_file) updated (name changed)"
+    else
+        info "tip: if you're using the health daemon with REQUIRED_SETS=all, run:"
+        info "       $SCRIPT_NAME baseline --update --sets"
+        info "     so the daemon picks up the new name."
+>>>>>>> 2dd898e42b065bbaca74af88849fb53912aad281
     fi
 }
 
@@ -13018,6 +16993,212 @@ cmd_destroy() {
     # other orphans), so the daemon doesn't keep referring to a vanished
     # set's user-explicit policy.
     _sweep_stale_ar_overrides
+}
+
+# ----------------------------------------------------------------------
+# Zsh completion installer (transparently managed from within the script,
+# same pattern as my-plex). Runs on every invocation; idempotent: writes
+# nothing if the on-disk file already has the current content.
+# ----------------------------------------------------------------------
+install_zsh_completions() {
+    # Best-effort - never let this fail the run.
+    [ -n "${HOME:-}" ] || return 0
+    # We install into $HOME/.zsh/completions regardless of EUID. On
+    # hosts where the tool is genuinely used as root (e.g. ada), root's
+    # interactive shell IS the shell that needs the completion, and
+    # /var/root is the right place. On a normal sudo-from-user setup
+    # the file lands in /var/root only for that invocation, then a
+    # subsequent non-sudo run installs the user's own copy too -
+    # that's fine, they're independent files.
+
+    _comp_dir="$HOME/.zsh/completions"
+    _comp_file="$_comp_dir/_my-appleRAID"
+
+    _tmp=$(mktemp 2>/dev/null) || return 0
+    cat >"$_tmp" <<'COMPLETION_EOF'
+#compdef my-appleRAID
+
+_my-appleRAID() {
+    local context state line
+    typeset -A opt_args
+
+    local -a commands
+    commands=(
+        'list:List all AppleRAID sets and their members'
+        'disks:One line per disk'
+        'info:Show detailed info for a RAID set'
+        'status:Short status summary (Online / Degraded / ...)'
+        'watch:Live-refreshing status'
+        'blink:Pulse a disk activity LED to identify the physical drive'
+        'eject:Unmount + spin-down + power off (refuses RAID members; --release to also break from set)'
+        'release:Release one or more disks from their AppleRAID set without ejecting'
+        'smart:Detailed SMART drill-down for one disk (history + error log + self-tests)'
+        'wipe:Zero first + last 100 MB of /dev/diskN'
+        'verify-wipe:Check that first + last 100 MB are zeros'
+        'create:Create a new mirror from two disk numbers'
+        'repair:Interactive guided repair of a degraded set'
+        'test:Run non-destructive tests on a RAID set'
+        'destroy:Delete a RAID set (data loss)'
+        'rename:Rename a RAID set'
+        'autorebuild:Manage AppleRAID AutoRebuild policy (per set)'
+        'health:Run a monitoring pass'
+        'show-config:Print effective config values'
+        'create-config:Write annotated default config to <path>'
+        'baseline:Snapshot current sets/disks as expected baseline'
+        'report:Human-readable health summary (read-only)'
+        'test-alerts:Exercise every alerting channel'
+        'install-daemon:Install the LaunchDaemon plist'
+        'uninstall-daemon:Unload and remove the LaunchDaemon'
+        'daemon-status:Diagnose the daemon'
+        'migrate-softraid:Migrate ONE SoftRAID mirror to AppleRAID (auto-releases SoftRAID side)'
+        'release-softraid:Tear down a SoftRAID volume without creating an AppleRAID set'
+        'uninstall-softraid:Pre/post-flight verification for SoftRAID removal'
+        'help:Show help (use help <command> for details)'
+        'version:Print version, copyright, and license info'
+        'stamp-version:Bake the current git short SHA into SCRIPT_COMMIT (run before deploy)'
+    )
+
+    local -a global_opts
+    global_opts=(
+        '(-V --verbose)'{-V,--verbose}'[Show more detail]'
+        '(-D --debug)'{-D,--debug}'[Even more detail; implies -V + set -x]'
+        '(-h --help)'{-h,--help}'[Show help]'
+        '--version[Print version + copyright + license]'
+    )
+
+    _arguments -s : \
+        $global_opts \
+        '1: :->cmd' \
+        '*::arg:->args'
+
+    case "$state" in
+        cmd)
+            _describe 'command' commands
+            ;;
+        args)
+            case "$line[1]" in
+                help|--help|-h)
+                    _describe 'help topic' commands
+                    ;;
+                info|status|watch|destroy|rename|repair)
+                    _message 'RAID set name or UUID'
+                    ;;
+                autorebuild)
+                    _arguments \
+                        '1: :_message "RAID set name or UUID (or omit for explainer + table)"' \
+                        '2: :(on off)'
+                    ;;
+                test)
+                    _arguments \
+                        '--all[Test every AppleRAID set; non-zero exit if any fail]' \
+                        '*: :_message "RAID set name or UUID"'
+                    ;;
+                migrate-softraid|release-softraid)
+                    _message 'SoftRAID volume name'
+                    ;;
+                wipe|verify-wipe|blink|smart)
+                    _message 'disk number (e.g. 3 for /dev/disk3)'
+                    ;;
+                eject)
+                    _arguments \
+                        '--release[Also break the disk out of its AppleRAID set (DESTRUCTIVE: set goes Degraded)]' \
+                        '*: :_message "disk number (e.g. 3 for /dev/disk3)"'
+                    ;;
+                release)
+                    _message 'disk number(s) - one or more (e.g. 3 7)'
+                    ;;
+                create)
+                    _arguments \
+                        '--force[Release target disks from any AppleRAID set that currently claims them, before creating]' \
+                        '*: :_message "name <N1> <N2>"'
+                    ;;
+                create-config)
+                    _files
+                    ;;
+                health)
+                    _arguments \
+                        '--dry-run[Perform checks, no alerts]' \
+                        '--once[Bypass rate limits (testing)]' \
+                        '-v[Debug logging for this run]' \
+                        '--disk[SMART drill-down for one disk (skip daemon pass)]:disk number:'
+                    ;;
+                baseline)
+                    _arguments \
+                        '--update[Refresh baseline from current state]' \
+                        '--raw[Cat baseline.raw forensic snapshot]' \
+                        '--diff[Show diff between recorded baseline and live]' \
+                        '--sets[(with --update) restrict to set baseline]' \
+                        '--disks[(with --update) restrict to disk baseline]' \
+                        '--optsets[(with --update) interactive OPTIONAL_DISK_SETS manager]'
+                    ;;
+                *)
+                    _files
+                    ;;
+            esac
+            ;;
+    esac
+}
+
+_my-appleRAID "$@"
+COMPLETION_EOF
+
+    # Idempotent: only update if content changed.
+    _changed=0
+    if [ -r "$_comp_file" ] && cmp -s "$_tmp" "$_comp_file" 2>/dev/null; then
+        rm -f "$_tmp"
+    else
+        mkdir -p "$_comp_dir" 2>/dev/null || { rm -f "$_tmp"; return 0; }
+        mv "$_tmp" "$_comp_file" 2>/dev/null || { rm -f "$_tmp"; return 0; }
+        _changed=1
+    fi
+    # mktemp creates files at mode 600; compinit's security check then
+    # refuses to load them. Match the conventional 644 used by other
+    # completion files (e.g. _my-plex). Detect a stale 600 leftover
+    # from earlier versions and treat that as 'changed' too, so the
+    # zcompdump rebuild below kicks in.
+    if [ -r "$_comp_file" ]; then
+        case "$(stat -f '%Lp' "$_comp_file" 2>/dev/null)" in
+            644) ;;
+            *)   chmod 644 "$_comp_file" 2>/dev/null && _changed=1 ;;
+        esac
+    fi
+
+    # When the completion file was created or updated, invalidate the
+    # compinit dump so the next shell rebuilds it - otherwise zsh
+    # keeps reusing the stale cache and the new file is ignored.
+    if [ "$_changed" = "1" ]; then
+        rm -f "$HOME"/.zcompdump* 2>/dev/null || true
+    fi
+
+    # Patch ~/.zshrc to add the fpath entry, but only once.
+    _zshrc="$HOME/.zshrc"
+    [ -f "$_zshrc" ] || return 0
+    if grep -q '\.zsh/completions' "$_zshrc" 2>/dev/null; then
+        return 0
+    fi
+
+    # If oh-my-zsh is loaded, insert fpath BEFORE the source line so
+    # compinit (run by oh-my-zsh) picks up the new path. Otherwise
+    # append fpath + compinit at the end.
+    if grep -q 'oh-my-zsh\.sh' "$_zshrc" 2>/dev/null; then
+        _tmp_rc=$(mktemp 2>/dev/null) || return 0
+        awk -v cdir="$_comp_dir" '
+            !inserted && /oh-my-zsh\.sh/ {
+                print "# my-appleRAID zsh completions"
+                print "fpath=(" cdir " $fpath)"
+                inserted=1
+            }
+            { print }
+        ' "$_zshrc" >"$_tmp_rc" 2>/dev/null \
+            && mv "$_tmp_rc" "$_zshrc" 2>/dev/null
+        rm -f "$_tmp_rc"
+    else
+        {
+            printf '\n# my-appleRAID zsh completions\n'
+            printf 'fpath=(%s $fpath)\n' "$_comp_dir"
+            printf 'autoload -Uz compinit && compinit\n'
+        } >>"$_zshrc" 2>/dev/null || true
+    fi
 }
 
 # ----------------------------------------------------------------------
