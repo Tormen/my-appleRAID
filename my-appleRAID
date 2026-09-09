@@ -1103,6 +1103,7 @@ cfg_load() {
     for candidate in \
         "${MY_APPLERAID_CONFIG:-}" \
         "/LINKS/default/my-appleRAID.conf" \
+        "/LINKS/default/my-appleRAID" \
         "${HOME:-/}/.my-appleRAID.conf" \
         "/usr/local/etc/my-appleRAID.conf" \
         "/etc/my-appleRAID.conf"
