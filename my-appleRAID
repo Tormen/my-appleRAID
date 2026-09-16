@@ -89,7 +89,7 @@ SCRIPT_NAME="$(basename "$0")"
 # subcommand updates SCRIPT_COMMIT to the current HEAD sha and
 # amends - run it as the last step before deploying.
 SCRIPT_VERSION="v8.7"
-SCRIPT_COMMIT="959a998"
+SCRIPT_COMMIT="d92a9d0"
 SCRIPT_COPYRIGHT="Copyright (C) 2026 Tormen <tormen@mail.ch>"
 SCRIPT_LICENSE_SHORT="GPL-3.0-or-later (copyleft)"
 SCRIPT_LICENSE_URL="https://www.gnu.org/licenses/gpl-3.0.html"
@@ -244,8 +244,10 @@ die() {
 #   021   state-DB: atomic rename during state-put failed
 #   022   state-DB: awk rewrite during state-delete failed
 #   023   state-DB: atomic rename during state-delete failed
+#   024   test-mail: called with arguments (it takes none)
+#   025   test-mail: the test mail was not delivered (or email disabled)
 #
-# _ERR_HIGHEST=023
+# _ERR_HIGHEST=025
 # ----------------------------------------------------------------------
 err() {
     _ec_code="$1"
@@ -9329,6 +9331,57 @@ _smart_compare_two() {
 }
 
 # ----------------------------------------------------------------------
+# send_test_mail <origin> - send ONE test mail through alert_email, the
+# same function (and the same EMAIL_TO / EMAIL_FROM / EMAIL_SENDER and
+# failure diagnostics) every real alert uses. Shared by `test-mail` and
+# `test-alerts`. <origin> is the command name, quoted in the body.
+#
+# Returns 0 only when the sender accepted the mail. A disabled channel
+# (EMAIL_TO or EMAIL_SENDER empty) is a FAILURE here: alert_email treats
+# it as a successful no-op, which for a test would report a mail that
+# was never sent.
+# ----------------------------------------------------------------------
+send_test_mail() {
+    _tm_origin="$1"
+    if [ -z "${EMAIL_TO:-}" ]; then
+        errmsg "Test mail NOT sent: email is disabled [EMAIL_TO='']"
+        return 1
+    fi
+    if [ -z "${EMAIL_SENDER:-}" ]; then
+        errmsg "Test mail NOT sent: email is disabled [EMAIL_SENDER='']"
+        return 1
+    fi
+    _tm_host=$(hostname)
+    _tm_rc=0
+    alert_email "[appleRAID] TEST mail from $_tm_host - please ignore" \
+        "This is a TEST mail from '$SCRIPT_NAME $_tm_origin'. No action needed.
+
+Host:   $_tm_host
+User:   $(id -un 2>/dev/null)
+Time:   $(now_iso)
+Config: $LOADED_CONFIG
+
+If you received this, the email alert chain is working." || _tm_rc=$?
+    if [ "$_tm_rc" -eq 0 ]; then
+        ok "Test mail sent to '$EMAIL_TO' via ${sender_exec:-$EMAIL_SENDER} [rc $_tm_rc]"
+        return 0
+    fi
+    errmsg "Test mail FAILED to '$EMAIL_TO' [rc $_tm_rc] - see the EMAIL FAILED block above."
+    return 1
+}
+
+# ----------------------------------------------------------------------
+# `test-mail` (also `--test-mail`) - send ONE test mail, nothing else.
+# ----------------------------------------------------------------------
+cmd_test_mail() {
+    [ $# -eq 0 ] || err 024 "test-mail takes no arguments [got: $*]" 2
+    cfg_load
+    state_init
+    info "Config file: $LOADED_CONFIG"
+    send_test_mail test-mail || err 025 "test-mail: no mail was delivered"
+}
+
+# ----------------------------------------------------------------------
 # `test-alerts` - exercise every alerting channel.
 # ----------------------------------------------------------------------
 cmd_test_alerts() {
@@ -9346,20 +9399,7 @@ cmd_test_alerts() {
     info "2/3 Sending test email to '${EMAIL_TO:-<disabled>}'"
     _test_alerts_email_failed=0
     if [ -n "${EMAIL_TO:-}" ]; then
-        if alert_email "[appleRAID] Test alert" \
-            "This is a test from appleRAID test-alerts.
-
-Host:   $(hostname)
-Time:   $(now_iso)
-Config: $LOADED_CONFIG
-
-If you received this, the email alert chain is working."
-        then
-            ok "Test email dispatched - check your inbox."
-        else
-            _test_alerts_email_failed=1
-            errmsg "Test email FAILED. See the EMAIL FAILED block above for diagnostics."
-        fi
+        send_test_mail test-alerts || _test_alerts_email_failed=1
     else
         warn "Email disabled (EMAIL_TO is empty)."
     fi
@@ -9458,6 +9498,125 @@ script_version_string() {
     fi
     [ -n "$_sha" ] && _v="$_v ($_sha)"
     echo "$_v"
+}
+
+# ----------------------------------------------------------------------
+# 'run-tests' - self-tests for the parts of the CLI that can run without
+# real disks. Each test runs this script as a child process in a sandbox:
+# a temporary HOME (the zsh-completion installer writes there), its own
+# config via $MY_APPLERAID_CONFIG, STATE_DIR / LOG_FILE under the sandbox,
+# the alarm off, and EMAIL_SENDER pointing at a STUB that records what it
+# was given - no real mail is ever sent.
+# Exit 0 when every test passes, 1 otherwise.
+# ----------------------------------------------------------------------
+_T_PASS=0
+_T_FAIL=0
+
+_t_ok()   { _T_PASS=$((_T_PASS + 1)); printf '  PASS  %s\n' "$1"; }
+_t_fail() { _T_FAIL=$((_T_FAIL + 1)); printf '  FAIL  %s\n' "$1"; }
+_t_check() {
+    # Args: description, then a test command; PASS when it succeeds.
+    _tc_desc="$1"; shift
+    if "$@"; then _t_ok "$_tc_desc"; else _t_fail "$_tc_desc"; fi
+}
+_t_grep()  { grep -q -- "$1" "$2" 2>/dev/null; }
+_t_nogrep() { ! grep -q -- "$1" "$2" 2>/dev/null; }
+_t_count() { awk -v p="$1" 'index($0, p) == 1 { n++ } END { print n + 0 }' "$2" 2>/dev/null; }
+
+# _t_run <extra config lines> <argv...>: run the script in the sandbox.
+# Leaves stdout in $_T/out, stderr in $_T/err, exit status in $_t_rc.
+_t_run() {
+    _tr_extra="$1"; shift
+    rm -f "$_T/out" "$_T/err" "$_T/mail" "$_T/argv"
+    {
+        printf 'EMAIL_TO="rcpt@example.invalid"\n'
+        printf 'EMAIL_FROM="sender@example.invalid"\n'
+        printf 'EMAIL_SENDER="%s"\n' "$_T/stub-sender"
+        printf 'STATE_DIR="%s"\n' "$_T/state"
+        printf 'LOG_FILE="%s"\n' "$_T/log"
+        printf 'ALARM_ENABLED=no\n'
+        printf '%s\n' "$_tr_extra"
+    } > "$_T/conf"
+    env HOME="$_T/home" MY_APPLERAID_CONFIG="$_T/conf" \
+        "$_T_SELF" "$@" > "$_T/out" 2> "$_T/err" < /dev/null
+    _t_rc=$?
+}
+
+# shellcheck disable=SC2016  # the sh -c scripts expand $1.. in the child, by design
+t_test_mail() {
+    echo " >>> test-mail / --test-mail"
+
+    _t_run "" --test-mail
+    _t_check "--test-mail exits 0 when the sender accepts [rc $_t_rc]" [ "$_t_rc" -eq 0 ]
+    _t_check "exactly ONE mail reached the sender" \
+        [ "$(_t_count 'Subject:' "$_T/mail")" -eq 1 ]
+    _t_check "sender got EMAIL_TO as its argument" _t_grep 'rcpt@example.invalid' "$_T/argv"
+    _t_check "headers use EMAIL_FROM / EMAIL_TO" \
+        sh -c 'grep -q "^From: sender@example.invalid" "$1" && grep -q "^To: rcpt@example.invalid" "$1"' _ "$_T/mail"
+    _t_check "subject says TEST" _t_grep '^Subject: .*TEST' "$_T/mail"
+    _t_check "body names host, user, time, config" \
+        sh -c 'grep -q "^Host: *$(hostname)$" "$1" && grep -q "^User: *$(id -un)$" "$1" && grep -q "^Time: *[0-9]" "$1" && grep -q "^Config: *$2$" "$1"' _ "$_T/mail" "$_T/conf"
+    _t_check "output names recipient and raw rc" _t_grep "sent to 'rcpt@example.invalid' via .*\[rc 0\]" "$_T/out"
+
+    _t_run "" test-mail
+    _t_check "'test-mail' spelling works too [rc $_t_rc]" [ "$_t_rc" -eq 0 ]
+
+    _t_run 'STUB_RC=75; export STUB_RC' --test-mail
+    _t_check "sender failure exits non-zero [rc $_t_rc]" [ "$_t_rc" -ne 0 ]
+    _t_check "failure shows alert_email's EMAIL FAILED block with sender stderr" \
+        sh -c 'grep -q "EMAIL FAILED" "$1" && grep -q "stub refused" "$1"' _ "$_T/err"
+    _t_check "failure names its err code" _t_grep 'ERROR 025' "$_T/err"
+
+    _t_run 'EMAIL_TO=""' --test-mail
+    _t_check "EMAIL_TO empty exits non-zero, not a silent pass [rc $_t_rc]" [ "$_t_rc" -ne 0 ]
+    _t_check "EMAIL_TO empty sends nothing" [ ! -e "$_T/mail" ]
+    _t_check "EMAIL_TO empty shows the raw value" _t_grep "EMAIL_TO=''" "$_T/err"
+
+    _t_run 'EMAIL_SENDER=""' --test-mail
+    _t_check "EMAIL_SENDER empty exits non-zero [rc $_t_rc]" [ "$_t_rc" -ne 0 ]
+
+    _t_run "" --test-mail extra
+    _t_check "an argument is refused [rc $_t_rc]" [ "$_t_rc" -ne 0 ]
+    _t_check "an argument sends nothing" [ ! -e "$_T/mail" ]
+
+    _t_run "" --help
+    _t_check "--help documents test-mail, --test-mail" _t_grep 'test-mail, --test-mail' "$_T/out"
+    _t_run "" --test-mail --help
+    _t_check "--test-mail --help prints its section, sends nothing [rc $_t_rc]" \
+        sh -c '[ "$1" -eq 0 ] && grep -q "Send ONE test mail" "$2" && ! grep -q "^  list" "$2" && [ ! -e "$3" ]' _ "$_t_rc" "$_T/out" "$_T/mail"
+
+    _t_run "" test-alerts
+    _t_check "test-alerts sends the same test mail [rc $_t_rc]" \
+        sh -c '[ "$1" -eq 0 ] && grep -q "^Subject: .*TEST" "$2" && grep -q "test-alerts" "$2"' _ "$_t_rc" "$_T/mail"
+    _t_run 'EMAIL_SENDER=""' test-alerts
+    _t_check "test-alerts fails when EMAIL_SENDER is empty [rc $_t_rc]" [ "$_t_rc" -ne 0 ]
+}
+
+cmd_run_tests() {
+    _T_SELF=$(cd "$(dirname "$0")" 2>/dev/null && pwd)/$(basename "$0")
+    [ -x "$_T_SELF" ] || die "run-tests: cannot locate self at $_T_SELF"
+    _T=$(mktemp -d "${TMPDIR:-/tmp}/my-appleRAID-tests.XXXXXX") \
+        || die "run-tests: mktemp -d failed"
+    trap 'rm -rf "$_T"' EXIT INT TERM HUP
+    mkdir -p "$_T/home" "$_T/state" || die "run-tests: sandbox setup failed in $_T"
+    # The stub sender: records argv and the message; STUB_RC (set in the
+    # sourced config, so the test's config exports it) fails on demand.
+    cat > "$_T/stub-sender" <<STUB_EOF
+#!/bin/dash
+printf '%s\n' "\$*" > "$_T/argv"
+cat >> "$_T/mail"
+if [ "\${STUB_RC:-0}" != "0" ]; then
+    echo "stub refused: relay says no" >&2
+    exit "\$STUB_RC"
+fi
+exit 0
+STUB_EOF
+    chmod 755 "$_T/stub-sender" || die "run-tests: chmod of stub failed"
+
+    t_test_mail
+
+    printf '\n%s: %d passed, %d failed\n' "$SCRIPT_NAME run-tests" "$_T_PASS" "$_T_FAIL"
+    [ "$_T_FAIL" -eq 0 ]
 }
 
 # 'stamp-version' updates the SCRIPT_COMMIT line in place to the
@@ -9707,6 +9866,12 @@ ${C_BOLD}COMMANDS${C_RESET}
   ${C_CYAN}test-alerts${C_RESET}                 Exercise every alerting channel (sound,
                               email, log). Run once after setup to
                               verify alerts reach you.
+  ${C_CYAN}test-mail${C_RESET}, --test-mail      Send ONE test mail through the same path
+                              real alerts use (EMAIL_TO, EMAIL_FROM,
+                              EMAIL_SENDER). Takes no arguments, does
+                              nothing else. Exit 0 only when the sender
+                              accepted it; non-zero on failure, and also
+                              when email is disabled (EMAIL_TO empty).
   ${C_CYAN}report${C_RESET}                      Human-readable health summary: RAID set
                               status, baselines, active problems from the
                               state DB, pending grace timers, SMART poll
@@ -13073,6 +13238,7 @@ _my-appleRAID() {
         'baseline:Snapshot current sets/disks as expected baseline'
         'report:Human-readable health summary (read-only)'
         'test-alerts:Exercise every alerting channel'
+        'test-mail:Send ONE test mail through the alert mail path'
         'install-daemon:Install the LaunchDaemon plist'
         'uninstall-daemon:Unload and remove the LaunchDaemon'
         'daemon-status:Diagnose the daemon'
@@ -13082,6 +13248,7 @@ _my-appleRAID() {
         'help:Show help (use help <command> for details)'
         'version:Print version, copyright, and license info'
         'stamp-version:Bake the current git short SHA into SCRIPT_COMMIT (run before deploy)'
+        'run-tests:Run the self-tests (sandboxed, stub mail sender)'
     )
 
     local -a global_opts
@@ -13090,6 +13257,7 @@ _my-appleRAID() {
         '(-D --debug)'{-D,--debug}'[Even more detail; implies -V + set -x]'
         '(-h --help)'{-h,--help}'[Show help]'
         '--version[Print version + copyright + license]'
+        '--test-mail[Send ONE test mail through the alert mail path]'
     )
 
     _arguments -s : \
@@ -13244,6 +13412,10 @@ main() {
             cmd_stamp_version
             exit $?
             ;;
+        run-tests)
+            cmd_run_tests
+            exit $?
+            ;;
     esac
 
     preflight
@@ -13280,6 +13452,14 @@ main() {
                 set -- "$_topic" --help "$@"
                 ;;
         esac
+    fi
+
+    # '--test-mail' is the dash-spelled name of the 'test-mail' command
+    # (as '--help' is of 'help'); fold it to one name here so the help
+    # lookup and the dispatch below only ever see 'test-mail'.
+    if [ "$1" = "--test-mail" ]; then
+        shift
+        set -- test-mail "$@"
     fi
 
     # `<topic> --help` / `<topic> -h` for subcommands that DON'T have a
@@ -13334,6 +13514,7 @@ main() {
         baseline)           cmd_baseline "$@" ;;
         report)             cmd_report "$@" ;;
         test-alerts)        cmd_test_alerts "$@" ;;
+        test-mail)          cmd_test_mail "$@" ;;
         install-daemon)     cmd_install_daemon "$@" ;;
         uninstall-daemon)   cmd_uninstall_daemon "$@" ;;
         daemon-status)      cmd_daemon_status "$@" ;;

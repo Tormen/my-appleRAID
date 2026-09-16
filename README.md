@@ -684,6 +684,10 @@ miss on a scroll.
 
 ## Test harnesses
 
+`my-appleRAID run-tests` runs the built-in self-tests (currently
+`test-mail` / `--test-mail`). They run in a throw-away sandbox with a
+stub mail sender: no disks are touched and no real mail is sent.
+
 Two scripts live in `tests/`:
 
 - **`raid-behavior.sh`** — builds 200 MB hdiutil disk-image mirrors,
