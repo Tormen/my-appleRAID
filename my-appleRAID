@@ -89,11 +89,11 @@ SCRIPT_NAME="$(basename "$0")"
 # subcommand updates SCRIPT_COMMIT to the current HEAD sha and
 # amends - run it as the last step before deploying.
 SCRIPT_VERSION="v8.2"
-SCRIPT_COMMIT="48a4c57"
+SCRIPT_COMMIT="7109b67"
 # What git said when this build was stamped: 'git describe --tags --long' --
 # <nearest tag>-<commits since it>-g<short sha>. It says whether these bytes
 # ARE that release or work on top of it, on a machine with no git.
-SCRIPT_RELEASE="v8.2-7-g48a4c57"
+SCRIPT_RELEASE="v8.2-8-g7109b67"
 SCRIPT_COPYRIGHT="Copyright (C) 2026 Tormen <tormen@mail.ch>"
 SCRIPT_LICENSE_SHORT="GPL-3.0-or-later (copyleft)"
 SCRIPT_LICENSE_URL="https://www.gnu.org/licenses/gpl-3.0.html"
@@ -9484,6 +9484,22 @@ _build_id() {
     printf '%s' "${_bi:-unknown}"
 }
 
+# The directory holding the REAL file, symlinks resolved. /LINKS/bin/<tool> is
+# a farm link into ANOTHER repo, so asking git from there answers about THAT
+# repo -- and once it has a tag of its own, this tool would report a stranger's
+# release as its own.
+_self_dir() {
+  _sd_p=$0
+  while [ -L "$_sd_p" ]; do
+    _sd_t=$(readlink "$_sd_p") || break
+    case "$_sd_t" in
+      /*) _sd_p=$_sd_t ;;
+      *)  _sd_p=$(dirname "$_sd_p")/$_sd_t ;;
+    esac
+  done
+  (cd "$(dirname "$_sd_p")" 2>/dev/null && pwd -P)
+}
+
 script_version_string() {
     # SCRIPT_VERSION names the release these bytes are BASED on -- only a
     # release commit sets it. Whether they ARE that release is git's own
@@ -9492,7 +9508,7 @@ script_version_string() {
     # deployed copy has no git; it lags one release step, because stamping
     # happens before the tag exists).
     _bid=$(_build_id)
-    _desc=$(git -c safe.directory='*' -C "$(dirname "$0")" describe --tags --long 2>/dev/null)
+    _desc=$(git -c safe.directory='*' -C "$(_self_dir)" describe --tags --long 2>/dev/null)
     [ -n "$_desc" ] || _desc="$SCRIPT_RELEASE"
     case "$_desc" in
         *-*-g*)
