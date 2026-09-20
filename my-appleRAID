@@ -89,11 +89,11 @@ SCRIPT_NAME="$(basename "$0")"
 # subcommand updates SCRIPT_COMMIT to the current HEAD sha and
 # amends - run it as the last step before deploying.
 SCRIPT_VERSION="v8.2"
-SCRIPT_COMMIT="3f7460f"
+SCRIPT_COMMIT="36a359c"
 # What git said when this build was stamped: 'git describe --tags --long' --
 # <nearest tag>-<commits since it>-g<short sha>. It says whether these bytes
 # ARE that release or work on top of it, on a machine with no git.
-SCRIPT_RELEASE="v8.2-9-g3f7460f"
+SCRIPT_RELEASE="v8.2-10-g36a359c"
 SCRIPT_COPYRIGHT="Copyright (C) 2026 Tormen <tormen@mail.ch>"
 SCRIPT_LICENSE_SHORT="GPL-3.0-or-later (copyleft)"
 SCRIPT_LICENSE_URL="https://www.gnu.org/licenses/gpl-3.0.html"
@@ -9517,7 +9517,10 @@ script_version_string() {
        && ! git -c safe.directory='*' -C "$(_self_dir)" cat-file -e "${SCRIPT_COMMIT}^{commit}" 2>/dev/null; then
       _desc=""
     fi
-    [ -n "$_desc" ] || _desc="$SCRIPT_RELEASE"
+    # The stamp is a PAIR, written together: without SCRIPT_COMMIT there is no
+    # stamp to fall back to, and a lone SCRIPT_RELEASE would be a release claim
+    # nothing backs -- an unstamped file says so.
+    if [ -z "$_desc" ] && [ -n "$SCRIPT_COMMIT" ]; then _desc=$SCRIPT_RELEASE; fi
     case "$_desc" in
         *-*-g*)
             _dtag="${_desc%-*-g*}"
