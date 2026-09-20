@@ -88,8 +88,12 @@ SCRIPT_NAME="$(basename "$0")"
 # the commit they were built from. The companion 'stamp-version'
 # subcommand updates SCRIPT_COMMIT to the current HEAD sha and
 # amends - run it as the last step before deploying.
-SCRIPT_VERSION="v8.7"
-SCRIPT_COMMIT="d92a9d0"
+SCRIPT_VERSION="v8.2"
+SCRIPT_COMMIT="48a4c57"
+# What git said when this build was stamped: 'git describe --tags --long' --
+# <nearest tag>-<commits since it>-g<short sha>. It says whether these bytes
+# ARE that release or work on top of it, on a machine with no git.
+SCRIPT_RELEASE="v8.2-7-g48a4c57"
 SCRIPT_COPYRIGHT="Copyright (C) 2026 Tormen <tormen@mail.ch>"
 SCRIPT_LICENSE_SHORT="GPL-3.0-or-later (copyleft)"
 SCRIPT_LICENSE_URL="https://www.gnu.org/licenses/gpl-3.0.html"
@@ -9471,7 +9475,36 @@ show_subcmd_help() {
 # build apart from a clean tagged release. Fails silently on systems
 # without git or outside any repo - in that case the bare embedded
 # version is shown.
+# The first 12 hex of this file's own SHA-256: the value that actually
+# identifies the bytes, so two installs are compared by running --version on
+# each and diffing.
+_build_id() {
+    _bi=$(shasum -a 256 "$0" 2>/dev/null | cut -c1-12)
+    [ -n "$_bi" ] || _bi=$(cksum < "$0" 2>/dev/null | cut -d" " -f1)
+    printf '%s' "${_bi:-unknown}"
+}
+
 script_version_string() {
+    # SCRIPT_VERSION names the release these bytes are BASED on -- only a
+    # release commit sets it. Whether they ARE that release is git's own
+    # describe string, printed verbatim: <nearest tag>-<commits since
+    # it>-g<short sha>. Git first (exact in a checkout), the stamp second (a
+    # deployed copy has no git; it lags one release step, because stamping
+    # happens before the tag exists).
+    _bid=$(_build_id)
+    _desc=$(git -c safe.directory='*' -C "$(dirname "$0")" describe --tags --long 2>/dev/null)
+    [ -n "$_desc" ] || _desc="$SCRIPT_RELEASE"
+    case "$_desc" in
+        *-*-g*)
+            _dtag="${_desc%-*-g*}"
+            _dn="${_desc%-g*}"; _dn="${_dn##*-}"
+            if [ "$_dn" = 0 ]; then
+                echo "$SCRIPT_VERSION ($_desc: the $_dtag tag, build $_bid)"
+            else
+                echo "$SCRIPT_VERSION+$_dn ($_desc: $_dn commit(s) past $_dtag, unreleased, build $_bid)"
+            fi
+            return 0 ;;
+    esac
     _v="$SCRIPT_VERSION"
     _sha=""
     # SCRIPT_COMMIT (baked at stamp-version time) is AUTHORITATIVE
@@ -9496,7 +9529,11 @@ script_version_string() {
             fi
         fi
     fi
-    [ -n "$_sha" ] && _v="$_v ($_sha)"
+    if [ -n "$_sha" ]; then
+        _v="$_v (commit $_sha, build $_bid)"
+    else
+        _v="$_v (build $_bid, unstamped)"
+    fi
     echo "$_v"
 }
 
@@ -9653,9 +9690,12 @@ cmd_stamp_version() {
         ok "SCRIPT_COMMIT already matches HEAD ($_new_sha); nothing to do."
         return 0
     fi
-    info "Stamping SCRIPT_COMMIT: '$_cur_sha' -> '$_new_sha'"
+    # git's own spelling, kept verbatim so it can be pasted back into git
+    _new_desc=$(git describe --tags --long 2>/dev/null)
+    info "Stamping SCRIPT_COMMIT: '$_cur_sha' -> '$_new_sha'  SCRIPT_RELEASE='${_new_desc:-<no tag yet>}'"
     # macOS BSD sed: -i requires an extension argument. Use ''.
-    sed -i '' "s|^SCRIPT_COMMIT=\"[^\"]*\"|SCRIPT_COMMIT=\"$_new_sha\"|" "$_self" \
+    sed -i '' -e "s|^SCRIPT_COMMIT=\"[^\"]*\"|SCRIPT_COMMIT=\"$_new_sha\"|" \
+              -e "s|^SCRIPT_RELEASE=\"[^\"]*\"|SCRIPT_RELEASE=\"$_new_desc\"|" "$_self" \
         || die "sed -i failed on $_self"
 
     if git diff --quiet -- "$(basename "$0")"; then
