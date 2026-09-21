@@ -89,11 +89,11 @@ SCRIPT_NAME="$(basename "$0")"
 # subcommand updates SCRIPT_COMMIT to the current HEAD sha and
 # amends - run it as the last step before deploying.
 SCRIPT_VERSION="v8.2"
-SCRIPT_COMMIT="36a359c"
+SCRIPT_COMMIT="fc63b02"
 # What git said when this build was stamped: 'git describe --tags --long' --
 # <nearest tag>-<commits since it>-g<short sha>. It says whether these bytes
 # ARE that release or work on top of it, on a machine with no git.
-SCRIPT_RELEASE="v8.2-10-g36a359c"
+SCRIPT_RELEASE="v8.2-11-gfc63b02"
 SCRIPT_COPYRIGHT="Copyright (C) 2026 Tormen <tormen@mail.ch>"
 SCRIPT_LICENSE_SHORT="GPL-3.0-or-later (copyleft)"
 SCRIPT_LICENSE_URL="https://www.gnu.org/licenses/gpl-3.0.html"
@@ -9710,6 +9710,12 @@ cmd_stamp_version() {
         printf '%s\n' "$_other_dirty" | sed 's/^/  /'
         die "Commit or stash those first, then re-run stamp-version."
     fi
+
+    # The repo may be SHARED -- other sessions commit here too -- and an amend
+    # rewrites whatever HEAD happens to be. Stamp only the commit that carries
+    # THIS file: if HEAD does not touch it, HEAD is somebody else's work.
+    [ -n "$(git show --name-only --format= HEAD -- "$(basename "$0")" 2>/dev/null)" ] \
+        || die "HEAD does not touch this file -- it is not this file's commit (commit it first; in a shared repo the amend would rewrite someone else's)."
 
     _new_sha=$(git rev-parse --short HEAD)
     _cur_sha=$(awk -F'"' '/^SCRIPT_COMMIT=/ {print $2; exit}' "$_self")
