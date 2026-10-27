@@ -89,11 +89,11 @@ SCRIPT_NAME="$(basename "$0")"
 # subcommand updates SCRIPT_COMMIT to the current HEAD sha and
 # amends - run it as the last step before deploying.
 SCRIPT_VERSION="v8.2"
-SCRIPT_COMMIT="150022f"
+SCRIPT_COMMIT="428b79a"
 # What git said when this build was stamped: 'git describe --tags --long' --
 # <nearest tag>-<commits since it>-g<short sha>. It says whether these bytes
 # ARE that release or work on top of it, on a machine with no git.
-SCRIPT_RELEASE="v8.2-14-g150022f"
+SCRIPT_RELEASE="v8.2-15-g428b79a"
 SCRIPT_COPYRIGHT="Copyright (C) 2026 Tormen <tormen@mail.ch>"
 SCRIPT_LICENSE_SHORT="GPL-3.0-or-later (copyleft)"
 SCRIPT_LICENSE_URL="https://www.gnu.org/licenses/gpl-3.0.html"
@@ -250,10 +250,21 @@ die() {
 #   023   state-DB: atomic rename during state-delete failed
 #   024   test-mail: called with arguments (it takes none)
 #   025   test-mail: the test mail was not delivered (or email disabled)
-#   026   install-daemon: not run as root
+#   026   install-daemon: not run as root          (need_root, as 027-038)
 #   027   uninstall-daemon: not run as root
+#   028   blink: not run as root
+#   029   eject: not run as root
+#   030   release: not run as root
+#   031   verify-wipe: not run as root
+#   032   wipe: not run as root
+#   033   create: not run as root
+#   034   repair: not run as root
+#   035   autorebuild <set>: not run as root
+#   036   destroy: not run as root
+#   037   migrate-softraid: not run as root
+#   038   release-softraid: not run as root
 #
-# _ERR_HIGHEST=027
+# _ERR_HIGHEST=038
 # ----------------------------------------------------------------------
 err() {
     _ec_code="$1"
@@ -267,6 +278,14 @@ err() {
             "${C_RED}" "$_ec_code" "$_ec_exit" "${C_RESET}" >&2
     fi
     exit "$_ec_exit"
+}
+
+# need_root <code> <verb>: a verb that changes disks, RAID sets or launchd
+# stops here when run as a user -- before it resolves, picks or asks
+# anything -- and names the rerun. The tool never escalates by itself.
+need_root() {
+    [ "$(id -u)" -eq 0 ] \
+        || err "$1" "$2 needs root -- rerun under sudo: $SCRIPT_NAME $2 ..."
 }
 
 # ----------------------------------------------------------------------
@@ -657,7 +676,7 @@ EOF
     while IFS='|' read -r _d _u _n _m; do
         [ -n "$_d" ] || continue
         step "Removing $_d (member $_m) from set '$_n'"
-        run sudo diskutil appleRAID remove "$_m" "$_u" \
+        rundiskutil appleRAID remove "$_m" "$_u" \
             || die "Failed to remove $_d from '$_n' - cannot proceed."
         ok "$_d released; set '$_n' is now Degraded but alive."
     done <<EOF
@@ -667,7 +686,7 @@ EOF
     while IFS='|' read -r _u _n; do
         [ -n "$_u" ] || continue
         step "Destroying set '$_n' ($_u) - no surviving members"
-        run sudo diskutil appleRAID delete "$_u" \
+        rundiskutil appleRAID delete "$_u" \
             || die "Failed to delete '$_n' - cannot proceed."
         ok "Set '$_n' destroyed."
     done <<EOF
@@ -844,7 +863,7 @@ enforce_default_ar_for_uuid() {
     fi
 
     log_info "Enforcing AutoRebuild=$target on $uuid (was: ${current:-<unknown>})"
-    if sudo diskutil appleRAID update AutoRebuild "$target" "$uuid" >/dev/null 2>&1; then
+    if diskutil appleRAID update AutoRebuild "$target" "$uuid" >/dev/null 2>&1; then
         return 0
     fi
     log_warn "Failed to set AutoRebuild=$target on $uuid"
@@ -6602,8 +6621,7 @@ EOF
     fi
 
     # The plan above is for anyone; acting on it is root's.
-    [ "$(id -u)" -eq 0 ] \
-        || err 026 "install-daemon needs root -- rerun under sudo: $SCRIPT_NAME install-daemon"
+    need_root 026 install-daemon
     confirm "$prompt" || {
         [ "$do_write" = "0" ] && { info "Nothing changed. Done."; return 0; }
         die "Aborted."
@@ -6843,8 +6861,7 @@ cmd_uninstall_daemon() {
     step "Uninstalling LaunchDaemon"
     info "Plist: $plist"
     info "Label: $label"
-    [ "$(id -u)" -eq 0 ] \
-        || err 027 "uninstall-daemon needs root -- rerun under sudo: $SCRIPT_NAME uninstall-daemon"
+    need_root 027 uninstall-daemon
     confirm "Unload and delete?" || die "Aborted."
 
     run launchctl bootout system "$plist" 2>/dev/null \
@@ -7246,18 +7263,18 @@ softraid_release_volume() {
 
         if softraid_volume_safeguard_enabled "$vol"; then
             info "Volume \"$vol\" has Safeguard enabled - disabling first."
-            run sudo "$SOFTRAID_TOOL" volume "$vol" disablesafeguard \
+            run"$SOFTRAID_TOOL" volume "$vol" disablesafeguard \
                 || die "Failed to disable Safeguard on \"$vol\""
         fi
 
         if softraid_volume_mounted "$vol"; then
             info "Volume \"$vol\" is mounted - unmounting first."
-            run sudo "$SOFTRAID_TOOL" volume "$vol" unmount \
+            run"$SOFTRAID_TOOL" volume "$vol" unmount \
                 || warn "Volume unmount returned non-zero (delete will retry)."
         fi
 
         info "Deleting SoftRAID volume \"$vol\"."
-        run sudo "$SOFTRAID_TOOL" volume "$vol" delete \
+        run"$SOFTRAID_TOOL" volume "$vol" delete \
             || die "softraidtool volume \"$vol\" delete failed"
 
         for d in "$@"; do
@@ -7274,7 +7291,7 @@ softraid_release_volume() {
             # a SoftRAID member and releases it, so subsequent dd /
             # diskutil writes (used by do_auto_wipe) succeed.
             info "Releasing /dev/$d from SoftRAID (disk quickzero)."
-            run sudo "$SOFTRAID_TOOL" disk "$d" quickzero \
+            run"$SOFTRAID_TOOL" disk "$d" quickzero \
                 || die "softraidtool disk $d quickzero failed"
         done
 
@@ -7404,6 +7421,7 @@ EOF
         esac
     done
 
+    need_root 037 migrate-softraid
     vol_arg=""
     if [ $# -ge 1 ]; then
         vol_arg="$1"
@@ -7767,6 +7785,7 @@ EOF
     done
 
     [ $# -ge 1 ] || die "Usage: $SCRIPT_NAME release-softraid <volume>"
+    need_root 038 release-softraid
     vol="$1"
 
     softraid_tool_available || die "SoftRAIDTool not found at: $SOFTRAID_TOOL
@@ -9720,6 +9739,29 @@ t_daemon_needs_root() {
     _t_check "uninstall-daemon as a user: ERROR 027 [rc $_t_rc]" \
         sh -c '[ "$1" -ne 0 ] && grep -q "ERROR 027 .*needs root" "$2"' _ "$_t_rc" "$_T/all"
     _t_check "...and the plist is still there" [ -e "$_T/old.plist" ]
+
+    # Every verb that touches a disk or a RAID set refuses as a user before
+    # it resolves, picks or asks anything: the arguments name nothing real,
+    # so a verb that went past the refusal would die on them instead.
+    while IFS= read -r _tv; do
+        # shellcheck disable=SC2086  # the line is the verb and its arguments
+        _t_run "" $_tv
+        cat "$_T/out" "$_T/err" > "$_T/all"
+        _t_check "${_tv%% *} as a user: needs root [rc $_t_rc]" \
+            sh -c '[ "$1" -ne 0 ] && grep -q "ERROR [0-9]* .*$2 needs root" "$3"' _ "$_t_rc" "${_tv%% *}" "$_T/all"
+    done <<_EOF
+blink 999
+eject 999
+release 999
+verify-wipe 999
+wipe 999
+create T 998 999
+repair no-such-set
+autorebuild no-such-set on
+destroy no-such-set
+migrate-softraid no-such-volume
+release-softraid no-such-volume
+_EOF
 }
 
 cmd_run_tests() {
@@ -10081,9 +10123,10 @@ ${C_BOLD}EXAMPLES${C_RESET}
   tail -f /var/log/my-appleRAID.log
 
 ${C_BOLD}SAFETY NOTES${C_RESET}
-  - This script will run 'sudo' for destructive operations. It will
-    prompt for your password the first time and reuse the cached
-    credential for the rest of the invocation.
+  - Commands that change disks, RAID sets or the LaunchDaemon need
+    root: run them under sudo. As a user they stop with "needs root"
+    before they ask or touch anything; the script never escalates
+    by itself.
   - Whole-disk operations (wipe, create, repair) require you to type
     the literal word 'yes' to proceed. 'y' is also accepted.
   - Always verify device numbers with '${SCRIPT_NAME} disks' before
@@ -11397,7 +11440,7 @@ ARGUMENTS
 NOTES
   - Read-only. Will not touch data.
   - Reads from the raw device (/dev/rdiskN) for maximum throughput;
-    requires sudo on modern macOS.
+    needs root on modern macOS.
   - Pulses ~64 MiB read, then ~0.5 s idle, looping until you press
     Ctrl-C. The on/off pattern makes the blink obvious.
 EOF
@@ -11409,6 +11452,7 @@ EOF
         esac
         shift
     done
+    need_root 028 blink
 
     if [ -z "$arg" ]; then
         arg=$(pick_physical_disk_interactively "blink") || return 1
@@ -11434,17 +11478,11 @@ EOF
     # Trap so Ctrl-C exits cleanly instead of dumping a half-printed dd line.
     trap 'echo; ok "Blink stopped."; exit 0' INT TERM
 
-    # Prime sudo once so the loop body doesn't trigger a re-prompt mid-pulse.
-    if ! sudo -n true 2>/dev/null; then
-        info "Reading $rdev requires sudo (cached for the rest of the loop)."
-        sudo true || die "sudo authentication failed."
-    fi
-
     pulse=0
     while :; do
         pulse=$((pulse + 1))
         printf '  pulse %d ...\r' "$pulse"
-        if ! sudo dd if="$rdev" of=/dev/null bs=1m count=64 2>/dev/null; then
+        if ! dd if="$rdev" of=/dev/null bs=1m count=64 2>/dev/null; then
             echo
             die "Read failed on $rdev (disk disconnected?)"
         fi
@@ -11521,6 +11559,7 @@ EOF
         esac
         shift
     done
+    need_root 029 eject
 
     if [ -z "$arg" ]; then
         arg=$(pick_physical_disk_interactively "eject") || return 1
@@ -11580,7 +11619,7 @@ EOF
     fi
 
     step "Unmounting $dev"
-    run sudo diskutil unmountDisk force "$dev" \
+    rundiskutil unmountDisk force "$dev" \
         || warn "unmountDisk returned non-zero (may be already unmounted)"
 
     # The release helper above (when --release was passed) has already
@@ -11604,7 +11643,7 @@ EOF
     if [ -z "$smartctl_bin" ]; then
         warn "smartctl not found in PATH - skipping explicit spin-down."
         warn "  Install with: brew install smartmontools"
-    elif run sudo "$smartctl_bin" -s standby,now "$dev"; then
+    elif run"$smartctl_bin" -s standby,now "$dev"; then
         ok "Drive accepted STANDBY IMMEDIATE - platter is spinning down."
     else
         warn "STANDBY IMMEDIATE failed (exit non-zero)."
@@ -11699,6 +11738,7 @@ EOF
     set -- $args
 
     [ $# -ge 1 ] || die "Usage: $SCRIPT_NAME release <disk> [<disk>...]"
+    need_root 030 release
 
     devs=""
     for arg in "$@"; do
@@ -11833,6 +11873,7 @@ EOF
 # Zero first and last 100 MB of a whole disk.
 cmd_wipe() {
     [ $# -ge 1 ] || die "Usage: $SCRIPT_NAME wipe <disk-number>"
+    need_root 032 wipe
     dev=$(resolve_disk "$1") || die "Invalid disk spec: $1"
     rdev="/dev/r${dev#/dev/}"
 
@@ -11859,13 +11900,13 @@ cmd_wipe() {
     info "Disk size: $size_bytes bytes = $size_mb MiB; tail seek = $seek_mb MiB"
 
     step "Unmounting $dev"
-    run sudo diskutil unmountDisk force "$dev" || warn "unmountDisk returned non-zero (may be already unmounted)"
+    rundiskutil unmountDisk force "$dev" || warn "unmountDisk returned non-zero (may be already unmounted)"
 
     step "Zeroing first 100 MB of $dev"
-    run sudo dd if=/dev/zero of="$rdev" bs=1m count=100 status=progress || die "First-100MB wipe failed"
+    rundd if=/dev/zero of="$rdev" bs=1m count=100 status=progress || die "First-100MB wipe failed"
 
     step "Zeroing last 100 MB of $dev"
-    run sudo dd if=/dev/zero of="$rdev" bs=1m seek=$seek_mb count=100 status=progress || die "Last-100MB wipe failed"
+    rundd if=/dev/zero of="$rdev" bs=1m seek=$seek_mb count=100 status=progress || die "Last-100MB wipe failed"
 
     step "Verifying wipe"
     verify_wipe "$dev" || die "Verification failed"
@@ -11883,16 +11924,16 @@ verify_wipe() {
     skip_mb=$(( size_mb - 100 ))
 
     explain "Check 1/2: first 100 MB of $dev"
-    show "sudo cmp -n 104857600 $rdev /dev/zero"
-    if sudo cmp -n 104857600 "$rdev" /dev/zero >/dev/null 2>&1; then
+    show "cmp -n 104857600 $rdev /dev/zero"
+    if cmp -n 104857600 "$rdev" /dev/zero >/dev/null 2>&1; then
         first="OK"
     else
         first="FAIL"
     fi
 
     explain "Check 2/2: last 100 MB of $dev (via dd skip=$skip_mb)"
-    show "sudo dd if=$rdev bs=1m skip=$skip_mb count=100 | cmp -n 104857600 - /dev/zero"
-    if sudo dd if="$rdev" bs=1m skip=$skip_mb count=100 2>/dev/null \
+    show "dd if=$rdev bs=1m skip=$skip_mb count=100 | cmp -n 104857600 - /dev/zero"
+    if dd if="$rdev" bs=1m skip=$skip_mb count=100 2>/dev/null \
          | cmp -n 104857600 - /dev/zero >/dev/null 2>&1; then
         last="OK"
     else
@@ -11907,6 +11948,7 @@ verify_wipe() {
 
 cmd_verify_wipe() {
     [ $# -ge 1 ] || die "Usage: $SCRIPT_NAME verify-wipe <disk-number>"
+    need_root 031 verify-wipe
     dev=$(resolve_disk "$1") || die "Invalid disk spec: $1"
     assert_whole_disk "$dev"
     step "Verifying wipe on $dev"
@@ -11937,6 +11979,7 @@ cmd_create() {
     set -- $args
 
     [ $# -ge 3 ] || die "Usage: $SCRIPT_NAME create <name> <disk-num-1> <disk-num-2> [--force]"
+    need_root 033 create
     name="$1"
     dev1=$(resolve_disk "$2") || die "Invalid disk spec: $2"
     dev2=$(resolve_disk "$3") || die "Invalid disk spec: $3"
@@ -12044,7 +12087,7 @@ cmd_create() {
     explain "  - Register the Apple_RAID partitions as mirror members"
     explain "  - Format the mirror as APFS and mount it at /Volumes/$name"
     echo
-    run sudo diskutil appleRAID create mirror "$name" APFS "$dev1" "$dev2" \
+    rundiskutil appleRAID create mirror "$name" APFS "$dev1" "$dev2" \
         || die "diskutil appleRAID create failed"
 
     # Default: show focused views - only the NEW RAID set (using
@@ -12118,10 +12161,10 @@ do_auto_wipe() {
     size_mb=$(( size_bytes / 1048576 ))
     seek_mb=$(( size_mb - 100 ))
 
-    run sudo diskutil unmountDisk force "$dev" || true
-    run sudo dd if=/dev/zero of="$rdev" bs=1m count=100 status=progress \
+    rundiskutil unmountDisk force "$dev" || true
+    rundd if=/dev/zero of="$rdev" bs=1m count=100 status=progress \
         || die "First-100MB wipe of $dev failed"
-    run sudo dd if=/dev/zero of="$rdev" bs=1m seek=$seek_mb count=100 status=progress \
+    rundd if=/dev/zero of="$rdev" bs=1m seek=$seek_mb count=100 status=progress \
         || die "Last-100MB wipe of $dev failed"
     verify_wipe "$dev" || die "Wipe verification failed for $dev"
     ok "$dev wiped and verified."
@@ -12263,6 +12306,7 @@ _repair_guess_replacement() {
 # ----------------------------------------------------------------------
 cmd_repair() {
     eval "$(parse_global_flags "$@")"
+    need_root 034 repair
     if [ $# -ge 1 ]; then
         arg="$1"
         uuid=""
@@ -12459,7 +12503,7 @@ cmd_repair() {
                     echo
                     confirm "Release $dev from '$target_set_name' and start a full rebuild?" \
                         || die "Aborted."
-                    run sudo diskutil appleRAID remove "$chosen_member_uuid" "$SELECTED_UUID" \
+                    rundiskutil appleRAID remove "$chosen_member_uuid" "$SELECTED_UUID" \
                         || die "appleRAID remove failed - cannot proceed."
                     ok "Disk released from set."
                     echo
@@ -12533,7 +12577,7 @@ cmd_repair() {
     explain "'add member' has no such dependency - the rebuild kicks off"
     explain "as part of the add operation itself."
     echo
-    run sudo diskutil appleRAID add member "$dev" "$SELECTED_UUID" \
+    rundiskutil appleRAID add member "$dev" "$SELECTED_UUID" \
         || die "add member failed"
 
     # Post-repair: friendly compact view of the just-repaired set.
@@ -12827,7 +12871,7 @@ Usage: $SCRIPT_NAME autorebuild [<set>] [<mode>]
   (no args)         Print this help text + show every set's current
                     AutoRebuild value (table at the bottom). Read-only.
   <set>             Show the named set's current AutoRebuild; prompt
-                    yes/no to flip it. Requires sudo for the update.
+                    yes/no to flip it. Needs root, as do the forms below.
   <set> <mode>      Set AutoRebuild non-interactively.
   <mode> <set>      Same; the two positional args are order-independent.
 
@@ -12952,6 +12996,7 @@ cmd_autorebuild() {
         fi
         return 0
     fi
+    need_root 035 autorebuild
 
     # Resolve set arg to UUID.
     uuid=""
@@ -13022,7 +13067,7 @@ cmd_autorebuild() {
     fi
 
     step "Setting AutoRebuild=$word on '$name'"
-    if run sudo diskutil appleRAID update AutoRebuild "$target" "$uuid"; then
+    if rundiskutil appleRAID update AutoRebuild "$target" "$uuid"; then
         new=$(raid_ar_get "$uuid")
         new_word="manual"
         [ "$new" = "1" ] && new_word="auto"
@@ -13250,6 +13295,7 @@ EOF
 # Subcommand: destroy
 # ----------------------------------------------------------------------
 cmd_destroy() {
+    need_root 036 destroy
     if [ $# -ge 1 ]; then
         arg="$1"
         uuid=""
@@ -13289,7 +13335,7 @@ cmd_destroy() {
     confirm "SECOND confirmation: are you ABSOLUTELY sure?" || die "Aborted."
 
     step "Deleting RAID set"
-    run sudo diskutil appleRAID delete "$SELECTED_UUID" \
+    rundiskutil appleRAID delete "$SELECTED_UUID" \
         || die "RAID deletion failed"
 
     # Post-destroy: show the compact summary of remaining sets by
