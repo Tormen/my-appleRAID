@@ -89,11 +89,11 @@ SCRIPT_NAME="$(basename "$0")"
 # subcommand updates SCRIPT_COMMIT to the current HEAD sha and
 # amends - run it as the last step before deploying.
 SCRIPT_VERSION="v8.2"
-SCRIPT_COMMIT="fc63b02"
+SCRIPT_COMMIT="acd440b"
 # What git said when this build was stamped: 'git describe --tags --long' --
 # <nearest tag>-<commits since it>-g<short sha>. It says whether these bytes
 # ARE that release or work on top of it, on a machine with no git.
-SCRIPT_RELEASE="v8.2-11-gfc63b02"
+SCRIPT_RELEASE="v8.2-13-gacd440b"
 SCRIPT_COPYRIGHT="Copyright (C) 2026 Tormen <tormen@mail.ch>"
 SCRIPT_LICENSE_SHORT="GPL-3.0-or-later (copyleft)"
 SCRIPT_LICENSE_URL="https://www.gnu.org/licenses/gpl-3.0.html"
@@ -1091,6 +1091,7 @@ cfg_set_defaults() {
     # LaunchDaemon installation target (used by install-daemon).
     # LAUNCHD_LABEL is derived from LAUNCHD_PLIST at load time - do not set manually.
     LAUNCHD_PLIST="/Library/LaunchDaemons/eu.no-panic.my-appleRAID_health.plist"
+    LAUNCHD_PROGRAM=""                     # empty: this script itself
     LAUNCHD_STDOUT_LOG="/var/log/my-appleRAID.launchd.out"
     LAUNCHD_STDERR_LOG="/var/log/my-appleRAID.launchd.err"
     LAUNCHD_INTERVAL=60
@@ -4449,7 +4450,7 @@ cmd_show_config() {
         EMAIL_TO EMAIL_FROM EMAIL_SENDER EMAIL_INTERVAL EMAIL_HEARTBEAT_INTERVAL \
         SMART_POLL_INTERVAL SELFTEST_SHORT_SCHEDULE SELFTEST_LONG_SCHEDULE SELFTEST_HOUR \
         STATE_DIR LOG_FILE LOG_LEVEL \
-        LAUNCHD_PLIST LAUNCHD_STDOUT_LOG LAUNCHD_STDERR_LOG LAUNCHD_INTERVAL
+        LAUNCHD_PLIST LAUNCHD_PROGRAM LAUNCHD_STDOUT_LOG LAUNCHD_STDERR_LOG LAUNCHD_INTERVAL
     do
         eval "v=\${$k}"
         # Annotate duration-valued keys (_INTERVAL or _PERIOD suffix).
@@ -5042,6 +5043,13 @@ LOG_LEVEL=info
 # Use reverse-DNS naming (yourdomain.tld.product_component) to avoid
 # clashes with other launch items.
 LAUNCHD_PLIST="/Library/LaunchDaemons/eu.no-panic.my-appleRAID_health.plist"
+
+# The program the LaunchDaemon starts. Empty: this script itself. Set it
+# to a Full Disk Access launcher that runs this script, so the grant is
+# the launcher's and not the shell's (macOS checks a script's interpreter):
+#   my-fda create /LINKS/bin/my-appleRAID
+#   LAUNCHD_PROGRAM="/Library/PrivilegedHelperTools/my-fda-my-appleRAID"
+LAUNCHD_PROGRAM=""
 
 # Where launchd writes the daemon's stdout and stderr. These are the
 # paths that end up inside the plist as StandardOutPath / StandardErrorPath,
@@ -6502,6 +6510,17 @@ _optsets_action_remove() {
 # ----------------------------------------------------------------------
 # `install-daemon` / `uninstall-daemon` - launchd integration.
 # ----------------------------------------------------------------------
+
+# The program the LaunchDaemon starts, absolute: LAUNCHD_PROGRAM when set
+# (a Full Disk Access launcher that runs this script), else this script.
+daemon_program() {
+    if [ -n "${LAUNCHD_PROGRAM:-}" ]; then
+        printf '%s\n' "$LAUNCHD_PROGRAM"
+    else
+        printf '%s/%s\n' "$(cd "$(dirname "$0")" && pwd)" "$(basename "$0")"
+    fi
+}
+
 cmd_install_daemon() {
     cfg_load
     plist="${LAUNCHD_PLIST}"
@@ -6509,15 +6528,17 @@ cmd_install_daemon() {
     interval="${LAUNCHD_INTERVAL:-60}"
     stdout_log="${LAUNCHD_STDOUT_LOG:-/var/log/my-appleRAID.launchd.out}"
     stderr_log="${LAUNCHD_STDERR_LOG:-/var/log/my-appleRAID.launchd.err}"
-
-    # Self path: the absolute path to this script, so the plist can call it.
-    self=$(cd "$(dirname "$0")" && pwd)/$(basename "$0")
+    self=$(daemon_program)
 
     step "LaunchDaemon installation plan"
     info "Plist path:   $plist"
     info "Label:        $label  (derived from plist filename)"
     info "Interval:     ${interval}s"
-    info "Script path:  $self"
+    if [ -n "${LAUNCHD_PROGRAM:-}" ]; then
+        info "Program:      $self  (LAUNCHD_PROGRAM)"
+    else
+        info "Program:      $self  (this script)"
+    fi
     info "Stdout log:   $stdout_log"
     info "Stderr log:   $stderr_log"
     echo
@@ -6651,15 +6672,14 @@ cmd_daemon_status() {
 
     # --- Check 2/8: plist content matches current config -----------
     step "Check 2/8: Plist content vs current config"
-    # The plist embeds the absolute path of this script and the interval
-    # value. If someone renamed the script or changed LAUNCHD_INTERVAL,
-    # the on-disk plist is stale.
-    self=$(cd "$(dirname "$0")" && pwd)/$(basename "$0")
+    # The plist embeds the program it starts (LAUNCHD_PROGRAM, else this
+    # script) and the interval. If either changed, the on-disk plist is stale.
+    self=$(daemon_program)
     stale=0
     if ! grep -qF "<string>$self</string>" "$plist" 2>/dev/null; then
-        warn "Plist references a DIFFERENT script path than this one:"
-        warn "  This script: $self"
-        warn "  In plist:    $(grep -A0 '<string>.*/appleRAID</string>' "$plist" 2>/dev/null | head -1 | sed 's/^[[:space:]]*//')"
+        warn "Plist starts a DIFFERENT program than the config says:"
+        warn "  Expected:    $self"
+        warn "  In plist:    $(awk '/<key>ProgramArguments<\/key>/ { p = 1; next } p && /<string>/ { sub(/.*<string>/, ""); sub(/<\/string>.*/, ""); print; exit }' "$plist" 2>/dev/null)"
         stale=1
     fi
     plist_interval=$(awk '
@@ -9656,6 +9676,34 @@ t_test_mail() {
     _t_check "test-alerts fails when EMAIL_SENDER is empty [rc $_t_rc]" [ "$_t_rc" -ne 0 ]
 }
 
+# install-daemon is answered "no" (stdin is /dev/null), so it only shows
+# the plist it would write: nothing is written, launchctl is never reached.
+t_install_daemon_program() {
+    echo " >>> install-daemon / daemon-status: LAUNCHD_PROGRAM"
+    _tl="/Library/PrivilegedHelperTools/my-fda-my-appleRAID"
+
+    _t_run "LAUNCHD_PLIST=\"$_T/new.plist\"; LAUNCHD_PROGRAM=\"$_tl\"" install-daemon
+    cat "$_T/out" "$_T/err" > "$_T/all"
+    _t_check "the plist starts LAUNCHD_PROGRAM when it is set" _t_grep "<string>$_tl</string>" "$_T/all"
+    _t_check "...and not this script" _t_nogrep "<string>$_T_SELF</string>" "$_T/all"
+    _t_check "the plan names the program and its source" _t_grep "Program: *$_tl  (LAUNCHD_PROGRAM)" "$_T/all"
+    _t_check "answered no, nothing is written" [ ! -e "$_T/new.plist" ]
+
+    _t_run "LAUNCHD_PLIST=\"$_T/new.plist\"" install-daemon
+    cat "$_T/out" "$_T/err" > "$_T/all"
+    _t_check "LAUNCHD_PROGRAM empty: the plist starts this script" _t_grep "<string>$_T_SELF</string>" "$_T/all"
+
+    printf '<key>ProgramArguments</key>\n<array>\n<string>%s</string>\n<string>health</string>\n</array>\n<key>StartInterval</key>\n<integer>60</integer>\n' \
+        "$_tl" > "$_T/old.plist"
+    _t_run "LAUNCHD_PLIST=\"$_T/old.plist\"; LAUNCHD_PROGRAM=\"$_tl\"" daemon-status
+    cat "$_T/out" "$_T/err" > "$_T/all"
+    _t_check "daemon-status: a plist starting LAUNCHD_PROGRAM matches" _t_grep "Plist content matches" "$_T/all"
+    _t_run "LAUNCHD_PLIST=\"$_T/old.plist\"" daemon-status
+    cat "$_T/out" "$_T/err" > "$_T/all"
+    _t_check "daemon-status: the same plist is stale once LAUNCHD_PROGRAM is empty" \
+        _t_grep "In plist: *$_tl" "$_T/all"
+}
+
 cmd_run_tests() {
     _T_SELF=$(cd "$(dirname "$0")" 2>/dev/null && pwd)/$(basename "$0")
     [ -x "$_T_SELF" ] || die "run-tests: cannot locate self at $_T_SELF"
@@ -9678,6 +9726,7 @@ STUB_EOF
     chmod 755 "$_T/stub-sender" || die "run-tests: chmod of stub failed"
 
     t_test_mail
+    t_install_daemon_program
 
     printf '\n%s: %d passed, %d failed\n' "$SCRIPT_NAME run-tests" "$_T_PASS" "$_T_FAIL"
     [ "$_T_FAIL" -eq 0 ]
@@ -9952,7 +10001,9 @@ ${C_BOLD}COMMANDS${C_RESET}
   ${C_CYAN}install-daemon${C_RESET}              Generate and load a LaunchDaemon plist.
                               Path/label/interval from config keys
                               LAUNCHD_PLIST, LAUNCHD_LABEL,
-                              LAUNCHD_INTERVAL. Requires sudo.
+                              LAUNCHD_INTERVAL; the program it starts
+                              from LAUNCHD_PROGRAM (empty: this
+                              script). Requires sudo.
   ${C_CYAN}uninstall-daemon${C_RESET}            Unload and remove the LaunchDaemon.
   ${C_CYAN}daemon-status${C_RESET}               Diagnose the daemon: plist on disk, plist vs
                               config drift, launchd registration, last
