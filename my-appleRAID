@@ -89,11 +89,11 @@ SCRIPT_NAME="$(basename "$0")"
 # subcommand updates SCRIPT_COMMIT to the current HEAD sha and
 # amends - run it as the last step before deploying.
 SCRIPT_VERSION="v8.2"
-SCRIPT_COMMIT="acd440b"
+SCRIPT_COMMIT="150022f"
 # What git said when this build was stamped: 'git describe --tags --long' --
 # <nearest tag>-<commits since it>-g<short sha>. It says whether these bytes
 # ARE that release or work on top of it, on a machine with no git.
-SCRIPT_RELEASE="v8.2-13-gacd440b"
+SCRIPT_RELEASE="v8.2-14-g150022f"
 SCRIPT_COPYRIGHT="Copyright (C) 2026 Tormen <tormen@mail.ch>"
 SCRIPT_LICENSE_SHORT="GPL-3.0-or-later (copyleft)"
 SCRIPT_LICENSE_URL="https://www.gnu.org/licenses/gpl-3.0.html"
@@ -239,8 +239,8 @@ die() {
 #   012   smart-dtype-cache: mktemp for atomic rewrite failed
 #   013   smart-dtype-cache: awk rewrite OR write of cache row failed
 #   014   install-daemon: writing the LaunchDaemon plist failed
-#   015   install-daemon: chown root:wheel of plist failed
-#   016   install-daemon: chmod 644 of plist failed
+#   015   (retired: install-daemon's chown, now part of 014)
+#   016   (retired: install-daemon's chmod, now part of 014)
 #   017   uninstall-daemon: rm of LaunchDaemon plist failed
 #   018   state-DB: mktemp for state-put atomic rewrite failed
 #   019   state-DB: awk rewrite during state-put failed
@@ -250,8 +250,10 @@ die() {
 #   023   state-DB: atomic rename during state-delete failed
 #   024   test-mail: called with arguments (it takes none)
 #   025   test-mail: the test mail was not delivered (or email disabled)
+#   026   install-daemon: not run as root
+#   027   uninstall-daemon: not run as root
 #
-# _ERR_HIGHEST=025
+# _ERR_HIGHEST=027
 # ----------------------------------------------------------------------
 err() {
     _ec_code="$1"
@@ -6573,69 +6575,60 @@ cmd_install_daemon() {
 </plist>
 EOF
 
-    if [ -f "$plist" ]; then
-        if cmp -s "$new_tmp" "$plist" 2>/dev/null; then
-            ok "Existing plist is already up-to-date - no rewrite needed:"
-            info "  $plist"
-            echo
-            confirm "Reload it anyway (unload + load via launchctl)?" || {
-                rm -f "$new_tmp"
-                trap - EXIT INT TERM
-                info "Nothing changed. Done."
-                return 0
-            }
-            # Skip the write; just reload below.
-            do_write=0
-        else
-            warn "Existing plist found at: $plist"
-            info "Diff (existing -> new) is shown below; only the differences will be applied:"
-            echo
-            # diff exits 1 when files differ. Suppress the non-zero
-            # status so the script (under set -u) doesn't trip.
-            diff -u "$plist" "$new_tmp" || true
-            echo
-            confirm "Apply these changes and reload (requires sudo)?" || die "Aborted."
-            do_write=1
-        fi
+    if [ -f "$plist" ] && cmp -s "$new_tmp" "$plist" 2>/dev/null; then
+        ok "Existing plist is already up-to-date - no rewrite needed:"
+        info "  $plist"
+        echo
+        prompt="Reload it anyway (unload + load via launchctl)?"
+        do_write=0
+    elif [ -f "$plist" ]; then
+        warn "Existing plist found at: $plist"
+        info "Diff (existing -> new) is shown below; only the differences will be applied:"
+        echo
+        # diff exits 1 when files differ. Suppress the non-zero
+        # status so the script (under set -u) doesn't trip.
+        diff -u "$plist" "$new_tmp" || true
+        echo
+        prompt="Apply these changes and reload?"
+        do_write=1
     else
         info "No existing plist at $plist - this is a fresh install."
         info "Full plist contents to be written:"
         echo
         sed 's/^/    /' "$new_tmp"
         echo
-        confirm "Install and load this LaunchDaemon (requires sudo)?" || die "Aborted."
+        prompt="Install and load this LaunchDaemon?"
         do_write=1
     fi
 
+    # The plan above is for anyone; acting on it is root's.
+    [ "$(id -u)" -eq 0 ] \
+        || err 026 "install-daemon needs root -- rerun under sudo: $SCRIPT_NAME install-daemon"
+    confirm "$prompt" || {
+        [ "$do_write" = "0" ] && { info "Nothing changed. Done."; return 0; }
+        die "Aborted."
+    }
+
     if [ "$do_write" = "1" ]; then
-        # Write plist via sudo by piping the rendered tmpfile into a
-        # root-owned 'cat'. Using cp would also work; this matches the
-        # heredoc style of the rest of the script.
-        run sudo sh -c "cat > '$plist'" < "$new_tmp" \
+        # install -S: a temp file renamed into place, so launchd never
+        # reads a half-written plist; owner and mode in the same step.
+        run install -S -o root -g wheel -m 644 "$new_tmp" "$plist" \
             || err 014 "writing the LaunchDaemon plist to $plist failed"
-        run sudo chown root:wheel "$plist" \
-            || err 015 "chown root:wheel $plist failed"
-        run sudo chmod 644 "$plist" \
-            || err 016 "chmod 644 $plist failed"
     fi
 
     rm -f "$new_tmp"
     trap - EXIT INT TERM
 
     # Reload: unload first if already registered, then bootstrap.
-    if launchctl list "$label" >/dev/null 2>&1 \
-        || sudo -n launchctl list "$label" >/dev/null 2>&1; then
-        run sudo launchctl bootout system "$plist" 2>/dev/null \
-            || run sudo launchctl unload "$plist" 2>/dev/null \
-            || true
+    if launchctl list "$label" >/dev/null 2>&1; then
+        run launchctl bootout system "$plist" 2>/dev/null || true
     fi
-    run sudo launchctl bootstrap system "$plist" \
-        || run sudo launchctl load -w "$plist" \
-        || warn "Could not load the plist automatically. Reboot or run 'sudo launchctl bootstrap system $plist' manually."
+    run launchctl bootstrap system "$plist" \
+        || warn "Could not load the plist automatically. Reboot, or as root: launchctl bootstrap system $plist"
 
     ok "LaunchDaemon installed and loaded."
     info "View logs:  tail -f $stderr_log ${LOG_FILE:-/var/log/my-appleRAID.log}"
-    info "Status:     sudo launchctl list | grep $label"
+    info "Status:     launchctl print system/$label"
 }
 
 # ----------------------------------------------------------------------
@@ -6702,11 +6695,11 @@ cmd_daemon_status() {
     # --- Check 3/8: loaded in launchd ------------------------------
     step "Check 3/8: launchd registration"
     # 'launchctl list <label>' returns 0 if loaded, non-zero if not.
-    # No sudo needed for a system-domain query read-only lookup.
+    # A user's launchctl sees only the user's domain, never this job.
     if launchctl list "$label" >/dev/null 2>&1; then
         ok "Loaded (launchctl list '$label' succeeds)."
-    elif sudo -n launchctl list "$label" >/dev/null 2>&1; then
-        ok "Loaded (visible via sudo)."
+    elif [ "$(id -u)" -ne 0 ]; then
+        warn "Cannot tell as uid $(id -u): launchd's system domain is root's -- rerun under sudo."
     else
         errmsg "NOT loaded in launchd."
         warn "Run:  sudo launchctl bootstrap system $plist"
@@ -6718,8 +6711,7 @@ cmd_daemon_status() {
 
     # --- Check 4/8: PID + last exit status -------------------------
     step "Check 4/8: Process + last exit status"
-    # Try both userspace and (if available) sudo to read the job dict.
-    out=$(launchctl list "$label" 2>/dev/null || sudo -n launchctl list "$label" 2>/dev/null)
+    out=$(launchctl list "$label" 2>/dev/null)
     if [ -n "$out" ]; then
         pid=$(echo "$out" | awk -F'[=;]' '/"PID"/ {gsub(/[ \t]/, "", $2); print $2}')
         last_exit=$(echo "$out" | awk -F'[=;]' '/"LastExitStatus"/ {gsub(/[ \t]/, "", $2); print $2}')
@@ -6851,12 +6843,14 @@ cmd_uninstall_daemon() {
     step "Uninstalling LaunchDaemon"
     info "Plist: $plist"
     info "Label: $label"
+    [ "$(id -u)" -eq 0 ] \
+        || err 027 "uninstall-daemon needs root -- rerun under sudo: $SCRIPT_NAME uninstall-daemon"
     confirm "Unload and delete?" || die "Aborted."
 
-    run sudo launchctl bootout system "$plist" 2>/dev/null \
-        || run sudo launchctl unload "$plist" 2>/dev/null \
+    run launchctl bootout system "$plist" 2>/dev/null \
+        || run launchctl unload "$plist" 2>/dev/null \
         || warn "launchctl unload failed (maybe not loaded)"
-    run sudo rm -f "$plist" \
+    run rm -f "$plist" \
         || err 017 "removing the LaunchDaemon plist file $plist failed"
     ok "Uninstalled."
 }
@@ -9704,6 +9698,30 @@ t_install_daemon_program() {
         _t_grep "In plist: *$_tl" "$_T/all"
 }
 
+# The daemon verbs that write need root and say so: run as a user, they
+# show their plan and stop with "needs root"; nothing is written or removed.
+# shellcheck disable=SC2016  # the sh -c scripts expand $1.. in the child, by design
+t_daemon_needs_root() {
+    echo " >>> install-daemon / uninstall-daemon: needs root"
+    if [ "$(id -u)" -eq 0 ]; then
+        _t_ok "skipped: runs as root, and the refusal is for a user"
+        return 0
+    fi
+    _t_run "LAUNCHD_PLIST=\"$_T/new.plist\"" install-daemon
+    cat "$_T/out" "$_T/err" > "$_T/all"
+    _t_check "install-daemon as a user: ERROR 026 [rc $_t_rc]" \
+        sh -c '[ "$1" -ne 0 ] && grep -q "ERROR 026 .*needs root" "$2"' _ "$_t_rc" "$_T/all"
+    _t_check "...after showing the plist it would write" _t_grep "<string>health</string>" "$_T/all"
+    _t_check "...and writing nothing" [ ! -e "$_T/new.plist" ]
+
+    printf 'old\n' > "$_T/old.plist"
+    _t_run "LAUNCHD_PLIST=\"$_T/old.plist\"" uninstall-daemon
+    cat "$_T/out" "$_T/err" > "$_T/all"
+    _t_check "uninstall-daemon as a user: ERROR 027 [rc $_t_rc]" \
+        sh -c '[ "$1" -ne 0 ] && grep -q "ERROR 027 .*needs root" "$2"' _ "$_t_rc" "$_T/all"
+    _t_check "...and the plist is still there" [ -e "$_T/old.plist" ]
+}
+
 cmd_run_tests() {
     _T_SELF=$(cd "$(dirname "$0")" 2>/dev/null && pwd)/$(basename "$0")
     [ -x "$_T_SELF" ] || die "run-tests: cannot locate self at $_T_SELF"
@@ -9727,6 +9745,7 @@ STUB_EOF
 
     t_test_mail
     t_install_daemon_program
+    t_daemon_needs_root
 
     printf '\n%s: %d passed, %d failed\n' "$SCRIPT_NAME run-tests" "$_T_PASS" "$_T_FAIL"
     [ "$_T_FAIL" -eq 0 ]
@@ -10003,14 +10022,15 @@ ${C_BOLD}COMMANDS${C_RESET}
                               LAUNCHD_PLIST, LAUNCHD_LABEL,
                               LAUNCHD_INTERVAL; the program it starts
                               from LAUNCHD_PROGRAM (empty: this
-                              script). Requires sudo.
-  ${C_CYAN}uninstall-daemon${C_RESET}            Unload and remove the LaunchDaemon.
+                              script). Needs root; as a user it only
+                              shows the plist it would write.
+  ${C_CYAN}uninstall-daemon${C_RESET}            Unload and remove the LaunchDaemon. Needs root.
   ${C_CYAN}daemon-status${C_RESET}               Diagnose the daemon: plist on disk, plist vs
                               config drift, launchd registration, last
                               exit status, log recency, stderr tail,
-                              writable paths. Read-only. No sudo needed
-                              (though a few fields are more informative
-                              when run with sudo).
+                              writable paths. Read-only. As a user the
+                              launchd checks cannot see the job; run
+                              it as root for those.
 
   ${C_CYAN}help${C_RESET}, --help, -h            This message.
 
