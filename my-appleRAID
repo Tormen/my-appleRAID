@@ -89,11 +89,11 @@ SCRIPT_NAME="$(basename "$0")"
 # subcommand updates SCRIPT_COMMIT to the current HEAD sha and
 # amends - run it as the last step before deploying.
 SCRIPT_VERSION="v8.2"
-SCRIPT_COMMIT="428b79a"
+SCRIPT_COMMIT="c5ecd81"
 # What git said when this build was stamped: 'git describe --tags --long' --
 # <nearest tag>-<commits since it>-g<short sha>. It says whether these bytes
 # ARE that release or work on top of it, on a machine with no git.
-SCRIPT_RELEASE="v8.2-15-g428b79a"
+SCRIPT_RELEASE="v8.2-16-gc5ecd81"
 SCRIPT_COPYRIGHT="Copyright (C) 2026 Tormen <tormen@mail.ch>"
 SCRIPT_LICENSE_SHORT="GPL-3.0-or-later (copyleft)"
 SCRIPT_LICENSE_URL="https://www.gnu.org/licenses/gpl-3.0.html"
@@ -8547,7 +8547,7 @@ _smart_drilldown_one() {
     case "$health_raw" in
         PASSED|OK)  ok "Overall health: $health_raw" ;;
         '')         warn "Overall health: not reported by drive" ;;
-        *)          err "Overall health: $health_raw" ;;
+        *)          errmsg "Overall health: $health_raw" ;;
     esac
     echo
 
@@ -9764,6 +9764,21 @@ release-softraid no-such-volume
 _EOF
 }
 
+# err exits and its first argument is the code that names the line; a
+# message in that place prints no code and ends the run where the caller
+# meant to go on (errmsg is the variant that returns).
+t_err_calls_name_a_code() {
+    echo " >>> every err call names a code"
+    awk '/^[[:space:]]*#/ { next }
+         match($0, /(^|[;{)]|\|\||&&)[[:space:]]*err [^[:space:]]+/) {
+             a = substr($0, RSTART, RLENGTH); sub(/.*err /, "", a)
+             if (a !~ /^[0-9]+$/ && a != "\"$1\"") print FILENAME ":" FNR ": " $0
+         }' "$_T_SELF" > "$_T/errcalls"
+    _t_check "no err call without a numeric code [$(wc -l < "$_T/errcalls" | tr -d ' ') found]" [ ! -s "$_T/errcalls" ]
+    [ -s "$_T/errcalls" ] && sed 's/^/        /' "$_T/errcalls"
+    return 0
+}
+
 cmd_run_tests() {
     _T_SELF=$(cd "$(dirname "$0")" 2>/dev/null && pwd)/$(basename "$0")
     [ -x "$_T_SELF" ] || die "run-tests: cannot locate self at $_T_SELF"
@@ -9788,6 +9803,7 @@ STUB_EOF
     t_test_mail
     t_install_daemon_program
     t_daemon_needs_root
+    t_err_calls_name_a_code
 
     printf '\n%s: %d passed, %d failed\n' "$SCRIPT_NAME run-tests" "$_T_PASS" "$_T_FAIL"
     [ "$_T_FAIL" -eq 0 ]
@@ -11401,8 +11417,8 @@ pick_physical_disk_interactively() {
     } >&2
     read -r _choice || return 1
     case "$_choice" in
-        q|Q|'')      err "Aborted."; return 1 ;;
-        *[!0-9]*)    err "Invalid choice: $_choice"; return 1 ;;
+        q|Q|'')      errmsg "Aborted."; return 1 ;;
+        *[!0-9]*)    errmsg "Invalid choice: $_choice"; return 1 ;;
     esac
     if [ "$_choice" -lt 1 ] || [ "$_choice" -gt "$_i" ]; then
         errmsg "Invalid choice: $_choice (must be 1..$_i)"
@@ -11410,7 +11426,7 @@ pick_physical_disk_interactively() {
     fi
 
     _picked=$(printf '%s' "$_map" | awk -F= -v c="$_choice" '$1==c {print $2; exit}')
-    [ -n "$_picked" ] || { err "Internal error resolving choice $_choice."; return 1; }
+    [ -n "$_picked" ] || { errmsg "Internal error resolving choice $_choice."; return 1; }
     echo "$_picked"
 }
 
@@ -11919,7 +11935,7 @@ verify_wipe() {
     dev="$1"
     rdev="/dev/r${dev#/dev/}"
     size_bytes=$(disk_size_bytes "$dev")
-    [ -n "$size_bytes" ] || { err "Could not determine size of $dev"; return 1; }
+    [ -n "$size_bytes" ] || { errmsg "Could not determine size of $dev"; return 1; }
     size_mb=$(( size_bytes / 1048576 ))
     skip_mb=$(( size_mb - 100 ))
 
