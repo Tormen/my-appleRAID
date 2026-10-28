@@ -89,11 +89,11 @@ SCRIPT_NAME="$(basename "$0")"
 # subcommand updates SCRIPT_COMMIT to the current HEAD sha and
 # amends - run it as the last step before deploying.
 SCRIPT_VERSION="v8.2"
-SCRIPT_COMMIT="c5ecd81"
+SCRIPT_COMMIT="5a81912"
 # What git said when this build was stamped: 'git describe --tags --long' --
 # <nearest tag>-<commits since it>-g<short sha>. It says whether these bytes
 # ARE that release or work on top of it, on a machine with no git.
-SCRIPT_RELEASE="v8.2-16-gc5ecd81"
+SCRIPT_RELEASE="v8.2-17-g5a81912"
 SCRIPT_COPYRIGHT="Copyright (C) 2026 Tormen <tormen@mail.ch>"
 SCRIPT_LICENSE_SHORT="GPL-3.0-or-later (copyleft)"
 SCRIPT_LICENSE_URL="https://www.gnu.org/licenses/gpl-3.0.html"
@@ -6542,6 +6542,13 @@ daemon_program() {
     fi
 }
 
+# same_plist <new> <installed> -- the same job: equal but for the installer
+# comment, which the installed one must have (one without it is written again)
+same_plist() {
+    grep -q '^<!-- installed by ' "$2" 2>/dev/null &&
+        [ "$(grep -v '^<!-- installed by ' "$1")" = "$(grep -v '^<!-- installed by ' "$2")" ]
+}
+
 cmd_install_daemon() {
     cfg_load
     plist="${LAUNCHD_PLIST}"
@@ -6571,8 +6578,8 @@ cmd_install_daemon() {
     trap 'rm -f "$new_tmp"' EXIT INT TERM
     cat > "$new_tmp" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
-  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- installed by $SCRIPT_NAME install-daemon ($(id -un)) on $(hostname -s 2>/dev/null || hostname), $(date '+%Y-%m-%d %H:%M %z'): generated, build $(_build_id) -->
 <plist version="1.0">
 <dict>
   <key>Label</key>
@@ -6594,7 +6601,7 @@ cmd_install_daemon() {
 </plist>
 EOF
 
-    if [ -f "$plist" ] && cmp -s "$new_tmp" "$plist" 2>/dev/null; then
+    if [ -f "$plist" ] && same_plist "$new_tmp" "$plist"; then
         ok "Existing plist is already up-to-date - no rewrite needed:"
         info "  $plist"
         echo
@@ -9717,6 +9724,29 @@ t_install_daemon_program() {
         _t_grep "In plist: *$_tl" "$_T/all"
 }
 
+# The plist carries ONE installer comment after the DOCTYPE; comparing ignores
+# it, so a second install-daemon finds nothing to rewrite -- but a plist
+# WITHOUT the comment is written again, to gain one.
+# shellcheck disable=SC2016  # the sh -c script expands $1 and $(id -un) in the child, by design
+t_install_daemon_comment() {
+    echo " >>> install-daemon: the installer comment"
+    mkdir "$_T/old" "$_T/bare"     # the label is the file's name: the same in each
+    _t_run "LAUNCHD_PLIST=\"$_T/fresh.plist\"" install-daemon
+    awk '/Full plist contents to be written:/ { p = 1; next } p && /^    / { print substr($0, 5) } p && !/^    / && NF { exit }' \
+        "$_T/out" > "$_T/inst.plist"
+    _t_check "the plist names who installed it, right after the DOCTYPE" \
+        sh -c 'sed -n 3p "$1" | grep -q "^<!-- installed by my-appleRAID install-daemon ($(id -un)) on .*: generated, build "' _ "$_T/inst.plist"
+    sed 's/^<!-- installed by \(.*\) on [^,]*, [^:]*:/<!-- installed by \1 on elsewhere, 2020-01-01 00:00 +0000:/' \
+        "$_T/inst.plist" > "$_T/old/fresh.plist"
+    _t_run "LAUNCHD_PLIST=\"$_T/old/fresh.plist\"" install-daemon
+    cat "$_T/out" "$_T/err" > "$_T/all"
+    _t_check "an installed plist that differs only in its comment is up to date" _t_grep "already up-to-date" "$_T/all"
+    grep -v '^<!-- installed by ' "$_T/inst.plist" > "$_T/bare/fresh.plist"
+    _t_run "LAUNCHD_PLIST=\"$_T/bare/fresh.plist\"" install-daemon
+    cat "$_T/out" "$_T/err" > "$_T/all"
+    _t_check "...one WITHOUT the comment is written again" _t_grep "Existing plist found" "$_T/all"
+}
+
 # The daemon verbs that write need root and say so: run as a user, they
 # show their plan and stop with "needs root"; nothing is written or removed.
 # shellcheck disable=SC2016  # the sh -c scripts expand $1.. in the child, by design
@@ -9802,6 +9832,7 @@ STUB_EOF
 
     t_test_mail
     t_install_daemon_program
+    t_install_daemon_comment
     t_daemon_needs_root
     t_err_calls_name_a_code
 
