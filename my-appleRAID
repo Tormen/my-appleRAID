@@ -89,11 +89,11 @@ SCRIPT_NAME="$(basename "$0")"
 # subcommand updates SCRIPT_COMMIT to the current HEAD sha and
 # amends - run it as the last step before deploying.
 SCRIPT_VERSION="v8.2"
-SCRIPT_COMMIT="5a81912"
+SCRIPT_COMMIT="8ff64a5"
 # What git said when this build was stamped: 'git describe --tags --long' --
 # <nearest tag>-<commits since it>-g<short sha>. It says whether these bytes
 # ARE that release or work on top of it, on a machine with no git.
-SCRIPT_RELEASE="v8.2-17-g5a81912"
+SCRIPT_RELEASE="v8.2-18-g8ff64a5"
 SCRIPT_COPYRIGHT="Copyright (C) 2026 Tormen <tormen@mail.ch>"
 SCRIPT_LICENSE_SHORT="GPL-3.0-or-later (copyleft)"
 SCRIPT_LICENSE_URL="https://www.gnu.org/licenses/gpl-3.0.html"
@@ -1318,11 +1318,15 @@ problem_hash() {
     printf '%s|%s|%s' "$1" "$2" "$3" | shasum | awk '{print $1}'
 }
 
+# The state_* and seen_* helpers name their variables _s*_ only: dash has
+# no 'local', and their callers (handle_problem, the check loops) hold
+# their own h / sev / summary / first across these calls.
+
 # Look up a problem by hash. Prints the matching line or empty.
 state_get() {
-    h="$1"
+    _sg_h="$1"
     [ -f "$STATE_FILE" ] || return 0
-    awk -F'|' -v h="$h" '
+    awk -F'|' -v h="$_sg_h" '
         /^#/ { next }
         $1 == h { print; exit }
     ' "$STATE_FILE"
@@ -1331,32 +1335,32 @@ state_get() {
 # Upsert a problem: write or replace the line for a given hash.
 # Args: hash, severity, first_seen, last_alarm, last_email, summary
 state_put() {
-    h="$1"; sev="$2"; first="$3"; alarm="$4"; email="$5"; summary="$6"
-    tmp=$(mktemp "${STATE_FILE}.XXXXXX") \
+    _sp_h="$1"
+    _sp_tmp=$(mktemp "${STATE_FILE}.XXXXXX") \
         || err 018 "mktemp for state-DB rewrite failed at ${STATE_FILE}.XXXXXX"
-    awk -F'|' -v h="$h" '
+    awk -F'|' -v h="$_sp_h" '
         /^#/ { print; next }
         $1 != h { print }
-    ' "$STATE_FILE" > "$tmp" \
-        || err 019 "awk rewrite of state-DB failed (writing to $tmp)"
-    printf '%s|%s|%s|%s|%s|%s\n' "$h" "$sev" "$first" "$alarm" "$email" "$summary" >> "$tmp" \
-        || err 020 "appending new state-DB row failed (to $tmp)"
-    mv "$tmp" "$STATE_FILE" \
-        || err 021 "atomic rename of state-DB failed: $tmp -> $STATE_FILE"
+    ' "$STATE_FILE" > "$_sp_tmp" \
+        || err 019 "awk rewrite of state-DB failed (writing to $_sp_tmp)"
+    printf '%s|%s|%s|%s|%s|%s\n' "$_sp_h" "$2" "$3" "$4" "$5" "$6" >> "$_sp_tmp" \
+        || err 020 "appending new state-DB row failed (to $_sp_tmp)"
+    mv "$_sp_tmp" "$STATE_FILE" \
+        || err 021 "atomic rename of state-DB failed: $_sp_tmp -> $STATE_FILE"
 }
 
 # Remove a problem by hash.
 state_delete() {
-    h="$1"
+    _sd_h="$1"
     [ -f "$STATE_FILE" ] || return 0
-    tmp=$(mktemp "${STATE_FILE}.XXXXXX") || return 1
-    awk -F'|' -v h="$h" '
+    _sd_tmp=$(mktemp "${STATE_FILE}.XXXXXX") || return 1
+    awk -F'|' -v h="$_sd_h" '
         /^#/ { print; next }
         $1 != h { print }
-    ' "$STATE_FILE" > "$tmp" \
-        || err 022 "awk rewrite of state-DB during delete failed (writing to $tmp)"
-    mv "$tmp" "$STATE_FILE" \
-        || err 023 "atomic rename of state-DB during delete failed: $tmp -> $STATE_FILE"
+    ' "$STATE_FILE" > "$_sd_tmp" \
+        || err 022 "awk rewrite of state-DB during delete failed (writing to $_sd_tmp)"
+    mv "$_sd_tmp" "$STATE_FILE" \
+        || err 023 "atomic rename of state-DB during delete failed: $_sd_tmp -> $STATE_FILE"
 }
 
 # List all current problem hashes (one per line).
@@ -1367,10 +1371,9 @@ state_list_hashes() {
 
 # Get field N (1-based) from the state line for a given hash.
 state_field() {
-    h="$1"; n="$2"
-    line=$(state_get "$h")
-    [ -n "$line" ] || return 0
-    echo "$line" | awk -F'|' -v n="$n" '{print $n}'
+    _sf_line=$(state_get "$1")
+    [ -n "$_sf_line" ] || return 0
+    echo "$_sf_line" | awk -F'|' -v n="$2" '{print $n}'
 }
 
 # Seconds between two ISO8601 timestamps (macOS date parsing).
@@ -2688,9 +2691,8 @@ seen_add() {
 }
 
 seen_has() {
-    h="$1"
     [ -f "$SEEN_HASHES_FILE" ] || return 1
-    grep -qxF "$h" "$SEEN_HASHES_FILE"
+    grep -qxF "$1" "$SEEN_HASHES_FILE"
 }
 
 # ----------------------------------------------------------------------
@@ -9809,6 +9811,37 @@ t_err_calls_name_a_code() {
     return 0
 }
 
+# The same problem seen on two health passes is ONE new problem and ONE
+# mail: handle_problem records it under its OWN hash, whatever the mail on
+# the way did. The state helpers once set the caller's 'h': a mail that
+# went out (or failed) recorded the email-channel hash instead, so the
+# problem was NEW again on every pass -- one mail a minute (ada,
+# 2026-09-25..27). Runs in-process against the stub sender; the two passes
+# run in a subshell, so the test's config does not outlive them.
+_t_two_passes() {
+    STATE_DIR="$_T/state-$1"; LOG_FILE="$_T/log-$1"
+    EMAIL_TO="rcpt@example.invalid"; EMAIL_FROM="sender@example.invalid"
+    EMAIL_SENDER="$_T/stub-sender"; ALARM_ENABLED=no
+    STUB_RC=$1; export STUB_RC
+    state_init; seen_init
+    _tp_s="Optional set 'mirror': no group is fully present"
+    handle_problem optset-none-full mirror no-group-fully-present crit "$_tp_s"
+    handle_problem optset-none-full mirror no-group-fully-present crit "$_tp_s"
+    state_get "$(problem_hash optset-none-full mirror no-group-fully-present)" > "$_T/row-$1"
+    seen_cleanup
+}
+
+t_problem_recorded_once() {
+    echo " >>> a problem seen twice: recorded under its own hash, mailed once"
+    for _tp_rc in 0 75; do
+        rm -f "$_T/mail"
+        ( _t_two_passes "$_tp_rc" ) > /dev/null 2>&1
+        _t_check "sender rc $_tp_rc: the problem's own row is in state.db" [ -s "$_T/row-$_tp_rc" ]
+        _t_check "sender rc $_tp_rc: ONE mail for it, not one per pass [$(_t_count "Subject: [appleRAID/crit] Optional" "$_T/mail")]" \
+            [ "$(_t_count "Subject: [appleRAID/crit] Optional" "$_T/mail")" -eq 1 ]
+    done
+}
+
 cmd_run_tests() {
     _T_SELF=$(cd "$(dirname "$0")" 2>/dev/null && pwd)/$(basename "$0")
     [ -x "$_T_SELF" ] || die "run-tests: cannot locate self at $_T_SELF"
@@ -9835,6 +9868,7 @@ STUB_EOF
     t_install_daemon_comment
     t_daemon_needs_root
     t_err_calls_name_a_code
+    t_problem_recorded_once
 
     printf '\n%s: %d passed, %d failed\n' "$SCRIPT_NAME run-tests" "$_T_PASS" "$_T_FAIL"
     [ "$_T_FAIL" -eq 0 ]
