@@ -528,11 +528,31 @@ surface every transition.
 
 ---
 
+## Where the config, the state and the logs live
+
+`/LINKS/default/site.conf`, when it exists, is read before anything else:
+plain `KEY="value"` lines naming the site's directories for every tool.
+Without it, nothing site-specific is assumed.
+
+| Key | Used as | Without the file |
+|---|---|---|
+| `DATA_BASE_DIR` | `STATE_DIR` default: `<base>/my-appleRAID` (shared: the root daemon writes, everyone reads) | `/var/db` |
+| `LOG_BASE_DIR` | `LOG_FILE` default `<base>/my-appleRAID.log`, launchd's `<base>/my-appleRAID.launchd.out` / `.err` | `/var/log` |
+| `CONFIG_SEARCH_DIR` | searched for `my-appleRAID.conf`, then `my-appleRAID`, ahead of `~`, `/usr/local/etc`, `/etc` | not searched |
+| `CONFIG_OFFER_DIR`, `CONFIG_OFFER_NOTE` | where "no config found" offers to write one, with the note beside it | not offered |
+
+A key the config sets wins over these defaults. The site file there but
+unreadable is an error, never a silent fallback. `$MY_APPLERAID_CONFIG`,
+when set, is read before the whole search (tests use it); `--help` lists
+the search order.
+
+---
+
 ## Permission model — root writes, everyone reads
 
 `my-appleRAID` runs in two distinct contexts:
 
-- **The daemon** (launchd, root) writes everything: `STATE_DIR` (default `/var/db/my-appleRAID`), `LOG_FILE` (default `/var/log/.../my-appleRAID.log`), all baseline files, the dtype cache, the problems sidecar.
+- **The daemon** (launchd, root) writes everything: `STATE_DIR`, `LOG_FILE` (defaults: the table above), all baseline files, the dtype cache, the problems sidecar.
 - **An interactive human** (almost always non-root) reads. `status`, `baseline`, `baseline --show`, `baseline --diff`, `report`, `smart <disk>` all need to look at what the daemon wrote — *without* needing `sudo`.
 
 The script keeps this clean with **two invariants**:
@@ -540,7 +560,7 @@ The script keeps this clean with **two invariants**:
 1. **Configured paths are authoritative.** `STATE_DIR` and `LOG_FILE` come from the config file (or its defaults). The script never silently routes to a per-user tmpdir when those paths aren't writable — that would produce phantom state nobody else reads. Instead it **dies loudly** with a `sudo …` hint at the moment a write is attempted by a uid that can't.
 2. **New files are world-readable by default.** A top-of-script `umask 022` guarantees any directory the script creates is `0755` and any file it writes is `0644`. Operators who tighten perms manually keep their choice — `my-appleRAID` never re-chmods anything that already exists.
 
-In practice on the recommended layout (`STATE_DIR=/var/db/my-appleRAID` mode `0755 root:wheel`, `LOG_FILE` directory mode `0755`):
+In practice on the recommended layout (`STATE_DIR` mode `0755 root:wheel`, `LOG_FILE` directory mode `0755`):
 
 | Command | Reads | Writes | Works as non-root |
 | --- | --- | --- | --- |
@@ -557,7 +577,7 @@ When a non-root user attempts a write-needing command, the script prints a clear
 If the canonical paths don't exist yet on a fresh box, run once as root:
 
 ```sh
-sudo install -d -m 0755 -o root -g wheel /var/db/my-appleRAID
+sudo install -d -m 0755 -o root -g wheel "$STATE_DIR"
 sudo install -d -m 0755 -o root -g wheel "$(dirname "$LOG_FILE")"
 ```
 
@@ -684,9 +704,10 @@ miss on a scroll.
 
 ## Test harnesses
 
-`my-appleRAID run-tests` runs the built-in self-tests (currently
-`test-mail` / `--test-mail`). They run in a throw-away sandbox with a
-stub mail sender: no disks are touched and no real mail is sent.
+`my-appleRAID run-tests [<FILTER>]` runs the built-in self-tests -- with a
+FILTER, only those whose name holds it (`run-tests site_conf`). They run
+in a throw-away sandbox with a stub mail sender: no disks are touched and
+no real mail is sent.
 
 Two scripts live in `tests/`:
 

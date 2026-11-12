@@ -26,10 +26,12 @@
 #
 # Config search path (first readable file wins):
 #   $MY_APPLERAID_CONFIG        (env var, for testing)
-#   /LINKS/default/my-appleRAID.conf
+#   $CONFIG_SEARCH_DIR/my-appleRAID.conf, then $CONFIG_SEARCH_DIR/my-appleRAID
 #   $HOME/.my-appleRAID.conf
 #   /usr/local/etc/my-appleRAID.conf
 #   /etc/my-appleRAID.conf
+# The site file /LINKS/default/site.conf, when there, is read first: it
+# gives CONFIG_SEARCH_DIR and the bases of STATE_DIR and the logs.
 #
 # See `appleRAID --help` for full command list and `appleRAID create-config
 # <path>` to produce a well-commented default config.
@@ -56,6 +58,8 @@ set -u  # Treat unset variables as errors (but NOT -e: we want to handle
 # by the root-owned daemon. We only set the default — never re-chmod
 # existing files. Operators who tighten perms manually keep their choice.
 umask 022
+
+SITE_CONF="/LINKS/default/site.conf"   # the ONE site path in this tool: read_site
 
 # ----------------------------------------------------------------------
 # Colors (only if stdout is a terminal)
@@ -89,11 +93,11 @@ SCRIPT_NAME="$(basename "$0")"
 # subcommand updates SCRIPT_COMMIT to the current HEAD sha and
 # amends - run it as the last step before deploying.
 SCRIPT_VERSION="v8.2"
-SCRIPT_COMMIT="8ff64a5"
+SCRIPT_COMMIT="86eaf2e"
 # What git said when this build was stamped: 'git describe --tags --long' --
 # <nearest tag>-<commits since it>-g<short sha>. It says whether these bytes
 # ARE that release or work on top of it, on a machine with no git.
-SCRIPT_RELEASE="v8.2-18-g8ff64a5"
+SCRIPT_RELEASE="v8.2-19-g86eaf2e"
 SCRIPT_COPYRIGHT="Copyright (C) 2026 Tormen <tormen@mail.ch>"
 SCRIPT_LICENSE_SHORT="GPL-3.0-or-later (copyleft)"
 SCRIPT_LICENSE_URL="https://www.gnu.org/licenses/gpl-3.0.html"
@@ -263,8 +267,10 @@ die() {
 #   036   destroy: not run as root
 #   037   migrate-softraid: not run as root
 #   038   release-softraid: not run as root
+#   039   site file there but not readable
+#   040   site file failed to load
 #
-# _ERR_HIGHEST=038
+# _ERR_HIGHEST=040
 # ----------------------------------------------------------------------
 err() {
     _ec_code="$1"
@@ -308,7 +314,7 @@ need_root() {
 # command that mutates persistent state (baseline --update, health,
 # smart-cache writes, etc.). DIES loudly with a sudo hint when not.
 _ensure_state_dir_writable() {
-    [ -n "${STATE_DIR:-}" ] || STATE_DIR="/var/db/my-appleRAID"
+    [ -n "${STATE_DIR:-}" ] || STATE_DIR="$STATE_DIR_DEFAULT"
     if [ -d "$STATE_DIR" ] && [ -w "$STATE_DIR" ]; then
         return 0
     fi
@@ -338,7 +344,7 @@ If you control the box, you can also widen the dir once:
 # 'no state yet' is OK or a hard error). DIES loudly when the dir
 # exists but is unreadable.
 _ensure_state_dir_readable() {
-    [ -n "${STATE_DIR:-}" ] || STATE_DIR="/var/db/my-appleRAID"
+    [ -n "${STATE_DIR:-}" ] || STATE_DIR="$STATE_DIR_DEFAULT"
     # Fresh install: dir doesn't exist yet. Caller handles missing state.
     [ -e "$STATE_DIR" ] || return 0
     # Exists and we can read+enter it: done.
@@ -1105,37 +1111,86 @@ cfg_set_defaults() {
     SELFTEST_SHORT_SCHEDULE="daily"        # never|daily|weekly  (~2 min per drive)
     SELFTEST_LONG_SCHEDULE="weekly"        # never|daily|weekly  (hours; scales with disk size)
     SELFTEST_HOUR=3                        # 0-23, when scheduled tests kick off
-    # State / logging
-    STATE_DIR="/var/db/my-appleRAID"
-    LOG_FILE="/var/log/my-appleRAID.log"
+    # State / logging: under the site file's bases (read_site; /var/db and
+    # /var/log without it). Shared by every user -- the root daemon writes,
+    # everyone reads -- so no user part, only the tool's name.
+    STATE_DIR_DEFAULT="$DATA_BASE_DIR/my-appleRAID"
+    STATE_DIR="$STATE_DIR_DEFAULT"
+    LOG_FILE="$LOG_BASE_DIR/my-appleRAID.log"
     LOG_LEVEL=info                         # error|warn|info|debug
     # LaunchDaemon installation target (used by install-daemon).
     # LAUNCHD_LABEL is derived from LAUNCHD_PLIST at load time - do not set manually.
     LAUNCHD_PLIST="/Library/LaunchDaemons/eu.no-panic.my-appleRAID_health.plist"
     LAUNCHD_PROGRAM=""                     # empty: this script itself
-    LAUNCHD_STDOUT_LOG="/var/log/my-appleRAID.launchd.out"
-    LAUNCHD_STDERR_LOG="/var/log/my-appleRAID.launchd.err"
+    LAUNCHD_STDOUT_LOG_DEFAULT="$LOG_BASE_DIR/my-appleRAID.launchd.out"
+    LAUNCHD_STDERR_LOG_DEFAULT="$LOG_BASE_DIR/my-appleRAID.launchd.err"
+    LAUNCHD_STDOUT_LOG="$LAUNCHD_STDOUT_LOG_DEFAULT"
+    LAUNCHD_STDERR_LOG="$LAUNCHD_STDERR_LOG_DEFAULT"
     LAUNCHD_INTERVAL=60
 }
 
 # Path of the config file actually used by this run (for show-config).
 LOADED_CONFIG=""
 
+# The site's values for every tool, from SITE_CONF -- the one site path this
+# tool knows -- read before its own config: the base directories, where a
+# config is searched and where one is offered. The neutral values first, so
+# an exported variable never takes their place; then the file, plain
+# KEY="value" lines, when it is there.
+read_site() {
+    DATA_BASE_DIR="/var/db"; LOG_BASE_DIR="/var/log"
+    CONFIG_SEARCH_DIR=""; CONFIG_OFFER_DIR=""; CONFIG_OFFER_NOTE=""
+    [ -e "$SITE_CONF" ] || return 0
+    # there but unreadable: an error, never the neutral values -- they would
+    # keep this user's view of the state apart from the daemon's
+    [ -r "$SITE_CONF" ] || err 039 "cannot read '$SITE_CONF' -- the site's directories for every tool; its group must include $(id -un)"
+    # shellcheck disable=SC1090  # the site file's path is a variable (tests point it elsewhere)
+    . "$SITE_CONF" || err 040 "'$SITE_CONF' failed to load"
+}
+
+# Where a config is looked for, in order, after $MY_APPLERAID_CONFIG.
+config_search_paths() {
+    [ -z "$CONFIG_SEARCH_DIR" ] \
+        || printf '%s\n' "$CONFIG_SEARCH_DIR/my-appleRAID.conf" "$CONFIG_SEARCH_DIR/my-appleRAID"
+    printf '%s\n' "${HOME:-/}/.my-appleRAID.conf" /usr/local/etc/my-appleRAID.conf /etc/my-appleRAID.conf
+}
+
+# The offer names only paths the search reads, most common place first: the
+# site's offer directory -- only where the site's search directory is
+# searched, which a file there reaches as the note says; never the search
+# directory itself, a farm -- then /etc, then ~.
+config_offer_paths() {
+    if [ -n "$CONFIG_OFFER_DIR" ] && [ -n "$CONFIG_SEARCH_DIR" ]; then
+        printf '%s\n' "$CONFIG_OFFER_DIR/my-appleRAID.conf"
+    fi
+    for _o in /etc/my-appleRAID.conf "${HOME:-/}/.my-appleRAID.conf"; do
+        config_search_paths | grep -qx "$_o" && printf '%s\n' "$_o"
+    done
+}
+
+# config_offer <headline>: the headline, then each offered place a paste-ready
+# line, the site's note beside its own place.
+config_offer() {
+    echo "$1"
+    config_offer_paths | while IFS= read -r _o; do
+        if [ "$_o" = "$CONFIG_OFFER_DIR/my-appleRAID.conf" ] && [ -n "$CONFIG_OFFER_NOTE" ]; then
+            echo "    > $SCRIPT_NAME create-config $_o   ($CONFIG_OFFER_NOTE)"
+        else
+            echo "    > $SCRIPT_NAME create-config $_o"
+        fi
+    done
+    echo "    ($SCRIPT_NAME --help: the full search order)"
+}
+
 # ----------------------------------------------------------------------
-# Load config: try each search-path location, source the first that exists.
-# Silent on success; prints [INFO] line if nothing found (defaults used).
+# Load config: the site file, the defaults, then the first config found
+# ($MY_APPLERAID_CONFIG, then config_search_paths) sourced over them.
+# Silent; with none found the defaults stay and show-config says so.
 # ----------------------------------------------------------------------
 cfg_load() {
+    read_site
     cfg_set_defaults
-    # Candidate search path, in priority order.
-    for candidate in \
-        "${MY_APPLERAID_CONFIG:-}" \
-        "/LINKS/default/my-appleRAID.conf" \
-        "/LINKS/default/my-appleRAID" \
-        "${HOME:-/}/.my-appleRAID.conf" \
-        "/usr/local/etc/my-appleRAID.conf" \
-        "/etc/my-appleRAID.conf"
-    do
+    while IFS= read -r candidate; do
         [ -n "$candidate" ] || continue
         if [ -r "$candidate" ]; then
             # shellcheck disable=SC1090
@@ -1143,7 +1198,10 @@ cfg_load() {
             LOADED_CONFIG="$candidate"
             break
         fi
-    done
+    done <<_EOF
+${MY_APPLERAID_CONFIG:-}
+$(config_search_paths)
+_EOF
     [ -n "$LOADED_CONFIG" ] || LOADED_CONFIG="(none - defaults in use)"
 
     # Derive LAUNCHD_LABEL from LAUNCHD_PLIST: strip directory + ".plist".
@@ -4432,21 +4490,10 @@ cmd_show_config() {
     # a state that doesn't exist.
     case "$LOADED_CONFIG" in
         *"(none"*|"")
-            errmsg "No config file found on the search path."
-            echo
-            info "Searched locations (first readable wins):"
-            info "  \$MY_APPLERAID_CONFIG              (env var, for testing)"
-            info "  /LINKS/default/my-appleRAID.conf"
-            info "  \$HOME/.my-appleRAID.conf"
-            info "  /usr/local/etc/my-appleRAID.conf"
-            info "  /etc/my-appleRAID.conf"
-            echo
-            info "To create an annotated default config at one of these paths:"
-            info "  $SCRIPT_NAME create-config /LINKS/default/my-appleRAID.conf"
-            info "Or for a per-user file:"
-            info "  $SCRIPT_NAME create-config ~/.my-appleRAID.conf"
-            echo
-            info "Then re-run:  $SCRIPT_NAME show-config"
+            {
+                config_offer "!!! no config found -- write one, most common place first:"
+                echo "    then: $SCRIPT_NAME show-config"
+            } 1>&2
             exit 1
             ;;
     esac
@@ -4522,11 +4569,8 @@ format_duration() {
 cmd_create_config() {
     if [ $# -lt 1 ]; then
         errmsg "Usage: $SCRIPT_NAME create-config <path>"
-        echo
-        info "Suggested locations (any one works; first readable wins):"
-        info "  /LINKS/default/my-appleRAID.conf        # your symlink-based location"
-        info "  /usr/local/etc/my-appleRAID.conf        # system-wide"
-        info "  ~/.my-appleRAID.conf                    # per-user"
+        read_site
+        config_offer "--> write it to one of these, most common place first:" 1>&2
         exit 1
     fi
     path="$1"
@@ -4546,7 +4590,8 @@ cmd_create_config() {
 #
 # Search path (first readable file wins):
 #   $MY_APPLERAID_CONFIG  (env var, for testing)
-#   /LINKS/default/my-appleRAID.conf
+#   $CONFIG_SEARCH_DIR/my-appleRAID.conf, then $CONFIG_SEARCH_DIR/my-appleRAID
+#     (CONFIG_SEARCH_DIR from the site file /LINKS/default/site.conf)
 #   $HOME/.my-appleRAID.conf
 #   /usr/local/etc/my-appleRAID.conf
 #   /etc/my-appleRAID.conf
@@ -5045,11 +5090,13 @@ SELFTEST_HOUR=3
 # --- State & logging ------------------------------------------------
 
 # Where the script keeps its state database and sentinel files.
-# Must be writable by the user running `appleRAID health`.
-STATE_DIR="/var/db/my-appleRAID"
+# Must be writable by the user running `appleRAID health`. DATA_BASE_DIR
+# and LOG_BASE_DIR come from the site file /LINKS/default/site.conf
+# (/var/db and /var/log without it).
+STATE_DIR="$DATA_BASE_DIR/my-appleRAID"
 
 # Log file. Set empty to log to stderr only (launchd will capture it).
-LOG_FILE="/var/log/my-appleRAID.log"
+LOG_FILE="$LOG_BASE_DIR/my-appleRAID.log"
 
 # Verbosity: error | warn | info | debug
 LOG_LEVEL=info
@@ -5081,8 +5128,8 @@ LAUNCHD_PROGRAM=""
 # captures any unexpected tracebacks or crash output.
 #
 # Must be writable by root (the daemon runs as root via launchd).
-LAUNCHD_STDOUT_LOG="/var/log/my-appleRAID.launchd.out"
-LAUNCHD_STDERR_LOG="/var/log/my-appleRAID.launchd.err"
+LAUNCHD_STDOUT_LOG="$LOG_BASE_DIR/my-appleRAID.launchd.out"
+LAUNCHD_STDERR_LOG="$LOG_BASE_DIR/my-appleRAID.launchd.err"
 
 # How often launchd should invoke `appleRAID health`.
 # Accepts duration suffixes (see top of file): 60, 1m, 5m, etc.
@@ -6556,8 +6603,8 @@ cmd_install_daemon() {
     plist="${LAUNCHD_PLIST}"
     label="${LAUNCHD_LABEL}"
     interval="${LAUNCHD_INTERVAL:-60}"
-    stdout_log="${LAUNCHD_STDOUT_LOG:-/var/log/my-appleRAID.launchd.out}"
-    stderr_log="${LAUNCHD_STDERR_LOG:-/var/log/my-appleRAID.launchd.err}"
+    stdout_log="${LAUNCHD_STDOUT_LOG:-$LAUNCHD_STDOUT_LOG_DEFAULT}"
+    stderr_log="${LAUNCHD_STDERR_LOG:-$LAUNCHD_STDERR_LOG_DEFAULT}"
     self=$(daemon_program)
 
     step "LaunchDaemon installation plan"
@@ -6654,7 +6701,7 @@ EOF
         || warn "Could not load the plist automatically. Reboot, or as root: launchctl bootstrap system $plist"
 
     ok "LaunchDaemon installed and loaded."
-    info "View logs:  tail -f $stderr_log ${LOG_FILE:-/var/log/my-appleRAID.log}"
+    info "View logs:  tail -f $stderr_log${LOG_FILE:+ $LOG_FILE}"
     info "Status:     launchctl print system/$label"
 }
 
@@ -6770,7 +6817,7 @@ cmd_daemon_status() {
             if [ "$ago" -gt "$threshold" ]; then
                 warn "Log hasn't been written to in ${ago}s (interval is ${LAUNCHD_INTERVAL}s)."
                 warn "The daemon may not be running. Check:"
-                warn "  tail ${LAUNCHD_STDERR_LOG:-/var/log/my-appleRAID.launchd.err}"
+                warn "  tail ${LAUNCHD_STDERR_LOG:-$LAUNCHD_STDERR_LOG_DEFAULT}"
             else
                 ok "Log activity is recent."
             fi
@@ -6781,15 +6828,15 @@ cmd_daemon_status() {
     else
         warn "Log file not present or not configured: ${LOG_FILE:-<unset>}"
         info "  (launchd stderr/stdout logs may still exist at"
-        info "   ${LAUNCHD_STDERR_LOG:-/var/log/my-appleRAID.launchd.err}"
-        info "   ${LAUNCHD_STDOUT_LOG:-/var/log/my-appleRAID.launchd.out}"
+        info "   ${LAUNCHD_STDERR_LOG:-$LAUNCHD_STDERR_LOG_DEFAULT}"
+        info "   ${LAUNCHD_STDOUT_LOG:-$LAUNCHD_STDOUT_LOG_DEFAULT}"
         info "   - check those.)"
     fi
     echo
 
     # --- Check 6/8: launchd stderr (last errors) -------------------
     step "Check 6/8: Launchd stderr log"
-    err_log="${LAUNCHD_STDERR_LOG:-/var/log/my-appleRAID.launchd.err}"
+    err_log="${LAUNCHD_STDERR_LOG:-$LAUNCHD_STDERR_LOG_DEFAULT}"
     if [ -f "$err_log" ]; then
         sz=$(stat -f '%z' "$err_log" 2>/dev/null)
         if [ "${sz:-0}" = "0" ]; then
@@ -6855,8 +6902,8 @@ cmd_daemon_status() {
 
     step "Quick actions"
     cat <<EOF
-  Tail the log live:       tail -f ${LOG_FILE:-/var/log/my-appleRAID.log}
-  Tail launchd stderr:     tail -f ${LAUNCHD_STDERR_LOG:-/var/log/my-appleRAID.launchd.err}
+  Tail the log live:       tail -f ${LOG_FILE:-<stderr only>}
+  Tail launchd stderr:     tail -f ${LAUNCHD_STDERR_LOG:-$LAUNCHD_STDERR_LOG_DEFAULT}
   Force an immediate run:  sudo launchctl kickstart -k system/$label
   Reload the plist:        sudo $SCRIPT_NAME uninstall-daemon && sudo $SCRIPT_NAME install-daemon
   Full health overview:    $SCRIPT_NAME report
@@ -8323,7 +8370,7 @@ smart_dtype_store() {
     # Soft-fail in full: the cache is opportunistic. A non-root caller
     # of `smart` shouldn't die because STATE_DIR (0755 root) won't
     # accept their write — they'll just re-probe next time.
-    [ -n "${STATE_DIR:-}" ] || STATE_DIR="/var/db/my-appleRAID"
+    [ -n "${STATE_DIR:-}" ] || STATE_DIR="$STATE_DIR_DEFAULT"
     [ -d "$STATE_DIR" ] && [ -w "$STATE_DIR" ] || return 0
     f=$(smart_cache_file)
     if [ ! -f "$f" ]; then
@@ -9842,6 +9889,112 @@ t_problem_recorded_once() {
     done
 }
 
+# _ts_in <site file> <command...>: run a command against that site file, with
+# no env config and the sandbox HOME. Always called in a command
+# substitution, so nothing it sets outlives the check.
+_ts_in() {
+    SITE_CONF="$1"; shift
+    HOME="$_T/home"; MY_APPLERAID_CONFIG=""
+    "$@" 2>&1
+}
+_ts_bases()    { read_site; printf '%s|%s|%s|%s' "$DATA_BASE_DIR" "$LOG_BASE_DIR" "$CONFIG_SEARCH_DIR" "$CONFIG_OFFER_DIR"; }
+_ts_exported() { DATA_BASE_DIR=/elsewhere; export DATA_BASE_DIR; _ts_bases; }
+_ts_load()     { cfg_load; printf '%s|%s|%s|%s|%s' "$LOADED_CONFIG" "$LOG_LEVEL" "$STATE_DIR" "$LOG_FILE" "$LAUNCHD_STDERR_LOG"; }
+_ts_offer()    { read_site; config_offer "offer:"; }
+_ts_fallback() { read_site; echo "fell back to $DATA_BASE_DIR"; }
+_ts_template() {
+    read_site
+    rm -f "$_T/tpl.conf"
+    cmd_create_config "$_T/tpl.conf" > /dev/null 2>&1
+    STATE_DIR=""; LOG_FILE=""
+    # shellcheck disable=SC1091  # the template just written
+    . "$_T/tpl.conf"
+    printf '%s|%s' "$STATE_DIR" "$LOG_FILE"
+}
+
+# The site file: its values when it is there, the neutral ones when it is
+# not -- an exported variable never in their place -- an error when it is
+# there but unreadable; the search reads its directory first, .conf before
+# the bare name; STATE_DIR and the logs lie under its bases, in the built-in
+# defaults and in the template create-config writes; the offer names its
+# offer directory with the note, never the farm.
+# shellcheck disable=SC2016  # the sh -c scripts expand $1.. in the child, by design
+t_site_conf_gives_the_bases_the_search_and_the_offer() {
+    echo " >>> the site file: bases, search, offer"
+    _ts_got=$(_ts_in "$_T/no-site.conf" _ts_exported)
+    _t_check "without the file: /var/db, /var/log, nothing searched or offered ['$_ts_got']" \
+        [ "$_ts_got" = "/var/db|/var/log||" ]
+
+    [ -d "$_T/farm" ] || mkdir "$_T/farm"
+    printf '%s\n' 'DATA_BASE_DIR="/srv/data"' 'LOG_BASE_DIR="/srv/log"' "CONFIG_SEARCH_DIR=\"$_T/farm\"" \
+        "CONFIG_OFFER_DIR=\"$_T/global\"" 'CONFIG_OFFER_NOTE="linked there by a run"' > "$_T/site.conf"
+    rm -f "$_T/farm/my-appleRAID.conf"
+    printf 'LOG_LEVEL=warn\n' > "$_T/farm/my-appleRAID"
+    _ts_got=$(_ts_in "$_T/site.conf" _ts_load)
+    _t_check "with the file: the bare name in its search dir, state and logs under its bases ['$_ts_got']" \
+        [ "$_ts_got" = "$_T/farm/my-appleRAID|warn|/srv/data/my-appleRAID|/srv/log/my-appleRAID.log|/srv/log/my-appleRAID.launchd.err" ]
+    printf 'LOG_LEVEL=debug\n' > "$_T/farm/my-appleRAID.conf"
+    _ts_got=$(_ts_in "$_T/site.conf" _ts_load)
+    _t_check "my-appleRAID.conf before the bare name ['${_ts_got%%|*}']" \
+        [ "${_ts_got%%|*}" = "$_T/farm/my-appleRAID.conf" ]
+
+    _ts_got=$(_ts_in "$_T/site.conf" _ts_template)
+    _t_check "the create-config template puts state and log under the bases ['$_ts_got']" \
+        [ "$_ts_got" = "/srv/data/my-appleRAID|/srv/log/my-appleRAID.log" ]
+
+    _ts_got=$(_ts_in "$_T/site.conf" _ts_offer)
+    _t_check "the offer names the offer dir with its note, then /etc" \
+        sh -c 'printf "%s\n" "$1" | grep -qxF "    > $3 create-config $2/global/my-appleRAID.conf   (linked there by a run)" &&
+               printf "%s\n" "$1" | grep -qxF "    > $3 create-config /etc/my-appleRAID.conf"' _ "$_ts_got" "$_T" "$SCRIPT_NAME"
+    _t_check "the offer never names the farm" \
+        sh -c '! printf "%s\n" "$1" | grep -qF "$2/farm/"' _ "$_ts_got" "$_T"
+
+    if [ "$(id -u)" -eq 0 ]; then
+        _t_ok "unreadable site file: not testable as root (root reads mode 000)"
+    else
+        chmod 000 "$_T/site.conf"
+        _ts_got=$(_ts_in "$_T/site.conf" _ts_fallback); _ts_rc=$?
+        chmod 600 "$_T/site.conf"
+        _t_check "unreadable site file: ERROR 039, no fallback [rc $_ts_rc]" \
+            sh -c '[ "$1" -ne 0 ] && printf "%s\n" "$2" | grep -q "ERROR 039" && ! printf "%s\n" "$2" | grep -q "fell back"' _ "$_ts_rc" "$_ts_got"
+    fi
+}
+
+# _to_unsearched <case>: the offered paths the search does not read (or the
+# farm), each with a mark; nothing when the offer is honest.
+_to_unsearched() {
+    read_site
+    config_offer_paths > "$_T/offer"
+    while IFS= read -r _o; do
+        case "$_o" in
+            "$_T/farm/"*) printf ' %s(the farm)' "$_o" ;;
+            "$_T/global/my-appleRAID.conf") config_search_paths | grep -qx "$_T/farm/my-appleRAID.conf" || printf ' %s' "$_o" ;;
+            *) config_search_paths | grep -qx "$_o" || printf ' %s' "$_o" ;;
+        esac
+    done < "$_T/offer"
+    [ "$1" != site ] || grep -qx "$_T/global/my-appleRAID.conf" "$_T/offer" || printf ' (%s: site offer missing)' "$1"
+    [ -s "$_T/offer" ] || printf ' (%s: nothing offered)' "$1"
+}
+
+# Every offered path is searched, or is the site's offer directory while the
+# site's search directory is searched; the search directory itself, a farm,
+# is never offered.
+t_config_offer_names_only_searched_paths() {
+    echo " >>> the config offer names only searched paths"
+    _to_bad=""
+    for _to_with in site offer-only none; do
+        case "$_to_with" in
+            site) printf '%s\n' "CONFIG_SEARCH_DIR=\"$_T/farm\"" "CONFIG_OFFER_DIR=\"$_T/global\"" > "$_T/site.conf" ;;
+            # an offer directory with no search directory: a file written
+            # there would be read from nowhere, so it is not offered
+            offer-only) printf '%s\n' "CONFIG_OFFER_DIR=\"$_T/global\"" > "$_T/site.conf" ;;
+            none) rm -f "$_T/site.conf" ;;
+        esac
+        _to_bad="$_to_bad$(_ts_in "$_T/site.conf" _to_unsearched "$_to_with")"
+    done
+    _t_check "offered but not searched:${_to_bad:- none}" [ -z "$_to_bad" ]
+}
+
 cmd_run_tests() {
     _T_SELF=$(cd "$(dirname "$0")" 2>/dev/null && pwd)/$(basename "$0")
     [ -x "$_T_SELF" ] || die "run-tests: cannot locate self at $_T_SELF"
@@ -9863,14 +10016,16 @@ exit 0
 STUB_EOF
     chmod 755 "$_T/stub-sender" || die "run-tests: chmod of stub failed"
 
-    t_test_mail
-    t_install_daemon_program
-    t_install_daemon_comment
-    t_daemon_needs_root
-    t_err_calls_name_a_code
-    t_problem_recorded_once
+    # Every test, in order; a FILTER runs those whose name holds it.
+    _rt_ran=0
+    for _rt_t in t_test_mail t_install_daemon_program t_install_daemon_comment \
+                 t_daemon_needs_root t_err_calls_name_a_code t_problem_recorded_once \
+                 t_site_conf_gives_the_bases_the_search_and_the_offer t_config_offer_names_only_searched_paths; do
+        case "$_rt_t" in *"${1:-}"*) "$_rt_t"; _rt_ran=$((_rt_ran + 1)) ;; esac
+    done
+    [ "$_rt_ran" -gt 0 ] || _t_fail "no test name holds '${1:-}'"
 
-    printf '\n%s: %d passed, %d failed\n' "$SCRIPT_NAME run-tests" "$_T_PASS" "$_T_FAIL"
+    printf '\n%s: %d passed, %d failed [%d test(s)]\n' "$SCRIPT_NAME run-tests" "$_T_PASS" "$_T_FAIL" "$_rt_ran"
     [ "$_T_FAIL" -eq 0 ]
 }
 
@@ -10160,11 +10315,15 @@ ${C_BOLD}COMMANDS${C_RESET}
 ${C_BOLD}CONFIG FILE SEARCH PATH${C_RESET}
   First readable file wins:
     \$MY_APPLERAID_CONFIG              (env var, for testing)
-    /LINKS/default/my-appleRAID.conf
+    \$CONFIG_SEARCH_DIR/my-appleRAID.conf, then \$CONFIG_SEARCH_DIR/my-appleRAID
     ~/.my-appleRAID.conf
     /usr/local/etc/my-appleRAID.conf
     /etc/my-appleRAID.conf
   If none found, built-in defaults are used. 'show-config' will tell you.
+  $SITE_CONF, when there, is read first: the site's
+  CONFIG_SEARCH_DIR, and DATA_BASE_DIR / LOG_BASE_DIR, under which
+  STATE_DIR and the logs lie by default (/var/db, /var/log without the
+  file). There but unreadable: an error.
 
 ${C_BOLD}VERBOSE BY DESIGN${C_RESET}
   Every state-changing command is echoed (with a leading '\$') right
@@ -10201,7 +10360,7 @@ ${C_BOLD}EXAMPLES${C_RESET}
   # 4. Install the LaunchDaemon (runs every 60s as root)
   sudo ${SCRIPT_NAME} install-daemon
   # 5. Tail the log
-  tail -f /var/log/my-appleRAID.log
+  tail -f <LOG_FILE>                       # its path: show-config
 
 ${C_BOLD}SAFETY NOTES${C_RESET}
   - Commands that change disks, RAID sets or the LaunchDaemon need
@@ -13684,7 +13843,8 @@ main() {
             exit $?
             ;;
         run-tests)
-            cmd_run_tests
+            shift
+            cmd_run_tests "$@"
             exit $?
             ;;
     esac
