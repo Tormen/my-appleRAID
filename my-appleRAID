@@ -17,7 +17,7 @@
 #     with launchd. Polls RAID set state every minute (cheap) and runs
 #     SMART checks once per day (cheap on power / spin-up wear).
 #   - On problems: plays an audible alarm (configurable volume strategy),
-#     logs, and sends rate-limited email via msmtp.
+#     logs, and sends rate-limited email via a sendmail-compatible sender.
 #   - State-change aware: only re-alarms/re-emails on configurable intervals
 #     so a failed drive doesn't produce 1440 emails per day.
 #   - Self-tests: schedulable SMART short/long self-tests via smartctl -t.
@@ -93,18 +93,18 @@ SCRIPT_NAME="$(basename "$0")"
 # subcommand updates SCRIPT_COMMIT to the current HEAD sha and
 # amends - run it as the last step before deploying.
 SCRIPT_VERSION="v8.2"
-SCRIPT_COMMIT="86eaf2e"
+SCRIPT_COMMIT="266aa92"
 # What git said when this build was stamped: 'git describe --tags --long' --
 # <nearest tag>-<commits since it>-g<short sha>. It says whether these bytes
 # ARE that release or work on top of it, on a machine with no git.
-SCRIPT_RELEASE="v8.2-19-g86eaf2e"
+SCRIPT_RELEASE="v8.2-21-g266aa92"
 SCRIPT_COPYRIGHT="Copyright (C) 2026 Tormen <tormen@mail.ch>"
 SCRIPT_LICENSE_SHORT="GPL-3.0-or-later (copyleft)"
 SCRIPT_LICENSE_URL="https://www.gnu.org/licenses/gpl-3.0.html"
 
 # Augment PATH for the launchd context.
 # launchd starts daemons with a minimal PATH (/usr/bin:/bin:/usr/sbin:/sbin)
-# that excludes both Homebrew prefixes - which means smartctl, msmtp,
+# that excludes both Homebrew prefixes - which means smartctl, a mail sender,
 # and any other Homebrew-installed tool would be invisible to the
 # health daemon even when present on the box. Append both Homebrew
 # bin dirs (no-op when already in PATH or when the dir doesn't exist).
@@ -1097,7 +1097,7 @@ cfg_set_defaults() {
     # Email
     EMAIL_TO=""                            # empty disables email
     EMAIL_FROM="my-appleRAID@$(hostname)"
-    EMAIL_SENDER="msmtp"                   # bare name; resolved via PATH (which
+    EMAIL_SENDER="sendmail"                # bare name; resolved via PATH (which
                                            # the top-of-script PATH block extends to
                                            # include Homebrew prefixes). Override with
                                            # an absolute path if you prefer.
@@ -2292,7 +2292,7 @@ alert_email() {
     [ -n "${EMAIL_SENDER:-}" ] || { log_debug "Email disabled (no EMAIL_SENDER)"; return 0; }
 
     # Resolve the sender. Accept either an absolute path or a bare name
-    # (e.g. "msmtp"); for the latter we look it up via PATH, which now
+    # (e.g. "sendmail"); for the latter we look it up via PATH, which now
     # includes both Homebrew prefixes (see top-of-script PATH block).
     case "$EMAIL_SENDER" in
         /*) sender_exec="$EMAIL_SENDER" ;;
@@ -2304,7 +2304,7 @@ alert_email() {
         return 1
     fi
 
-    _stderr_tmp=$(mktemp "${TMPDIR:-/tmp}/my-appleRAID.msmtp-err.XXXXXX" 2>/dev/null) \
+    _stderr_tmp=$(mktemp "${TMPDIR:-/tmp}/my-appleRAID.sender-err.XXXXXX" 2>/dev/null) \
         || _stderr_tmp=""
     {
         printf 'From: %s\n' "${EMAIL_FROM}"
@@ -2332,7 +2332,7 @@ alert_email() {
 
 # Emit a loud, multi-line failure block. Goes to stderr (always visible
 # on interactive runs) AND to the log via log_warn. Includes the actual
-# sender stderr and a Possible-reasons checklist tuned for msmtp.
+# sender stderr and a Possible-reasons checklist.
 # Args: subject, sender_exec, sender_stderr, exit_code, override_reason
 _alert_email_fail() {
     _sub="$1"; _exec="$2"; _err="$3"; _rc="$4"; _override="$5"
@@ -2358,13 +2358,13 @@ _alert_email_fail() {
         printf '        the SMTP account auths as user X but the From: address\n' >&2
         printf '        is Y, and the relay enforces sender == auth identity.\n' >&2
         printf '        Set EMAIL_FROM to the exact address that owns the SMTP login.\n' >&2
-        printf '    - ~/.msmtprc / /etc/msmtprc missing or unreadable by the\n' >&2
-        printf '        invoking uid (daemon runs as root; check root has its own\n' >&2
-        printf '        /var/root/.msmtprc or set a system-wide one).\n' >&2
+        printf '    - the sender is not set up to deliver: no local MTA behind\n' >&2
+        printf '        sendmail, or an SMTP client whose account file is missing or\n' >&2
+        printf '        unreadable by the invoking uid (the daemon runs as root).\n' >&2
         printf '    - Wrong password / expired app-password / 2FA / SPF / DMARC.\n' >&2
         printf '    - Network egress on port 465/587 blocked or relay unreachable.\n' >&2
-        printf '\n  Verify directly (will print the actual SMTP dialog):\n' >&2
-        printf '      echo "test body" | %s --debug -t <<EOF\n' "${_exec:-msmtp}" >&2
+        printf '\n  Verify directly:\n' >&2
+        printf '      %s -t <<EOF\n' "${_exec:-sendmail}" >&2
         printf '      From: %s\n'       "${EMAIL_FROM:-you@example.com}" >&2
         printf '      To: %s\n'         "${EMAIL_TO:-you@example.com}" >&2
         printf '      Subject: test\n\n'                              >&2
@@ -4655,18 +4655,18 @@ EMAIL_TO=""
 # Default below is a placeholder that will be rejected by every relay.
 EMAIL_FROM="my-appleRAID@localhost"
 
-# Path to (or bare name of) a sendmail-compatible sender. msmtp is
-# recommended:
-#   brew install msmtp
-# Configure ~/.msmtprc with a working SMTP account before email will
-# leave the host.
+# Path to (or bare name of) a sendmail-compatible sender: it gets the
+# mail on stdin, the recipient as its argument. The default is the
+# system's sendmail, which hands the mail to the local MTA (postfix on
+# macOS); an SMTP client with a sendmail interface works as well, once
+# its account is set up for the user the daemon runs as (root).
 #
 # A bare name (default below) is resolved via PATH; my-appleRAID's
 # top-of-script block extends PATH to include /opt/homebrew/bin and
 # /usr/local/bin so this works in the launchd daemon context too. Set
 # to an absolute path here if you have multiple sender binaries and
 # want to pin one explicitly.
-EMAIL_SENDER="msmtp"
+EMAIL_SENDER="sendmail"
 
 # Minimum time between emails for the SAME ongoing problem.
 # Accepts duration suffixes (see top of file): 60, 60s, 5m, 2h, 1d, 1w.
@@ -4677,7 +4677,7 @@ EMAIL_INTERVAL=4h
 #
 # A misconfigured EMAIL_FROM, expired app-password, or relay outage can
 # break the email channel silently — the daemon thinks it sent, but
-# msmtp's stderr was being thrown away. Nothing arrives, and you only
+# the sender's stderr was being thrown away. Nothing arrives, and you only
 # notice months later when a real alert also doesn't arrive.
 #
 # The heartbeat is a short "everything is fine, channel is alive"
@@ -5169,8 +5169,7 @@ EOF
     info "Edit $path and set at minimum:"
     info "  EMAIL_TO       = \"you@example.com\"           # recipient (currently empty -> email off)"
     info "  EMAIL_FROM     = \"my-appleRAID@yourhost\"     # must match what your SMTP relay allows"
-    info "  EMAIL_SENDER   = \"msmtp\"                     # default; needs 'brew install msmtp'"
-    info "                                                # + ~/.msmtprc with a working SMTP account"
+    info "  EMAIL_SENDER   = \"sendmail\"                  # default: the local MTA must deliver"
     echo
     info "Then verify with: $SCRIPT_NAME show-config"
     info "And test with:    $SCRIPT_NAME test-alerts"
@@ -9933,6 +9932,24 @@ _ts_template() {
     printf '%s|%s' "$STATE_DIR" "$LOG_FILE"
 }
 
+# The mail sender's default, built in and in the create-config template:
+# sendmail (msmtp is retired here, and sendmail is the neutral choice).
+_ts_sender() {
+    cfg_load > /dev/null 2>&1; _ts_d=$EMAIL_SENDER
+    rm -f "$_T/tpl.conf"
+    cmd_create_config "$_T/tpl.conf" > /dev/null 2>&1
+    EMAIL_SENDER=""
+    # shellcheck disable=SC1091  # the template just written
+    . "$_T/tpl.conf"
+    printf '%s|%s' "$_ts_d" "$EMAIL_SENDER"
+}
+t_default_sender_is_sendmail() {
+    echo " >>> the mail sender's default"
+    _ts_got=$(_ts_in "$_T/no-site.conf" _ts_sender)
+    _t_check "EMAIL_SENDER defaults to sendmail, built in and in the template ['$_ts_got']" \
+        [ "$_ts_got" = "sendmail|sendmail" ]
+}
+
 # The site file: its values when it is there, the neutral ones when it is
 # not -- an exported variable never in their place -- an error when it is
 # there but unreadable; the search reads its directory first, .conf before
@@ -10067,7 +10084,7 @@ STUB_EOF
     for _rt_t in t_test_mail t_install_daemon_program t_install_daemon_comment \
                  t_daemon_needs_root t_err_calls_name_a_code t_problem_recorded_once \
                  t_site_conf_gives_the_bases_the_search_and_the_offer t_site_conf_cannot_tell_is_an_error \
-                 t_config_offer_names_only_searched_paths; do
+                 t_config_offer_names_only_searched_paths t_default_sender_is_sendmail; do
         case "$_rt_t" in *"${1:-}"*) "$_rt_t"; _rt_ran=$((_rt_ran + 1)) ;; esac
     done
     [ "$_rt_ran" -gt 0 ] || _t_fail "no test name holds '${1:-}'"
