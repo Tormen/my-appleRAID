@@ -93,11 +93,11 @@ SCRIPT_NAME="$(basename "$0")"
 # subcommand updates SCRIPT_COMMIT to the current HEAD sha and
 # amends - run it as the last step before deploying.
 SCRIPT_VERSION="v8.2"
-SCRIPT_COMMIT="266aa92"
+SCRIPT_COMMIT="a4574b0"
 # What git said when this build was stamped: 'git describe --tags --long' --
 # <nearest tag>-<commits since it>-g<short sha>. It says whether these bytes
 # ARE that release or work on top of it, on a machine with no git.
-SCRIPT_RELEASE="v8.2-21-g266aa92"
+SCRIPT_RELEASE="v8.2-22-ga4574b0"
 SCRIPT_COPYRIGHT="Copyright (C) 2026 Tormen <tormen@mail.ch>"
 SCRIPT_LICENSE_SHORT="GPL-3.0-or-later (copyleft)"
 SCRIPT_LICENSE_URL="https://www.gnu.org/licenses/gpl-3.0.html"
@@ -1135,19 +1135,16 @@ cfg_set_defaults() {
 LOADED_CONFIG=""
 
 # sh: 0 not there, 1 there ([ -r ] it: unreadable is the error), 2 cannot tell
+# Judged by the system's own answer, never by mode bits: macOS can refuse a
+# look the bits allow (TCC). On 2, _sa_m says why, for the error message.
 site_absent() {
-	_sa_p=$1
-	[ -e "$_sa_p" ] && return 1
-	[ -L "$_sa_p" ] && return 2
-	while :; do
-		_sa_d=$(dirname -- "$_sa_p")
-		[ "$_sa_d" = "$_sa_p" ] && return 0
-		if [ -e "$_sa_d" ] || [ -L "$_sa_d" ]; then
-			[ -d "$_sa_d" ] && [ -x "$_sa_d" ] && return 0
-			return 2
-		fi
-		_sa_p=$_sa_d
-	done
+	[ -e "$1" ] && return 1
+	_sa_m=$(LC_ALL=C ls -d -- "$1" 2>&1 > /dev/null)
+	case $_sa_m in *": No such file or directory") return 0 ;; esac
+	if [ -n "$_sa_m" ]; then _sa_m="the system says: ${_sa_m##*: }"
+	elif [ -L "$1" ]; then _sa_m="a link to nothing"
+	else _sa_m="listed, but it cannot be looked at"; fi
+	return 2
 }
 
 # The site's values for every tool, from SITE_CONF -- the one site path this
@@ -1163,7 +1160,7 @@ read_site() {
     [ "$_rs_absent" -eq 0 ] && return 0
     # there but unreadable, or cannot tell: an error, never the neutral
     # values -- they would keep this user's view of the state apart from the daemon's
-    [ "$_rs_absent" -eq 1 ] || err 041 "cannot tell whether '$SITE_CONF' is there -- a link to nothing, or a folder on the way it cannot search; its group must include $(id -un)"
+    [ "$_rs_absent" -eq 1 ] || err 041 "cannot tell whether '$SITE_CONF' is there -- $_sa_m; its group must include $(id -un)"
     [ -r "$SITE_CONF" ] || err 039 "cannot read '$SITE_CONF' -- the site's directories for every tool; its group must include $(id -un)"
     # shellcheck disable=SC1090  # the site file's path is a variable (tests point it elsewhere)
     . "$SITE_CONF" || err 040 "'$SITE_CONF' failed to load"
@@ -10023,6 +10020,21 @@ t_site_conf_cannot_tell_is_an_error() {
         sh -c '[ "$1" -ne 0 ] && printf "%s\n" "$2" | grep -q "ERROR 041" && ! printf "%s\n" "$2" | grep -q "fell back"' _ "$_ts_rc" "$_ts_got"
 }
 
+# A look the system refuses although the mode bits allow it (macOS TCC):
+# ERROR 041 naming the system's answer, no fallback. ls stands in for the
+# kernel's answer.
+t_site_conf_refused_by_the_system_is_an_error_whatever_the_mode_bits() {
+    echo " >>> the site file: a look the system refuses is an error, whatever the mode bits"
+    [ -d "$_T/refused" ] || mkdir "$_T/refused"
+    [ -d "$_T/fakebin" ] || mkdir "$_T/fakebin"
+    # shellcheck disable=SC2016  # $3 belongs to the fake ls, expanded when it runs
+    printf '#!/bin/dash\necho "ls: $3: Operation not permitted" >&2\nexit 1\n' > "$_T/fakebin/ls"; chmod 755 "$_T/fakebin/ls"
+    _ts_got=$(PATH="$_T/fakebin:/usr/bin:/bin" _ts_in "$_T/refused/site.conf" _ts_fallback); _ts_rc=$?
+    # shellcheck disable=SC2016  # $1 and $2 belong to the sh -c, expanded when it runs
+    _t_check "refused by the system: ERROR 041 naming its answer, no fallback [rc $_ts_rc]" \
+        sh -c '[ "$1" -ne 0 ] && printf "%s\n" "$2" | grep -q "ERROR 041.*is there -- the system says: Operation not permitted" && ! printf "%s\n" "$2" | grep -q "fell back"' _ "$_ts_rc" "$_ts_got"
+}
+
 # _to_unsearched <case>: the offered paths the search does not read (or the
 # farm), each with a mark; nothing when the offer is honest.
 _to_unsearched() {
@@ -10083,7 +10095,7 @@ STUB_EOF
     _rt_ran=0
     for _rt_t in t_test_mail t_install_daemon_program t_install_daemon_comment \
                  t_daemon_needs_root t_err_calls_name_a_code t_problem_recorded_once \
-                 t_site_conf_gives_the_bases_the_search_and_the_offer t_site_conf_cannot_tell_is_an_error \
+                 t_site_conf_gives_the_bases_the_search_and_the_offer t_site_conf_cannot_tell_is_an_error t_site_conf_refused_by_the_system_is_an_error_whatever_the_mode_bits \
                  t_config_offer_names_only_searched_paths t_default_sender_is_sendmail; do
         case "$_rt_t" in *"${1:-}"*) "$_rt_t"; _rt_ran=$((_rt_ran + 1)) ;; esac
     done
