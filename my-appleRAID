@@ -6137,8 +6137,8 @@ cmd_baseline_optsets() {
     # the menu loop, which then tries to awk a vanished file. Common
     # path: user Ctrl+C-s out of an interactive child (bash readline,
     # confirm, etc.) - the SIGINT hits both the child and us.
-    trap 'rm -f "$_wf" "$_cache"' EXIT
-    trap 'rm -f "$_wf" "$_cache"; trap - EXIT; exit 130' INT TERM
+    trap '_optsets_keys_raw off; rm -f "$_wf" "$_cache"' EXIT
+    trap '_optsets_keys_raw off; rm -f "$_wf" "$_cache"; trap - EXIT; exit 130' INT TERM
 
     # Seed the work file from the current OPTIONAL_DISK_SETS value.
     optional_sets_iter > "$_wf" 2>/dev/null || true
@@ -6216,26 +6216,145 @@ _optsets_prompt() {
     _ANS=$(printf '%s' "$_ANS" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
 }
 
-# Prompt with a numbered candidate list (helps avoid typos and
-# duplicate names by letting the user pick an existing entry by
-# number rather than retyping it).
+_K_NL='
+'
+_K_CR=$(printf '\r')
+_K_TAB=$(printf '\t')
+_K_ESC=$(printf '\033')
+_K_DEL=$(printf '\177')
+_K_BS=$(printf '\b')
+_K_EOT=$(printf '\004')
+_K_WAS=""
+
+# Put stdin into unbuffered, unechoed single-key mode (no-op when not a TTY).
+_optsets_keys_raw() {
+    [ -t 0 ] || return 0
+    if [ "${1:-}" = "on" ]; then
+        _K_WAS=$(stty -g) && stty -icanon -echo min 1
+    elif [ -n "${_K_WAS:-}" ]; then
+        stty "$_K_WAS"
+        _K_WAS=""
+    fi
+}
+
+# Read one key from stdin into _KEY: enter, tab, space, bs, up, down, other,
+# or the character itself. Returns 1 on EOF or Ctrl-D.
+_optsets_key_read() {
+    _kb=$(dd bs=1 count=1 2>/dev/null; echo .)
+    _kb=${_kb%.}   # trailing dot keeps a trailing newline that $(...) strips
+    case $_kb in
+        ""|"$_K_EOT")        _KEY=""; return 1 ;;
+        "$_K_NL"|"$_K_CR")   _KEY=enter ;;
+        "$_K_TAB")           _KEY=tab ;;
+        " ")                 _KEY=space ;;
+        "$_K_DEL"|"$_K_BS")  _KEY=bs ;;
+        "$_K_ESC")
+            case $(dd bs=1 count=2 2>/dev/null) in
+                "[A") _KEY=up ;;
+                "[B") _KEY=down ;;
+                *)    _KEY=other ;;
+            esac ;;
+        *)                   _KEY=$_kb ;;
+    esac
+}
+
+# Read a line into _ANS with shell-like Tab completion over $2... candidates:
+# one Tab extends to the longest common prefix of matching candidates; a
+# single Tab with nothing to add beeps; a second consecutive Tab with nothing
+# more to extend lists up to 20 matches ("... N more") and redraws the line.
+# Returns 1 on EOF or Ctrl-D.
+_optsets_line_edit() {
+    _le_prompt="$1"; shift
+    _le_pstr=$(printf '%s%s%s ' "${C_YELLOW}" "$_le_prompt" "${C_RESET}")
+    _ANS=""
+    _le_tabs=0
+    printf '%s' "$_le_pstr"
+    _optsets_keys_raw on
+    while _optsets_key_read || { _optsets_keys_raw off; printf '\n'; _ANS=""; return 1; }; do
+        case $_KEY in
+            enter) break ;;
+            bs)
+                if [ -n "$_ANS" ]; then
+                    _ANS=${_ANS%?}
+                    printf '\b \b'
+                fi
+                _le_tabs=0
+                ;;
+            tab)
+                _le_n=0
+                _le_cm=""
+                if [ "$#" -gt 0 ]; then
+                    # shellcheck disable=SC2016  # single-quoted awk program
+                    _le_res=$(printf '%s\n' "$@" | _OPTSETS_P="$_ANS" awk '
+                        BEGIN { p = ENVIRON["_OPTSETS_P"]; lp = length(p); n = 0 }
+                        length($0) > 0 && substr($0, 1, lp) == p { m[++n] = $0 }
+                        END {
+                            if (n == 0) { print "0:"; exit }
+                            c = m[1]
+                            for (i = 2; i <= n; i++) {
+                                while (length(c) > lp && substr(m[i], 1, length(c)) != c)
+                                    c = substr(c, 1, length(c) - 1)
+                            }
+                            printf "%d:%s\n", n, c
+                        }') || _le_res="0:"
+                    _le_n=${_le_res%%:*}
+                    _le_cm=${_le_res#*:}
+                fi
+                if [ "$_le_n" -gt 0 ] && [ "${#_le_cm}" -gt "${#_ANS}" ]; then
+                    printf '%s' "${_le_cm#"$_ANS"}"
+                    _ANS=$_le_cm
+                    _le_tabs=0
+                elif [ "$_le_n" -gt 1 ] && [ "$_le_tabs" -ge 1 ]; then
+                    printf '\n'
+                    # shellcheck disable=SC2016  # single-quoted awk program
+                    printf '%s\n' "$@" | _OPTSETS_P="$_ANS" awk '
+                        BEGIN { p = ENVIRON["_OPTSETS_P"]; lp = length(p); n = 0 }
+                        length($0) > 0 && substr($0, 1, lp) == p {
+                            n++
+                            if (n <= 20) printf "  %s\n", $0
+                        }
+                        END { if (n > 20) printf "  ... %d more\n", n - 20 }'
+                    printf '%s%s' "$_le_pstr" "$_ANS"
+                    _le_tabs=0
+                else
+                    printf '\a'
+                    if [ "$_le_n" -gt 1 ]; then
+                        _le_tabs=$((_le_tabs + 1))
+                    else
+                        _le_tabs=0
+                    fi
+                fi
+                ;;
+            space)
+                _ANS="$_ANS "
+                printf ' '
+                _le_tabs=0
+                ;;
+            up|down|other)
+                _le_tabs=0
+                ;;
+            *)
+                _ANS="$_ANS$_KEY"
+                printf '%s' "$_KEY"
+                _le_tabs=0
+                ;;
+        esac
+    done
+    _optsets_keys_raw off
+    printf '\n'
+    return 0
+}
+
+# Prompt with a numbered candidate list AND shell-like Tab completion:
 # $1 = prompt; $2... = candidate strings.
 # Sets _ANS to the resolved value (or blank if nothing entered):
 # - a numeric input picks the corresponding candidate
+# - Tab completes over existing candidates (Tab-Tab lists them)
 # - any other input is returned verbatim (intended for "new" names)
-#
-# Why a numbered list rather than readline TAB completion: dash's
-# built-in `read` has no readline. We previously delegated to a
-# `bash -i -c` subshell with TAB bound to dynamic-complete-history,
-# but `bash -i` inside $(...) cannot reliably take over the user's
-# controlling terminal for input on macOS - the subshell would hang
-# silently with no echo. A numbered list works in pure dash and is
-# arguably clearer anyway: the user sees every existing name AND
-# can pick by single digit.
 _optsets_prompt_completing() {
     _prompt="$1"; shift
     if [ "$#" -gt 0 ]; then
-        info "Existing names (pick by number, or type a new name):"
+        info "Existing names (pick by number, or type a name -- Tab completes):"
         _i=0
         for _c in "$@"; do
             [ -n "$_c" ] || continue
@@ -6243,7 +6362,11 @@ _optsets_prompt_completing() {
             printf '  %2d) %s\n' "$_i" "$_c"
         done
     fi
-    _optsets_prompt "$_prompt"
+    if ! _optsets_line_edit "$_prompt" "$@"; then
+        _ANS=""
+        return 1
+    fi
+    _ANS=$(printf '%s' "$_ANS" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
     case "$_ANS" in
         '') return 0 ;;
         [0-9]*)
@@ -10070,6 +10193,188 @@ t_config_offer_names_only_searched_paths() {
     _t_check "offered but not searched:${_to_bad:- none}" [ -z "$_to_bad" ]
 }
 
+# Shell-like Tab completion in _optsets_prompt_completing on a real pty:
+# one Tab extends to the longest common prefix (no list); a single Tab with
+# nothing to add only beeps; a second consecutive Tab lists matching candidates
+# (capped at 20 + "... N more") and redraws the prompt; numbered picks and free
+# new names still work; raw terminal mode is restored on exit and Ctrl-C.
+t_optsets_prompt_tab() {
+    echo " >>> optsets prompt: shell-like Tab completion on a pty"
+    sed '/^install_zsh_completions$/,$d' "$_T_SELF" > "$_T/optsets_lib.sh"
+    cat > "$_T/pty_tab.py" <<'PY_EOF'
+import fcntl
+import os
+import pty
+import select
+import sys
+import termios
+import time
+
+lib = sys.argv[1]
+
+def spawn_prompt(candidates, script_tail=None):
+    master, slave = pty.openpty()
+    before = termios.tcgetattr(master)[3]
+    pid = os.fork()
+    if pid == 0:
+        os.close(master)
+        os.setsid()
+        fcntl.ioctl(slave, termios.TIOCSCTTY, 0)
+        for fd in (0, 1, 2):
+            os.dup2(slave, fd)
+        if slave > 2:
+            os.close(slave)
+        body = (
+            'trap \'_optsets_keys_raw off; exit 130\' INT TERM; '
+            '. "$1"; shift; '
+            '_optsets_prompt_completing "Pick:" "$@"; '
+            'printf "\\n__ANS=%s__\\n" "$_ANS"'
+        ) if script_tail is None else script_tail
+        os.execvp("/bin/dash", ["/bin/dash", "-c", body, "_", lib, *candidates])
+        os._exit(127)
+    os.close(slave)
+    return pid, master, before
+
+def read_until(master, marker, timeout=5.0):
+    buf = bytearray()
+    end = time.monotonic() + timeout
+    while time.monotonic() < end:
+        r, _, _ = select.select([master], [], [], max(0.01, end - time.monotonic()))
+        if not r:
+            continue
+        try:
+            chunk = os.read(master, 4096)
+        except OSError:
+            break
+        if not chunk:
+            break
+        buf.extend(chunk)
+        if marker in buf:
+            return bytes(buf)
+    return bytes(buf)
+
+def read_idle(master, quiet=0.2, timeout=2.0):
+    buf = bytearray()
+    end = time.monotonic() + timeout
+    while time.monotonic() < end:
+        r, _, _ = select.select([master], [], [], quiet)
+        if not r:
+            break
+        try:
+            chunk = os.read(master, 4096)
+        except OSError:
+            break
+        if not chunk:
+            break
+        buf.extend(chunk)
+    return bytes(buf)
+
+def finish(pid, master):
+    out = bytearray()
+    end = time.monotonic() + 5.0
+    while time.monotonic() < end:
+        r, _, _ = select.select([master], [], [], max(0.01, end - time.monotonic()))
+        if r:
+            try:
+                chunk = os.read(master, 4096)
+            except OSError:
+                break
+            if not chunk:
+                break
+            out.extend(chunk)
+        else:
+            break
+    wpid = 0
+    status = 0
+    while time.monotonic() < end:
+        wpid, status = os.waitpid(pid, os.WNOHANG)
+        if wpid == pid:
+            break
+        time.sleep(0.01)
+    if wpid != pid:
+        os.kill(pid, 9)
+        _, status = os.waitpid(pid, 0)
+        rc = -1
+    else:
+        rc = os.waitstatus_to_exitcode(status)
+    after = termios.tcgetattr(master)[3]
+    os.close(master)
+    return rc, bytes(out), after
+
+def check(name, cond, detail=""):
+    if not cond:
+        print(f"FAIL: {name}: {detail}", file=sys.stderr)
+        sys.exit(1)
+
+# 1. One Tab extends to LCP ("Offsite"), no list shown
+pid, m, before = spawn_prompt(["OffsiteA", "OffsiteB", "WeeklyArchive"])
+init = read_until(m, b"Pick:\x1b[0m ")
+check("prompt shown", b"Pick:\x1b[0m " in init, repr(init))
+os.write(m, b"O\t")
+step1 = read_until(m, b"Offsite") + read_idle(m, quiet=0.1, timeout=0.3)
+check("one Tab extends to LCP", b"Offsite" in step1, repr(step1))
+check("one Tab does not list choices", b"  OffsiteA" not in step1 and b"  OffsiteB" not in step1, repr(step1))
+os.write(m, b"A\r")
+rc, tail, after = finish(pid, m)
+check("one Tab + A submits OffsiteA", rc == 0 and b"__ANS=OffsiteA__" in tail, repr((rc, tail)))
+check("tty restored after normal exit", (after & (termios.ICANON | termios.ECHO)) == (before & (termios.ICANON | termios.ECHO)))
+
+# 2. Single Tab with nothing to add only beeps; second consecutive Tab lists matches & redraws
+pid, m, before = spawn_prompt(["OffsiteA", "OffsiteB", "WeeklyArchive"])
+read_until(m, b"Pick:\x1b[0m ")
+os.write(m, b"Offsite\t")
+step1 = read_until(m, b"\x07") + read_idle(m, quiet=0.1, timeout=0.3)
+check("single Tab with nothing to add beeps", b"\x07" in step1, repr(step1))
+check("single Tab with nothing to add shows no list", b"  OffsiteA" not in step1 and b"  OffsiteB" not in step1, repr(step1))
+os.write(m, b"\t")
+step2 = read_until(m, b"Pick:\x1b[0m ") + read_idle(m, quiet=0.1, timeout=0.3)
+check("Tab-Tab lists matching choices", b"  OffsiteA" in step2 and b"  OffsiteB" in step2, repr(step2))
+check("Tab-Tab omits non-matching choices", b"WeeklyArchive" not in step2, repr(step2))
+check("Tab-Tab redraws prompt and typed prefix", b"Pick:\x1b[0m " in step2 and step2.rsplit(b"Pick:\x1b[0m ", 1)[1].endswith(b"Offsite"), repr(step2))
+os.write(m, b"B\r")
+rc, tail, _ = finish(pid, m)
+check("after Tab-Tab, typing B submits OffsiteB", rc == 0 and b"__ANS=OffsiteB__" in tail, repr((rc, tail)))
+
+# 3. Tab-Tab caps list at 20 + "... N more" and redraws
+many = [f"Set{i:02d}" for i in range(1, 24)]
+pid, m, _ = spawn_prompt(many)
+read_until(m, b"Pick:\x1b[0m ")
+os.write(m, b"Set\t\t")
+step = read_until(m, b"Pick:\x1b[0m ") + read_idle(m, quiet=0.15, timeout=0.4)
+check("cap shows Set01 and Set20", b"  Set01" in step and b"  Set20" in step, repr(step))
+check("cap omits Set21", b"  Set21" not in step, repr(step))
+check("cap shows ... 3 more", b"  ... 3 more" in step, repr(step))
+check("cap redraws prompt + Set", step.rsplit(b"Pick:\x1b[0m ", 1)[1].endswith(b"Set"), repr(step))
+os.write(m, b"05\r")
+rc, tail, _ = finish(pid, m)
+check("cap completion submits Set05", rc == 0 and b"__ANS=Set05__" in tail, repr((rc, tail)))
+
+# 4. Numbered choice, free new name, and backspace + Tab all work
+for typed, expected in [(b"2\r", b"__ANS=OffsiteB__"), (b"FreshSet\r", b"__ANS=FreshSet__"), (b"Ox\x7f\tA\r", b"__ANS=OffsiteA__")]:
+    pid, m, _ = spawn_prompt(["OffsiteA", "OffsiteB", "WeeklyArchive"])
+    read_until(m, b"Pick:\x1b[0m ")
+    os.write(m, typed)
+    rc, tail, _ = finish(pid, m)
+    check(f"input {typed!r}", rc == 0 and expected in tail, repr((rc, tail)))
+
+# 5. Ctrl-C restores raw terminal mode and exits 130
+pid, m, before = spawn_prompt(["OffsiteA", "OffsiteB"])
+read_until(m, b"Pick:\x1b[0m ")
+os.write(m, b"O")
+read_until(m, b"O")
+os.write(m, b"\x03")
+rc, tail, after = finish(pid, m)
+check("Ctrl-C exits 130", rc == 130, repr((rc, tail)))
+check("Ctrl-C restores tty", (after & (termios.ICANON | termios.ECHO)) == (before & (termios.ICANON | termios.ECHO)))
+PY_EOF
+    if python3 "$_T/pty_tab.py" "$_T/optsets_lib.sh" > "$_T/pty_out" 2> "$_T/pty_err"; then
+        _t_ok "pty Tab completion: LCP, single-Tab beep, Tab-Tab list + 20-cap + redraw, numbered pick, Ctrl-C tty restore"
+    else
+        _t_fail "pty Tab completion failed [rc $?]"
+        sed 's/^/        /' "$_T/pty_err"
+    fi
+}
+
 cmd_run_tests() {
     _T_SELF=$(cd "$(dirname "$0")" 2>/dev/null && pwd)/$(basename "$0")
     [ -x "$_T_SELF" ] || die "run-tests: cannot locate self at $_T_SELF"
@@ -10096,7 +10401,8 @@ STUB_EOF
     for _rt_t in t_test_mail t_install_daemon_program t_install_daemon_comment \
                  t_daemon_needs_root t_err_calls_name_a_code t_problem_recorded_once \
                  t_site_conf_gives_the_bases_the_search_and_the_offer t_site_conf_cannot_tell_is_an_error t_site_conf_refused_by_the_system_is_an_error_whatever_the_mode_bits \
-                 t_config_offer_names_only_searched_paths t_default_sender_is_sendmail; do
+                 t_config_offer_names_only_searched_paths t_default_sender_is_sendmail \
+                 t_optsets_prompt_tab; do
         case "$_rt_t" in *"${1:-}"*) "$_rt_t"; _rt_ran=$((_rt_ran + 1)) ;; esac
     done
     [ "$_rt_ran" -gt 0 ] || _t_fail "no test name holds '${1:-}'"
