@@ -1683,17 +1683,26 @@ baseline_write_sets() {
 # ----------------------------------------------------------------------
 _DISKID_CACHE_FILE=""
 
+# Create an ephemeral scratch file: under STATE_DIR when writable (so
+# root/daemon runs keep scratch out of /tmp and crashed ticks are swept),
+# else under $TMPDIR (for non-root read-only commands).
+_mktemp_scratch() {
+    if [ -n "${STATE_DIR:-}" ] && [ -d "${STATE_DIR}" ] && [ -w "${STATE_DIR}" ]; then
+        mktemp "${STATE_DIR}/.${1}.XXXXXX" 2>/dev/null
+    else
+        mktemp "${TMPDIR:-/tmp}/my-appleRAID.${1}.XXXXXX" 2>/dev/null
+    fi
+}
+
 # Build the cache for every currently-attached physical disk. Idempotent:
 # returns immediately if the cache already exists.
 # Writes one row per (bsd, tag) pair, in priority order; a disk with no
 # readable identifier gets a single bsd|__NONE__ row.
 #
-# Filename: per-process scratch in $TMPDIR (NOT $STATE_DIR — this is
-# ephemeral, cleared by the EXIT trap). Lives in tmp so non-root callers
-# of read-only commands (status, baseline, baseline --diff, report) can
-# prime it without needing write access to the canonical state dir.
-# Legacy mktemp-style leftovers from earlier versions that wrote inside
-# $STATE_DIR are best-effort swept here when STATE_DIR is writable.
+# Filename: ephemeral per-process scratch via _mktemp_scratch (inside
+# STATE_DIR when writable, else $TMPDIR), removed by _diskid_cache_clear.
+# Legacy leftovers from earlier versions are best-effort swept when
+# STATE_DIR is writable.
 _diskid_cache_init() {
     if [ -n "${_DISKID_CACHE_FILE:-}" ] && [ -f "$_DISKID_CACHE_FILE" ]; then
         return 0
@@ -1702,23 +1711,33 @@ _diskid_cache_init() {
     # Sweep legacy mktemp leftovers from prior versions (best-effort —
     # silent when $STATE_DIR isn't writable by us).
     if [ -n "${STATE_DIR:-}" ] && [ -w "${STATE_DIR}" ]; then
-        rm -f "$STATE_DIR"/.diskid-cache* 2>/dev/null || true
         rm -f "$STATE_DIR"/.diskid-disks.[A-Za-z0-9]* 2>/dev/null || true
         rm -f "$STATE_DIR"/.disk-for-id.[A-Za-z0-9]* 2>/dev/null || true
     fi
 
-    _DISKID_CACHE_FILE="${TMPDIR:-/tmp}/my-appleRAID.diskid-cache.$$"
-    _tmp="${_DISKID_CACHE_FILE}.tmp.$$"
+    _DISKID_CACHE_FILE=$(_mktemp_scratch diskid-cache) || {
+        _DISKID_CACHE_FILE=""
+        return 1
+    }
+    _tmp=$(mktemp "${_DISKID_CACHE_FILE}.tmp.XXXXXX" 2>/dev/null) || {
+        _diskid_cache_clear
+        return 1
+    }
     {
         printf '# diskid-cache | generated %s | pid %s\n' \
             "$(now_iso 2>/dev/null || date)" "$$"
     } > "$_tmp" 2>/dev/null || {
-        _DISKID_CACHE_FILE=""
+        rm -f "$_tmp"
+        _diskid_cache_clear
         return 1
     }
     # list_all_physical_disks via tmpfile so the loop runs in the parent
     # shell (avoids the cmd|while subshell trap when we accumulate state).
-    _tmp_disks="${_DISKID_CACHE_FILE}.disks.$$"
+    _tmp_disks=$(mktemp "${_DISKID_CACHE_FILE}.disks.XXXXXX" 2>/dev/null) || {
+        rm -f "$_tmp"
+        _diskid_cache_clear
+        return 1
+    }
     list_all_physical_disks > "$_tmp_disks" 2>/dev/null
     while IFS= read -r _d; do
         [ -n "$_d" ] || continue
@@ -1735,18 +1754,13 @@ _diskid_cache_init() {
     rm -f "$_tmp_disks"
     mv "$_tmp" "$_DISKID_CACHE_FILE" || {
         rm -f "$_tmp"
-        _DISKID_CACHE_FILE=""
+        _diskid_cache_clear
         return 1
     }
 }
 
-# Cache cleanup is a no-op now (single deterministic filename - the
-# next process's init overwrites it). Kept as a function so existing
-# `trap '_diskid_cache_clear' EXIT INT TERM` call sites stay valid;
-# they're harmless. We intentionally do NOT delete the file on exit so
-# adjacent processes (e.g. cmd_status invoked while cmd_health runs)
-# can share the prime, and a kill -9 leaves at most one stale file
-# which the next sweep cleans up.
+# Remove this process's ephemeral diskid-cache file (called by EXIT/INT/TERM
+# traps and explicit cleanup paths).
 _diskid_cache_clear() {
     if [ -n "${_DISKID_CACHE_FILE:-}" ]; then
         rm -f "$_DISKID_CACHE_FILE" 2>/dev/null || true
@@ -1923,7 +1937,7 @@ baseline_write_disks() {
         fi
         # Use the multi-row cache (one row per (bsd, tag)) so each disk's
         # complete tag list comes from a single awk lookup.
-        _tmp_dl=$(mktemp "${TMPDIR:-/tmp}/my-appleRAID.baseline-write-disks.XXXXXX" 2>/dev/null)
+        _tmp_dl=$(_mktemp_scratch baseline-write-disks) || return 1
         list_all_physical_disks > "$_tmp_dl"
         while IFS= read -r d; do
             [ -n "$d" ] || continue
@@ -2006,7 +2020,7 @@ disk_for_baseline_id() {
     fi
     # Slow path: cache uninitialized. Walk all disks, enumerate ALL
     # their readable tags, match any of them against the target.
-    _tmp_dl=$(mktemp "${TMPDIR:-/tmp}/my-appleRAID.disk-for-id.XXXXXX" 2>/dev/null) || return 1
+    _tmp_dl=$(_mktemp_scratch disk-for-id) || return 1
     list_all_physical_disks > "$_tmp_dl"
     _found=""
     while IFS= read -r d; do
@@ -2301,7 +2315,7 @@ alert_email() {
         return 1
     fi
 
-    _stderr_tmp=$(mktemp "${TMPDIR:-/tmp}/my-appleRAID.sender-err.XXXXXX" 2>/dev/null) \
+    _stderr_tmp=$(_mktemp_scratch sender-err) \
         || _stderr_tmp=""
     {
         printf 'From: %s\n' "${EMAIL_FROM}"
@@ -2837,12 +2851,16 @@ _sweep_stale_state_health() {
         printf '%s\n' "$2" | grep -qxF "$1"
     }
 
-    # 2. seen.XXXXXX mktemps - any one not owned by the current tick.
-    for _f in "$STATE_DIR"/seen.??????; do
+    # 2. Ephemeral per-tick scratch files not owned by the current tick.
+    for _f in "$STATE_DIR"/seen.?????? "$STATE_DIR"/.diskid-cache.* "$STATE_DIR"/.health-runlog.*; do
         [ -f "$_f" ] || continue
-        [ "$_f" = "${SEEN_HASHES_FILE:-/dev/null/never}" ] && continue
+        case "$_f" in
+            "${SEEN_HASHES_FILE:-/dev/null/never}"|\
+            "${_DISKID_CACHE_FILE:-/dev/null/never}"|\
+            "${HEALTH_RUN_LOG:-/dev/null/never}") continue ;;
+        esac
         if rm -f "$_f" 2>/dev/null; then
-            log_debug "sweep: removed orphaned seen-mktemp $_f"
+            log_debug "sweep: removed orphaned tick scratch $_f"
             _swept=$((_swept + 1))
         fi
     done
@@ -4277,16 +4295,16 @@ cmd_health() {
     # Per-run event log. handle_problem and handle_resolved append to
     # this file (via the HEALTH_RUN_LOG env var) so the end-of-run
     # SUMMARY block can count what happened this pass without re-
-    # parsing the state DB. Cleaned up by the trap below.
-    HEALTH_RUN_LOG=$(mktemp -t my-appleRAID-runlog.XXXXXX) || HEALTH_RUN_LOG=""
+    # parsing the state DB. Cleaned up on exit and by _health_cleanup.
+    HEALTH_RUN_LOG=$(_mktemp_scratch health-runlog) || HEALTH_RUN_LOG=""
     export HEALTH_RUN_LOG
 
-    # Trap so we always clean up the temp seen-file + run-log.
+    # Trap so we always clean up the temp seen-file, diskid cache, and run-log.
     # Health iterates monitored disks, optsets, and presence checks -
     # all of which call disk_baseline_id / disk_for_baseline_id. Cache
-    # once up front, clean up via the same trap as the rest.
+    # once up front, clean up via _health_cleanup on normal return and traps.
     _diskid_cache_init
-    trap 'seen_cleanup; _diskid_cache_clear; [ -n "$HEALTH_RUN_LOG" ] && rm -f "$HEALTH_RUN_LOG"' EXIT INT TERM
+    trap '_health_cleanup' EXIT INT TERM
 
     # Sweep stale state files left by prior cmd_health runs (items
     # removed from baseline, disks renumbered, sets destroyed, prior
@@ -4490,9 +4508,16 @@ cmd_health() {
     # (alert emails already exercise the channel).
     _send_heartbeat_if_due
 
-    seen_cleanup
+    _health_cleanup
     trap - EXIT INT TERM
     return $worst
+}
+
+_health_cleanup() {
+    seen_cleanup
+    _diskid_cache_clear
+    [ -n "${HEALTH_RUN_LOG:-}" ] && rm -f "$HEALTH_RUN_LOG"
+    HEALTH_RUN_LOG=""
 }
 
 # ----------------------------------------------------------------------
@@ -5783,7 +5808,7 @@ _baseline_diff() {
     [ -f "$_disks_f" ] && _prev_disks_full=$(awk 'NF>0 && !/^#/' "$_disks_f")
     # Generate the live disk-entry list into a tmpfile (same path
     # baseline_write_disks would take, minus the actual write).
-    _live_tmp=$(mktemp "${TMPDIR:-/tmp}/my-appleRAID.baseline-diff-disks.XXXXXX")
+    _live_tmp=$(_mktemp_scratch baseline-diff-disks) || die "mktemp failed"
     _orig_f=$(baseline_disks_file)
     baseline_disks_file() { echo "$_live_tmp"; }
     baseline_write_disks
@@ -5820,7 +5845,7 @@ Run '$SCRIPT_NAME baseline --update --disks' to create $_raw, then re-diff."
     info "Live:     $(now_iso)"
     # Generate the live raw snapshot into a tmpfile by temporarily
     # redirecting _baseline_raw_file.
-    _live_tmp=$(mktemp "${TMPDIR:-/tmp}/my-appleRAID.baseline-diff-raw.XXXXXX")
+    _live_tmp=$(_mktemp_scratch baseline-diff-raw) || die "mktemp failed"
     _orig_f="$_raw"
     _baseline_raw_file() { echo "$_live_tmp"; }
     _baseline_write_raw
@@ -6137,8 +6162,8 @@ cmd_baseline_optsets() {
     # the menu loop, which then tries to awk a vanished file. Common
     # path: user Ctrl+C-s out of an interactive child (bash readline,
     # confirm, etc.) - the SIGINT hits both the child and us.
-    trap '_optsets_keys_raw off; rm -f "$_wf" "$_cache"' EXIT
-    trap '_optsets_keys_raw off; rm -f "$_wf" "$_cache"; trap - EXIT; exit 130' INT TERM
+    trap '_optsets_keys_raw off; _diskid_cache_clear; rm -f "$_wf" "$_cache"' EXIT
+    trap '_optsets_keys_raw off; _diskid_cache_clear; rm -f "$_wf" "$_cache"; trap - EXIT; exit 130' INT TERM
 
     # Seed the work file from the current OPTIONAL_DISK_SETS value.
     optional_sets_iter > "$_wf" 2>/dev/null || true
@@ -10375,6 +10400,75 @@ PY_EOF
     fi
 }
 
+# /tmp hygiene: cmd_health keeps ephemeral scratch (diskid-cache, runlog) out
+# of /tmp when STATE_DIR is writable and removes it before clearing traps on
+# normal exit (previously `trap - EXIT INT TERM` at return left thousands of
+# my-appleRAID.diskid-cache.* files in /private/tmp). Non-writable STATE_DIR
+# falls back to TMPDIR and _diskid_cache_clear removes it; _sweep_stale_state_health
+# cleans orphaned .diskid-cache.* and .health-runlog.* from crashed ticks.
+_th_run_health() {
+    TMPDIR="$_T/hyg_tmp"; export TMPDIR
+    SITE_CONF="$_T/no-site.conf"
+    HOME="$_T/home"
+    STATE_DIR="$_T/hyg_state"; LOG_FILE="$_T/hyg_log"
+    mkdir -p "$TMPDIR" "$STATE_DIR"
+    printf 'STATE_DIR="%s"\nLOG_FILE="%s"\nEMAIL_TO=""\nALARM_ENABLED=no\nSMART_CHECK_ENABLED=no\nDEFAULT_AUTO_REBUILD=""\nMONITOR_SETS=""\nREQUIRED_SETS=""\nREQUIRED_DISKS=""\nOPTIONAL_DISK_SETS=""\nALERT_ON_MISSING_SET=no\nALERT_ON_MISSING_DISK=no\nALERT_ON_OPTIONAL_DISK_SETS=no\nAUTO_BASELINE_SETS=no\nAUTO_BASELINE_DISKS=no\n' \
+        "$STATE_DIR" "$LOG_FILE" > "$_T/hyg.conf"
+    MY_APPLERAID_CONFIG="$_T/hyg.conf"
+    # Stub list_all_physical_disks / diskutil so no hardware is probed.
+    list_all_physical_disks() { :; }
+    diskutil() { :; }
+    cmd_health --dry-run > /dev/null 2>&1
+}
+
+# shellcheck disable=SC2016  # the sh -c script expands $1.. in the child, by design
+t_diskid_cache_hygiene() {
+    echo " >>> /tmp hygiene: cmd_health, fallback cache, and crash-leftover sweep"
+    rm -rf "$_T/hyg_tmp" "$_T/hyg_state" "$_T/hyg_ro"
+    ( _th_run_health )
+    _th_rc=$?
+    _t_check "cmd_health exits cleanly in sandbox [rc $_th_rc]" [ "$_th_rc" -eq 0 ]
+    _th_tmp_left=$(find "$_T/hyg_tmp" -type f 2>/dev/null | wc -l | tr -d ' ')
+    _t_check "cmd_health leaves 0 files in TMPDIR [$_th_tmp_left]" [ "$_th_tmp_left" -eq 0 ]
+    _th_state_left=$(find "$_T/hyg_state" -name '.diskid-cache.*' -o -name '.health-runlog.*' -o -name 'seen.*' 2>/dev/null | wc -l | tr -d ' ')
+    _t_check "cmd_health removes ephemeral cache/runlog/seen from STATE_DIR [$_th_state_left]" [ "$_th_state_left" -eq 0 ]
+
+    if [ "$(id -u)" -eq 0 ]; then
+        _t_ok "read-only STATE_DIR fallback: skipped as root (root writes mode 555)"
+    else
+        mkdir -p "$_T/hyg_ro" && chmod 555 "$_T/hyg_ro"
+        _th_ro_got=$(
+            TMPDIR="$_T/hyg_tmp"; STATE_DIR="$_T/hyg_ro"
+            list_all_physical_disks() { :; }
+            _diskid_cache_init || exit 1
+            printf '%s' "$_DISKID_CACHE_FILE"
+            _diskid_cache_clear
+        )
+        chmod 755 "$_T/hyg_ro"
+        _t_check "non-writable STATE_DIR uses TMPDIR fallback ['$_th_ro_got']" \
+            sh -c 'case "$1" in "$2"/my-appleRAID.diskid-cache.*) true ;; *) false ;; esac' _ "$_th_ro_got" "$_T/hyg_tmp"
+        _th_tmp_left=$(find "$_T/hyg_tmp" -type f 2>/dev/null | wc -l | tr -d ' ')
+        _t_check "_diskid_cache_clear removes TMPDIR fallback file [$_th_tmp_left]" [ "$_th_tmp_left" -eq 0 ]
+    fi
+
+    (
+        STATE_DIR="$_T/hyg_state"; LOG_FILE="$_T/hyg_log"
+        list_all_physical_disks() { :; }
+        diskutil() { :; }
+        : > "$STATE_DIR/.diskid-cache.stale1"
+        : > "$STATE_DIR/.health-runlog.stale1"
+        _DISKID_CACHE_FILE="$STATE_DIR/.diskid-cache.live1"
+        HEALTH_RUN_LOG="$STATE_DIR/.health-runlog.live1"
+        : > "$_DISKID_CACHE_FILE"; : > "$HEALTH_RUN_LOG"
+        _sweep_stale_state_health
+    )
+    _t_check "sweep removes orphaned .diskid-cache/.health-runlog" \
+        [ ! -e "$_T/hyg_state/.diskid-cache.stale1" ] && [ ! -e "$_T/hyg_state/.health-runlog.stale1" ]
+    _t_check "sweep preserves current tick's .diskid-cache/.health-runlog" \
+        [ -e "$_T/hyg_state/.diskid-cache.live1" ] && [ -e "$_T/hyg_state/.health-runlog.live1" ]
+    rm -f "$_T/hyg_state/.diskid-cache.live1" "$_T/hyg_state/.health-runlog.live1"
+}
+
 cmd_run_tests() {
     _T_SELF=$(cd "$(dirname "$0")" 2>/dev/null && pwd)/$(basename "$0")
     [ -x "$_T_SELF" ] || die "run-tests: cannot locate self at $_T_SELF"
@@ -10402,7 +10496,7 @@ STUB_EOF
                  t_daemon_needs_root t_err_calls_name_a_code t_problem_recorded_once \
                  t_site_conf_gives_the_bases_the_search_and_the_offer t_site_conf_cannot_tell_is_an_error t_site_conf_refused_by_the_system_is_an_error_whatever_the_mode_bits \
                  t_config_offer_names_only_searched_paths t_default_sender_is_sendmail \
-                 t_optsets_prompt_tab; do
+                 t_optsets_prompt_tab t_diskid_cache_hygiene; do
         case "$_rt_t" in *"${1:-}"*) "$_rt_t"; _rt_ran=$((_rt_ran + 1)) ;; esac
     done
     [ "$_rt_ran" -gt 0 ] || _t_fail "no test name holds '${1:-}'"
